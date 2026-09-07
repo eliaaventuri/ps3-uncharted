@@ -141,7 +141,25 @@ Risultato:
     [spurs-pm] DMA cmd=0x40 lsa=0x00B00 ea=0x02AE53E80 size=0x100 tag=8
 
 Il codice SPU ricompilato **esegue** e fa DMA fra local store e memoria guest.
-`image=2` è il policy module liftato nella sessione 8.
+
+Una conferma che vale la pena registrare:
+
+    [cellSpurs] wid=0 PM resolved (fp=0xABE4C07881298FE5 image=2)
+
+`0xABE4C07881298FE5` è il fingerprint **del payload**, il secondo che la
+sessione 8 ha insegnato al generatore a emettere. Con il solo fingerprint del
+file ELF il policy module non sarebbe mai stato risolto.
+
+### Il prossimo anello
+
+Il kernel SPU entra, fa il suo giro (~20 DMA) e trova `ready=0`: **nessun job in
+coda**. Il Job Manager lato PPU non ne ha ancora accodati, perché è nel suo loop
+di costruzione comandi. Il log resta a 414 righe.
+
+Da capire: perché il Job Manager PPU non pubblica job. Le due estremità ora
+esistono e comunicano (il kernel legge la coda dove il PPU dovrebbe scrivere),
+quindi la domanda è diventata specifica — che cosa manca fra il loop del PPU e
+l'accodamento.
 
 ## Sessione 8 — cosa aspettava il gioco
 
