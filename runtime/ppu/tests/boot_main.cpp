@@ -48,6 +48,7 @@ void     ppu_fs_register(void);
 int      ppu_run(uint32_t entry_opd, uint32_t stack_top);
 extern const char* ppu_vfs_root;   /* host dir that PS3 mount points map into */
 extern "C" void ps3_install_guest_ptr_trap(void);
+extern "C" uint32_t ppu_hle_inject_base;   /* vm.h: the port picks where it lands */
 #ifdef __APPLE__
 #include <pthread.h>
 #include <CoreFoundation/CoreFoundation.h>
@@ -753,6 +754,21 @@ int main(int argc, char** argv)
      * the guest EA and the function that issued it), or a plain host fault.
      * Nothing called this before, so on POSIX every fault was a bare address. */
     ps3_install_guest_ptr_trap();
+
+    /* The HLE injection window (control register, labels, offset tables) has to
+     * live where the title never allocates -- vm.h says as much, and leaves the
+     * choice to the port. The 0x20000000 default is wrong for Uncharted, which
+     * maps its IO window at 0x21000000 and its heaps up to ~0x2B200000: the
+     * title overwrote the control register, so `put` read back as garbage
+     * (0x080018B7, not even 4-byte aligned) and the FIFO walker started
+     * decoding vertex data as commands.
+     *
+     * $PS3_HLE_INJECT_BASE moves it without a rebuild; 0x8000 bytes are needed. */
+    { const char* e = getenv("PS3_HLE_INJECT_BASE");
+      if (e && *e) {
+          ppu_hle_inject_base = (uint32_t)strtoul(e, nullptr, 0);
+          printf("[boot] HLE inject window at 0x%08X\n", ppu_hle_inject_base);
+      } }
 
     uint32_t entry = ppu_load_elf(argv[1]);
     if (!entry) { printf("load failed\n"); return 1; }
