@@ -116,6 +116,46 @@ il log è pulito —
 Le mappature che prima rispondevano `FFFFFFFF` ora riescono, il video è
 configurato a 1280x720 (pitch 5120 = 1280x4) e il backend RSX è su.
 
+## Sessione 10 — il policy module gira davvero
+
+Due errori, uno mio e uno di configurazione, tenevano fermo il kernel SPU.
+
+**1. La base di caricamento sbagliata (mio errore).** Avevo incapsulato il
+policy module con `--base 0`, ma il runtime lo carica a **LS 0xA00** (il trace
+lo diceva: `entry=0xA00`). Il codice liftato aveva quindi indirizzi 0-based
+mentre i salti indiretti a runtime usano indirizzi LS reali: ogni target cadeva
+0xA00 più in là del dovuto. Il sintomo era un salto a `0x2DE0` ripetuto
+**4 milioni di volte**. Rifatto con `--base 0xA00 --entry 0xA00`, l'entry
+liftata diventa `spu_func_00000A00` e i salti si risolvono.
+
+Nota diagnostica: `0x2DE0` non era corruzione. Con la base giusta si legge
+`ila $r0, 0x2DE0` — il modulo si imposta da sé quell'indirizzo di ritorno. Era
+il *nostro* lift a non avere una funzione lì.
+
+**2. `SPU_TAILRET=1`.** Senza, i ritorni del codice liftato annidano frame host
+e il policy module supera i 2000 di `SPU_HOST_DEPTH_MAX`: *"lifted call
+recursion, halting the SPU"*. Con la variabile attiva: **zero halt**.
+
+Risultato — il ciclo kernel↔policy module funziona:
+
+    [spurs-pm] RUN#1  wid=0 ... image=2 entry=0xA00
+    [spurs-pm] exit-to-kernel#61 (r3=0x00000000 polls=0)
+    [spurs-pm] END wid=1 status=0x2 pc=0x009C0 polls=0 exited=1
+
+**24.576 esecuzioni su tre workload** (wid 0, 1, 2), con entrate e uscite
+pulite verso il kernel. Il log passa da 419 a 758 righe.
+
+I parametri necessari vivono ora in `uncharted-data/run.sh`, non nella memoria
+di nessuno.
+
+### Dove si ferma adesso
+
+I run finiscono con `pc=0x02DE0 exited=0`: il modulo resta nel proprio loop di
+polling, che legge LS `0x12A0` e `0x12C0` e aspetta che cambino. `polls=0`
+significa che non chiama mai `selectWorkload`, quindi non è il kernel che deve
+svegliarlo: aspetta un dato che deve arrivargli per DMA — presumibilmente dal
+Job Manager lato PPU.
+
 ## Sessione 9 — SBLOCCATO: il kernel SPURS gira
 
 **Uncharted abilitava i workload correttamente da sempre.** Lo stato nella
