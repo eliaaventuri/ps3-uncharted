@@ -116,6 +116,58 @@ il log è pulito —
 Le mappature che prima rispondevano `FFFFFFFF` ora riescono, il video è
 configurato a 1280x720 (pitch 5120 = 1280x4) e il backend RSX è su.
 
+## Sessione 12 — il gioco carica i livelli
+
+**Il loop dell'inizializzazione grafica era un bug mio.** In sessione 7 avevo
+aggiunto i 501 ingressi indiretti con `{"start": va, "end": va}`: un intervallo
+vuoto. Per una funzione senza corpo il lifter emette
+
+    void func_004C5464(ppu_context* ctx) {
+        { g_trampoline_fn = (void(*)(void*))func_004C5464; return; }
+    }
+
+cioè una funzione che chiede al dispatcher di richiamare se stessa. Uncharted ci
+girava dentro per sempre, in `RenderTargetManager::CreateCorrespondenceTexture-
+ForRenderTarget`, con gli stessi argomenti a ogni giro (col debugger:
+`r3=0x50000 r4=0x500 r7=0x2AE47920` invariati).
+
+Lezione di metodo: la sparizione di *"unresolved indirect call"* mi aveva
+convinto di aver risolto, mentre avevo solo creato funzioni vuote. **Il sintomo
+era migliorato e la causa peggiorata.** Da qui in avanti si verifica il C
+generato, non solo la scomparsa del messaggio.
+
+Corretto l'intervallo (ogni voce arriva alla fine della funzione che la
+possiede), il titolo esce dall'inizializzazione e arriva a:
+
+    ### SyncLoad (loado) on [main/misc1/debugrendering6]
+    >>> PackageMgr::RequestLevel [main/misc1/debugrendering6]
+    OpenAsync: "/PS3_GAME/USRDIR/build/main/misc1/debugrendering6.pak"
+    [spu_workload] task 0 (taskset 0x2A8CE880) sleeping 1s in WAIT_SIGNAL
+    ### SyncLoad (loado) on [main/pak19/post]
+
+**Due livelli richiesti in sequenza, e task SPU in esecuzione con attesa di
+segnali.** Log da 500 a 1268 righe.
+
+### Altre due classi di ingresso
+
+`find_indirect_entries.py` ora riconosce anche i **target di jump table** (487:
+indirizzo contenuto in una word dei dati *e* preceduto da un terminatore) e, con
+`--computed-blocks`, i blocchi che nessun branch nomina (9713 — corretto ma il
+lift esplode, quindi spento di default).
+
+Per il caso pratico c'è `--extra`: si passa l'indirizzo che una run ha appena
+riportato. È il ciclo di lavoro: il gioco dice cosa gli manca, glielo si dà.
+
+### Dove si ferma
+
+Restano 8 target irrisolti (aggiunti con `--extra` nell'ultimo giro) e 26
+`bctr to NULL`, 20 dei quali da `func_00764998+0x3B0` — il gioco salta a un OPD
+nullo, cioè un puntatore a funzione che nessuno ha inizializzato. Poi un SIGSEGV
+con `sp=0xFFFFFF30`, uno stack pointer corrotto, in `func_000B1008`.
+
+Il prossimo filo è il `bctr to NULL`: capire chi dovrebbe riempire quel
+puntatore.
+
 ## Sessione 11 — chi scrive LS 0x12A0 / 0x12C0, e dove sta davvero il PPU
 
 **Risposta alla domanda: le scrive il policy module stesso.** Non sono una
