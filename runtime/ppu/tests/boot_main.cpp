@@ -48,6 +48,11 @@ void     ppu_fs_register(void);
 int      ppu_run(uint32_t entry_opd, uint32_t stack_top);
 extern const char* ppu_vfs_root;   /* host dir that PS3 mount points map into */
 extern "C" void ps3_install_guest_ptr_trap(void);
+#ifdef __APPLE__
+#include <pthread.h>
+#include <CoreFoundation/CoreFoundation.h>
+static volatile int s_guest_done = 0;
+#endif
 /* Optional hook: load real system PRX modules (libsre = cellSpurs/cellSync) into
  * guest RAM and register their exports. Weak default is a no-op; a title that
  * links a lifted PRX defines a strong version. Called after the lifted function
@@ -787,6 +792,44 @@ int main(int argc, char** argv)
 #endif
 
     printf("\n[boot] dispatching entry OPD 0x%08X (stack top 0x%08X)\n\n", entry, STACK_TOP);
+#ifdef __APPLE__
+    /* AppKit owns the main thread: an NSWindow cannot be built anywhere else,
+     * and the backend creates one when the guest initialises the RSX. So the
+     * guest runs on a thread of its own and the main thread stays in its run
+     * loop, servicing the main queue the backend hops onto. Without this the
+     * title dies on "NSWindow should only be instantiated on the main thread".
+     *
+     * The guest thread gets a large host stack: recompiled PPC code nests host
+     * frames far deeper than the 512 KB a default pthread would give it. */
+    {
+        static uint32_t s_entry; static int s_rc;
+        s_entry = entry;
+        auto guest_main = [](void* p) -> void* {
+            (void)p;
+            s_rc = ppu_run(s_entry, STACK_TOP);
+            s_guest_done = 1;
+            return nullptr;
+        };
+        pthread_attr_t at;
+        pthread_attr_init(&at);
+        pthread_attr_setstacksize(&at, 64u * 1024u * 1024u);
+        pthread_t th;
+        if (pthread_create(&th, &at, guest_main, nullptr) != 0) {
+            printf("[boot] could not start the guest thread\n");
+            return 1;
+        }
+        pthread_attr_destroy(&at);
+
+        /* Run the main run loop until the guest finishes. This is what makes
+         * dispatch_sync from a guest thread safe rather than a deadlock. */
+        while (!s_guest_done)
+            CFRunLoopRunInMode(kCFRunLoopDefaultMode, 0.01, true);
+
+        pthread_join(th, nullptr);
+        printf("[boot] ppu_run returned %d\n", s_rc);
+        return s_rc;
+    }
+#endif
 #ifdef _WIN32
     fprintf(stderr, "[boot] MAIN guest thread tid=%lu\n", (unsigned long)GetCurrentThreadId());
 #endif

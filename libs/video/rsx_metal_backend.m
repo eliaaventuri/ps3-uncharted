@@ -180,7 +180,23 @@ static int create_offscreen(void)
 }
 
 #if !TARGET_OS_IPHONE
+/* AppKit refuses to build an NSWindow off the main thread, and the guest calls
+ * into the backend from whatever thread ran cellGcmInit. Hop to the main queue
+ * when needed -- which only works because the host now keeps the main thread
+ * draining that queue (see boot_main.cpp on Apple platforms) instead of running
+ * the guest on it. */
+static int create_window_impl(const char* title);
+
 static int create_window(const char* title)
+{
+    if ([NSThread isMainThread]) return create_window_impl(title);
+
+    __block int rc = -1;
+    dispatch_sync(dispatch_get_main_queue(), ^{ rc = create_window_impl(title); });
+    return rc;
+}
+
+static int create_window_impl(const char* title)
 {
     [NSApplication sharedApplication];
     [NSApp setActivationPolicy:NSApplicationActivationPolicyRegular];
@@ -713,6 +729,9 @@ int rsx_metal_backend_pump_messages(void)
 {
 #if !TARGET_OS_IPHONE
     if (s_headless || !s_ready) return 0;
+    /* Event dispatch is the main thread's job. A guest thread calling this at
+     * flip time would race AppKit; the host's main loop pumps for everyone. */
+    if (![NSThread isMainThread]) return 0;
     @autoreleasepool {
         for (;;) {
             NSEvent* ev = [NSApp nextEventMatchingMask:NSEventMaskAny
