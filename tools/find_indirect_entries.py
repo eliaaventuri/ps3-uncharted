@@ -119,9 +119,19 @@ def main():
     if not a.output:
         return
 
+    # Each entry runs to the end of the function that owns it: the slot falls
+    # through into a shared body further down. An empty [start, start) range
+    # makes the lifter emit a function whose whole content is
+    #   g_trampoline_fn = itself; return;
+    # -- a perfect infinite loop, which is what Uncharted's renderer init did
+    # until this was fixed.
+    import bisect as _bisect
+    bounds = sorted(known)
     merged = list(items)
     for va in found:
-        merged.append({"start": hex(va), "end": hex(va)})   # the lifter walks to the owning function's end
+        i = _bisect.bisect_right(bounds, va)
+        end = bounds[i] if i < len(bounds) else va + 0x400
+        merged.append({"start": hex(va), "end": hex(end)})
     merged.sort(key=lambda e: int(str(e["start"]), 0))
     out = merged if isinstance(doc, list) else {**doc, "functions": merged}
     with open(a.output, "w") as f:
