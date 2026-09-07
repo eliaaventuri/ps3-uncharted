@@ -49,6 +49,10 @@ int      ppu_run(uint32_t entry_opd, uint32_t stack_top);
 extern const char* ppu_vfs_root;   /* host dir that PS3 mount points map into */
 extern "C" void ps3_install_guest_ptr_trap(void);
 extern "C" uint32_t ppu_hle_inject_base;   /* vm.h: the port picks where it lands */
+/* The title's lifted SPU images, if the port built any (tools/
+ * build_spu_workloads.py). Weak: a port without them still links, and
+ * cellSpurs simply finds no lifted entry for the guest's program. */
+extern "C" void spu_register_all(void) __attribute__((weak));
 #ifdef __APPLE__
 #include <pthread.h>
 #include <CoreFoundation/CoreFoundation.h>
@@ -777,6 +781,11 @@ int main(int argc, char** argv)
     printf("[boot] VFS root: %s\n", ppu_vfs_root);
 
     fprintf(stderr,"[boot-dbg] before ppu_recomp_register\n"); fflush(stderr);
+    if (spu_register_all) {
+        spu_register_all();
+        printf("[boot] lifted SPU workloads registered\n");
+    }
+
     ppu_recomp_register();   /* lifted function table -> address map */
     fprintf(stderr,"[boot-dbg] after ppu_recomp_register; before ps3_load_prx_modules\n"); fflush(stderr);
     ps3_load_prx_modules();  /* real system PRX (libsre) -> guest RAM + exports */

@@ -36,6 +36,21 @@ import argparse, glob, os, re, subprocess, sys
 def be16(b, o): return (b[o] << 8) | b[o + 1]
 def be32(b, o): return (b[o] << 24) | (b[o + 1] << 16) | (b[o + 2] << 8) | b[o + 3]
 
+def load_payload(b):
+    """Bytes of the one PT_LOAD segment -- what actually reaches local store."""
+    e_phoff = be32(b, 0x1C); e_phentsize = be16(b, 0x2A); e_phnum = be16(b, 0x2C)
+    segs = []
+    for k in range(e_phnum):
+        po = e_phoff + k * e_phentsize
+        if po + 0x14 > len(b):
+            break
+        if be32(b, po) != 1:          # PT_LOAD
+            continue
+        off, fsz = be32(b, po + 0x04), be32(b, po + 0x10)
+        segs.append(b[off:off + fsz])
+    return segs[0] if len(segs) == 1 else None
+
+
 def img_size(b):
     """On-disk extent spanning the section-header table and all PT_LOAD /
     non-NOBITS section content -- matches spu_elf_image_size()."""
@@ -132,7 +147,18 @@ def main():
 
         sz = img_size(b)
         e_entry = be32(b, 0x18)
-        imgs.append((img, prefix, fnv1a64(b[:sz]), e_entry))
+        # Two fingerprints, because a title can hand SPURS either shape:
+        # the ELF as it sits in the executable, or just the code that goes to
+        # local store. Uncharted assembles its policy module in memory and
+        # passes 12,160 raw bytes -- fingerprinting only the ELF would never
+        # match it. Registering both costs one extra registry row.
+        prints = [fnv1a64(b[:sz])]
+        payload = load_payload(b)
+        if payload is not None:
+            fp = fnv1a64(payload)
+            if fp not in prints:
+                prints.append(fp)
+        imgs.append((img, prefix, prints, e_entry))
 
     if not imgs:
         sys.exit("[build_spu_workloads] no SPU images lifted")
@@ -165,9 +191,10 @@ def main():
     L.append("")
     L.append(f"void {args.register_fn}(void)")
     L.append("{")
-    for i, (img, prefix, fp, ent) in enumerate(imgs, 1):
+    for i, (img, prefix, prints, ent) in enumerate(imgs, 1):
         L.append(f"    spu_begin_image({i}); {prefix}spu_recomp_register();")
-        L.append(f"    spu_workload_register_img(0x{fp:016X}ULL, {prefix}spu_func_{ent:08X}, {i}, \"{img}\");")
+        for fp in prints:
+            L.append(f"    spu_workload_register_img(0x{fp:016X}ULL, {prefix}spu_func_{ent:08X}, {i}, \"{img}\");")
     L.append("    spu_begin_image(0);")
     L.append("}")
     if args.constructor:

@@ -1127,6 +1127,24 @@ s32 cellSpursAddWorkload(CellSpurs* spurs, CellSpursWorkloadId* wid,
             vm_write32((u32)(uintptr_t)wid, i);
             printf("[cellSpurs] AddWorkload(wid=%u, pm=%p, size=%u)\n",
                    i, pm, sizePm);
+            /* SPU_PM_DUMP=<dir>: write the guest's policy module out as it is
+             * registered. The image a title hands to SPURS is not always one
+             * that extract_spu_images.py can find in the EBOOT -- Uncharted's
+             * is 12,160 bytes assembled in memory, while the only image inside
+             * its executable is a different 39,608-byte one. Dumping it here is
+             * the only way to get the bytes that actually run. */
+            { const char* dir = getenv("SPU_PM_DUMP");
+              if (dir && *dir && vm_base && sizePm) {
+                  char path[512];
+                  snprintf(path, sizeof path, "%s/spu_pm_%08X_%u.bin",
+                           dir, (uint32_t)(uintptr_t)pm, sizePm);
+                  FILE* f = fopen(path, "wb");
+                  if (f) {
+                      fwrite(vm_base + (uint32_t)(uintptr_t)pm, 1, sizePm, f);
+                      fclose(f);
+                      printf("[cellSpurs]   dumped policy module -> %s\n", path);
+                  }
+              } }
             return CELL_OK;
         }
     }
