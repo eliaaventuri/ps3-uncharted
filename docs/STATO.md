@@ -67,7 +67,38 @@ crash — si ferma in attesa):
 - **manda i primi comandi RSX**, e lì si ferma: `FIFO JUMP to unmapped IO
   0x1E8101C0`, poi uno spin loop (`HOTREAD spinning on 0x00000000`).
 
-## I prossimi tre blocchi, in ordine
+## Sessione 6 — due dei tre blocchi chiusi
+
+**1. NSWindow — RISOLTO.** AppKit vuole il main thread; il backend creava la
+finestra da un thread guest. Ora `create_window` fa hop sulla main queue, il
+pump degli eventi è un no-op fuori dal main thread, e su Apple `boot_main`
+esegue il guest su un pthread dedicato (stack host da 64 MB) lasciando il main
+thread nel suo run loop — è questo che rende il `dispatch_sync` sicuro invece di
+un deadlock. Uncharted apre la sua finestra: *windowed on Apple M4 Pro (1280x720)*.
+
+**2. FIFO JUMP — RISOLTO.** La finestra HLE (control register, label, offset
+table) stava al default `0x20000000`, cioè dentro la memoria di Uncharted (IO a
+`0x21000000`, heap fino a ~`0x2B200000`). Il gioco sovrascriveva il control
+register: `put` si rileggeva come `0x080018B7`, nemmeno allineato a 4, e il
+walker decodificava dati vertex come comandi (`0x3E8101C0` è un float).
+`$PS3_HLE_INJECT_BASE` la sposta senza ricompilare; per Uncharted **0x50000000**.
+
+**3. Gli OOB — in corso.** Il gioco ora arriva più avanti e si lamenta da solo:
+
+- `dont have enough space for primary render target` — non riesce ad allocare
+  la VRAM, benché `cellGcmGetConfiguration` dichiari 256 MB a `0xC0000000`;
+- `Mapped mesh output buffer of 8MB at 52656e64 to offset FFFFFFFF` — nota che
+  `52656e64` è ASCII **"Rend"**: il gioco passa come indirizzo un campo che
+  contiene testo, quindi legge una struttura dal posto sbagliato (o una nostra
+  API gliela riempie male), e `cellGcmAddressToOffset` risponde -1;
+- `Assertion failed: WwsJob_IsAligned(numElts, 16)` in `job/src/ppu/jobapi/
+  joblist.cpp:333` — l'assert del job system WwsJob.
+
+I tre sintomi sono probabilmente la stessa causa: una struttura che riempiamo
+con offset o layout sbagliati. Il prossimo passo è trovare quale API restituisce
+la struttura che contiene "Rend".
+
+## I tre blocchi originali (storico)
 
 1. **`NSWindow should only be instantiated on the main thread`** — con finestra
    il processo muore: il backend crea la finestra da un thread guest. Serve
@@ -106,7 +137,8 @@ crossbar `TEXTURE_CONTROL1` e i sampler per unità.
 ```bash
 ~/Documents/Coding/uncharted-data/build.sh
 cd ~/Documents/Coding/uncharted-data
-PS3_VFS_ROOT=/tmp/uc_iso ./uncharted ~/Documents/Coding/uncharted-data/EBOOT.elf
+PS3_HLE_INJECT_BASE=0x50000000 PS3_VFS_ROOT=/tmp/uc_iso \
+    ./uncharted ~/Documents/Coding/uncharted-data/EBOOT.elf
 ```
 
 La tabella NID è **per-port**: `ppu_hle_register_all()` nel runtime è weak e
