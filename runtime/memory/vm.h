@@ -88,6 +88,22 @@ extern uint32_t ppu_hle_inject_base;
 /* Align a value up to `align` (must be power of 2) */
 #define VM_ALIGN_UP(val, align) (((val) + (align) - 1) & ~((align) - 1))
 
+/* Host page granularity, which is NOT the guest's. mprotect() rejects any range
+ * that is not a multiple of the HOST page, and Apple Silicon uses 16 KB where
+ * the PS3 and Windows use 4 KB -- so a 4 KB-aligned guest commit fails there
+ * with EINVAL. Guest allocation granularity is 64 KB / 1 MB, so widening a
+ * request out to the host page never reaches into a neighbouring allocation. */
+static inline size_t vm_host_page(void)
+{
+#ifdef _WIN32
+    return (size_t)VM_PAGE_SIZE;
+#else
+    static size_t cached = 0;
+    if (!cached) cached = (size_t)sysconf(_SC_PAGESIZE);
+    return cached;
+#endif
+}
+
 /* ---------------------------------------------------------------------------
  * Global base pointer
  *
@@ -110,6 +126,17 @@ extern uint32_t ppu_vm_size;
  * Reserve the host address range and commit the main memory region.
  * Returns CELL_OK on success, CELL_ENOMEM on failure.
  */
+/* Widen [vm_base+addr, +size) to whole host pages, for mprotect. */
+static inline void vm_host_range(uint32_t addr, uint32_t size,
+                                 void** out_ptr, size_t* out_len)
+{
+    uintptr_t hp  = (uintptr_t)vm_host_page();
+    uintptr_t beg = ((uintptr_t)vm_base + addr) & ~(hp - 1);
+    uintptr_t end = (((uintptr_t)vm_base + addr) + size + hp - 1) & ~(hp - 1);
+    *out_ptr = (void*)beg;
+    *out_len = (size_t)(end - beg);
+}
+
 static inline int32_t vm_init(void)
 {
     if (vm_base != NULL) return CELL_OK; /* already initialized */
@@ -198,7 +225,8 @@ static inline int32_t vm_commit(uint32_t addr, uint32_t size)
     if (!VirtualAlloc(vm_base + addr, size, MEM_COMMIT, PAGE_READWRITE))
         return CELL_ENOMEM;
 #else
-    if (mprotect(vm_base + addr, size, PROT_READ | PROT_WRITE) != 0)
+    void* p; size_t len; vm_host_range(addr, size, &p, &len);
+    if (mprotect(p, len, PROT_READ | PROT_WRITE) != 0)
         return CELL_ENOMEM;
 #endif
 
@@ -227,7 +255,8 @@ static inline int32_t vm_protect(uint32_t addr, uint32_t size, int read, int wri
     if (write) prot |= PROT_WRITE;
     if (exec)  prot |= PROT_EXEC;
 
-    if (mprotect(vm_base + addr, size, prot) != 0)
+    void* p; size_t len; vm_host_range(addr, size, &p, &len);
+    if (mprotect(p, len, prot) != 0)
         return CELL_EFAULT;
 #endif
 
@@ -258,10 +287,15 @@ static inline void vm_stack_alloc_init(vm_stack_alloc* sa)
  */
 static inline uint32_t vm_stack_allocate(vm_stack_alloc* sa, uint32_t stack_size)
 {
-    stack_size = VM_ALIGN_UP(stack_size, VM_PAGE_SIZE);
+    /* The guard must be a whole host page: a smaller one gets rounded up by
+     * vm_protect and would swallow the bottom of the usable stack. */
+    uint32_t guard = (uint32_t)vm_host_page();
+    if (guard < VM_PAGE_SIZE) guard = VM_PAGE_SIZE;
+
+    stack_size = VM_ALIGN_UP(stack_size, guard);
 
     /* Add a guard page */
-    uint32_t total = stack_size + VM_PAGE_SIZE;
+    uint32_t total = stack_size + guard;
 
     if (sa->next_addr + total > sa->region_end)
         return 0; /* out of stack space */
@@ -270,9 +304,9 @@ static inline uint32_t vm_stack_allocate(vm_stack_alloc* sa, uint32_t stack_size
     sa->next_addr += total;
 
     /* Guard page at the bottom (no access) */
-    vm_protect(base, VM_PAGE_SIZE, 0, 0, 0);
+    vm_protect(base, guard, 0, 0, 0);
 
-    return base + VM_PAGE_SIZE; /* skip the guard page */
+    return base + guard; /* skip the guard page */
 }
 
 /* ---------------------------------------------------------------------------
