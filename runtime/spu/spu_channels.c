@@ -1368,6 +1368,28 @@ void spu_indirect_branch(spu_context* ctx)
         if ((++s_n % 2000000) == 0)
           fprintf(stderr, "[ibranch] %llu indirect branches; current target=0x%05X run=%llu\n",
                   (unsigned long long)s_n, ctx->pc, (unsigned long long)s_run); } }
+    /* A target that repeats forever is a return address that points back into
+     * the caller's own tail -- the registers say which one, and the raw words
+     * at the target say what it is executing. Without them "target=0x2DE0" is
+     * just an address. */
+    { static int s_rt = -1; if (s_rt < 0) s_rt = getenv("SPU_IBREGS") ? 1 : 0;
+      if (s_rt) { static uint32_t s_seen = 0xFFFFFFFFu; static int s_n2 = 0;
+        if (ctx->pc != s_seen && s_n2 < 24) {
+            s_seen = ctx->pc; s_n2++;
+            fprintf(stderr, "[ibregs] target=0x%05X img=%d  r0=0x%08X r1=0x%08X "
+                            "r2=0x%08X r3=0x%08X\n",
+                    ctx->pc, ctx->image_id,
+                    (uint32_t)ctx->gpr[0]._u32[0], (uint32_t)ctx->gpr[1]._u32[0],
+                    (uint32_t)ctx->gpr[2]._u32[0], (uint32_t)ctx->gpr[3]._u32[0]);
+            /* The SpursKernelContext the PM reads its callbacks out of. */
+            const uint8_t* k = ctx->ls + 0x1C0;
+            char kb[256]; int kp = snprintf(kb, sizeof kb, "[ibregs] kernel ctx 0x1C0:");
+            for (int i = 0; i < 0x30; i += 4)
+                kp += snprintf(kb + kp, sizeof(kb) - kp, " %02X%02X%02X%02X",
+                               k[i], k[i+1], k[i+2], k[i+3]);
+            snprintf(kb + kp, sizeof(kb) - kp, "\n");
+            fputs(kb, stderr);   /* one write: other threads log concurrently */
+        } } }
     /* Policy-entry trace: the SPURS policy at LS 0xA00 branches on
      * r8 = word at LS[r6] (must be 32 for the path that sets the dispatch ptr
      * LS[0x780]). Log r3..r6 + the word the kernel handed it, to see why the
