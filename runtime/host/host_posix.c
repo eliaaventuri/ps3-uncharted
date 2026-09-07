@@ -160,6 +160,33 @@ static void upload_texture(void)
 /* The textured draw uses its own vertex block: two triangles covering the
  * screen, with texcoord0 (attribute 8) alongside position and colour.
  * Layout per vertex: float4 pos, float4 colour, float4 uv -- stride 48. */
+#define FP_OFFSET   0x00030000u          /* RSX offset of the fragment program */
+#define FP_ARGB     0xFF00FF00u          /* what the program below computes    */
+
+/* A real NV40 fragment program: MOV r0, {0,1,0,1} with END set -- green.
+ * Deliberately NOT the triangle's vertex colour (red), so a backend that
+ * ignored the guest program and kept its built-in shader fails the assertion
+ * at the bottom of main() instead of quietly passing.
+ *
+ * Words reach the RSX byte-swapped in 16-bit halves, so store swap16(word)
+ * big-endian -- the inverse of what rsx_fp_read_word does. */
+static void upload_fragment_program(void)
+{
+    static const u32 words[] = {
+        (0x01u << 24) | (0xFu << 9) | 1u,    /* MOV, write xyzw, END */
+        /* EXEC_IF LT|EQ|GR = unconditional. All three clear means "never",
+         * which the decompiler honours by suppressing the write. */
+        (7u << 18) | 2u | ((0u<<9)|(1u<<11)|(2u<<13)|(3u<<15)),  /* src0 = CONST .xyzw */
+        0u, 0u,
+        0x00000000u, 0x3F800000u,             /* the constant: 0.0, 1.0, */
+        0x00000000u, 0x3F800000u,             /*               0.0, 1.0  */
+    };
+    for (unsigned i = 0; i < sizeof(words) / sizeof(words[0]); i++) {
+        const u32 w = words[i];
+        guest_w32(IO_ADDR + FP_OFFSET + i * 4u, (w << 16) | (w >> 16));
+    }
+}
+
 #define TVTX_OFFSET (VTX_OFFSET + 0x1000u)
 static void upload_textured_quad(void)
 {
@@ -198,6 +225,15 @@ static void emit_triangle_draw(void)
     emit(NV4097_SET_BEGIN_END, 0u);                       /* end              */
 }
 
+/* The triangle again, but rendered with the guest's own fragment program:
+ * SET_SHADER_PROGRAM carries the offset with the memory location in its low
+ * two bits (1 = local, otherwise main). */
+static void emit_guest_fp_draw(void)
+{
+    emit(NV4097_SET_SHADER_PROGRAM, FP_OFFSET);
+    emit_triangle_draw();
+}
+
 /* Bind the test texture on unit 0 and draw the quad. The vertex colour is
  * deliberately GREEN while the texture is a different colour, so a pass that
  * ignored the texture would still produce a plausible-looking frame -- and
@@ -232,7 +268,8 @@ static void submit_frame(int with_draw)
 {
     emit(NV4097_SET_COLOR_CLEAR_VALUE, CLEAR_ARGB);
     emit(NV4097_CLEAR_SURFACE,         0xF0u);
-    if (with_draw == 2)      emit_textured_draw();
+    if (with_draw == 3)      emit_guest_fp_draw();
+    else if (with_draw == 2) emit_textured_draw();
     else if (with_draw == 1) emit_triangle_draw();
 
     guest_w32(CTRL_ADDR + 0, g_fifo_len);   /* put */
@@ -252,6 +289,11 @@ int main(int argc, char** argv)
          * test. The vertex colour differs from the texture colour, so a
          * backend that ignored the texture fails the assertion below. */
         else if (strcmp(argv[i], "--tex") == 0)    do_draw = 2;
+        /* --fp: render the triangle with the guest's OWN fragment program,
+         * decompiled to MSL. The program computes green while the vertex
+         * colour is red, so a backend still running its built-in shader is
+         * caught by the pixel assertion rather than passing quietly. */
+        else if (strcmp(argv[i], "--fp") == 0)     do_draw = 3;
     }
 
     vm_base = (uint8_t*)calloc(1, VM_SIZE);
@@ -274,6 +316,7 @@ int main(int argc, char** argv)
     guest_w32(CTRL_ADDR + 4, 0);            /* get: start of ring */
     if (do_draw == 1) upload_triangle();
     if (do_draw == 2) { upload_texture(); upload_textured_quad(); }
+    if (do_draw == 3) { upload_triangle(); upload_fragment_program(); }
     submit_frame(do_draw);
 
     u32 got = host_backend_color();
@@ -306,7 +349,8 @@ int main(int argc, char** argv)
          * the TEXTURE's colour, not the quad's green -- so it also proves the
          * texture reached the sampler through layout, decode and the crossbar.
          */
-        u32 want = (do_draw == 2) ? TEX_ARGB
+        u32 want = (do_draw == 3) ? FP_ARGB
+                 : (do_draw == 2) ? TEX_ARGB
                  : (do_draw == 1) ? 0xFFFF0000u
                                   : CLEAR_ARGB;
         printf("[host] presented pixel: 0x%08X (expected 0x%08X) %s\n",

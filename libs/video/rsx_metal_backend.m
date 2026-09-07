@@ -26,6 +26,8 @@
 #include "rsx_metal_backend.h"
 #include "rsx_vertex_fetch.h"
 #include "rsx_primitives.h"
+#include "rsx_fp_decompiler.h"   /* guest fragment program -> MSL */
+#include "cellGcmSys.h"          /* cellGcmResolveLocated */
 #include <stdio.h>
 #include <stdlib.h>
 
@@ -63,6 +65,7 @@ typedef struct {
     int blend_enable;
     u32 blend_sfactor, blend_dfactor, blend_equation;
     float mvp[16];   /* 4 rows of the RSX vertex-constant matrix */
+    u32 fp_addr;     /* NV4097_SET_SHADER_PROGRAM: 0 = built-in shader */
 } MtlDraw;
 
 static MtlVertex* s_verts;
@@ -318,6 +321,7 @@ static void record_draw(const rsx_state* st, u32 prim, u32 base, u32 count,
     d->blend_sfactor  = st->blend_sfactor;
     d->blend_dfactor  = st->blend_dfactor;
     d->blend_equation = st->blend_equation;
+    d->fp_addr        = st->shader_program;
 
     /* RSX vertex constant slots 0..3 hold the MVP rows when no vertex program
      * has been translated. An all-zero matrix would collapse every vertex to
@@ -397,12 +401,75 @@ static NSString* const kBuiltinMSL = @
 "}\n"
 "fragment float4 fs_main(VOut in [[stage_in]]) { return in.col; }\n";
 
+/* Appended to a decompiled guest fragment program. The decompiler emits the
+ * PSInput struct and rsx_fp_main; this supplies the vertex stage that fills
+ * PSInput from the same MtlVertex layout the built-in path uses. Interpolants
+ * the fetch does not produce yet are zeroed rather than left undefined. */
+static NSString* const kGuestVertexMSL = @
+"struct VIn { float4 pos [[attribute(0)]]; float4 col [[attribute(1)]]; float4 tc [[attribute(2)]]; };\n"
+"struct VU  { float4 mvp[4]; };\n"
+"vertex PSInput vs_guest(VIn v [[stage_in]], constant VU& u [[buffer(0)]]) {\n"
+"    PSInput o;\n"
+"    o.position = float4(dot(u.mvp[0], v.pos), dot(u.mvp[1], v.pos),\n"
+"                        dot(u.mvp[2], v.pos), dot(u.mvp[3], v.pos));\n"
+"    o.col0 = v.col; o.col1 = v.col; o.fog = float4(0);\n"
+"    o.tc0 = v.tc; o.tc1 = float4(0); o.tc2 = float4(0); o.tc3 = float4(0);\n"
+"    o.tc4 = float4(0); o.tc5 = float4(0); o.tc6 = float4(0); o.tc7 = float4(0);\n"
+"    return o;\n"
+"}\n";
+
+/* One compiled library per guest program. A program that fails to decompile or
+ * to compile is remembered as a miss (lib == nil) so it is not retried every
+ * draw; that draw falls back to the built-in shader rather than dropping. */
+typedef struct { u32 fp_addr; id<MTLLibrary> lib; } GuestFpEntry;
+static GuestFpEntry s_fp_cache[64];
+static u32          s_fp_count;
+
+static id<MTLLibrary> guest_fp_library(u32 fp_addr)
+{
+    for (u32 i = 0; i < s_fp_count; i++)
+        if (s_fp_cache[i].fp_addr == fp_addr) return s_fp_cache[i].lib;
+    if (s_fp_count >= (u32)(sizeof(s_fp_cache) / sizeof(s_fp_cache[0]))) return nil;
+
+    id<MTLLibrary> lib = nil;
+    const u32 off = cellGcmResolveLocated((fp_addr & 0x3u) == 1, fp_addr & ~0x3u);
+    if (vm_base && off) {
+        static char msl[32768];
+        const int n = rsx_fp_decompile_lang(vm_base + off, 4096, RSX_FP_CTRL_AUTO,
+                                            0u, 0, RSX_FP_LANG_MSL,
+                                            msl, sizeof(msl), NULL);
+        if (n > 0) {
+            NSString* src = [NSString stringWithFormat:@"%s%@",
+                             msl, kGuestVertexMSL];
+            NSError* err = nil;
+            lib = [s_dev newLibraryWithSource:src options:nil error:&err];
+            if (!lib)
+                fprintf(stderr, "[RSX metal] guest fp 0x%08X compile failed: %s\n",
+                        fp_addr, [[err localizedDescription] UTF8String]);
+            else
+                fprintf(stderr, "[RSX metal] guest fp 0x%08X: %d instructions\n",
+                        fp_addr, n);
+        } else {
+            fprintf(stderr, "[RSX metal] guest fp 0x%08X: decompile failed\n", fp_addr);
+        }
+    }
+
+    s_fp_cache[s_fp_count].fp_addr = fp_addr;
+    s_fp_cache[s_fp_count].lib     = lib;
+    s_fp_count++;
+    return lib;
+}
+
 static u32 pso_key(const MtlDraw* d)
 {
-    if (!d->blend_enable) return 0u;
+    /* The guest program is part of the key: two draws with identical blend
+     * state but different fragment programs are different pipelines. */
+    const u32 fp = d->fp_addr ? (1u | (d->fp_addr * 2654435761u)) : 0u;
+    if (!d->blend_enable) return fp << 1;
     return 1u | ((d->blend_sfactor & 0xFFFu) << 1)
               | ((d->blend_dfactor & 0xFFFu) << 13)
-              | ((d->blend_equation & 0x7u) << 25);
+              | ((d->blend_equation & 0x7u) << 25)
+              | (fp & 0x80000000u);
 }
 
 static id<MTLRenderPipelineState> pso_for(const MtlDraw* d)
@@ -421,8 +488,16 @@ static id<MTLRenderPipelineState> pso_for(const MtlDraw* d)
     vd.layouts[MTL_VB_INDEX].stride = sizeof(MtlVertex);
 
     MTLRenderPipelineDescriptor* pd = [MTLRenderPipelineDescriptor new];
-    pd.vertexFunction   = [s_shader_lib newFunctionWithName:@"vs_main"];
-    pd.fragmentFunction = [s_shader_lib newFunctionWithName:@"fs_main"];
+    /* The guest's own fragment program when it has one and it translated;
+     * otherwise the built-in pair. */
+    id<MTLLibrary> glib = d->fp_addr ? guest_fp_library(d->fp_addr) : nil;
+    if (glib) {
+        pd.vertexFunction   = [glib newFunctionWithName:@"vs_guest"];
+        pd.fragmentFunction = [glib newFunctionWithName:@"rsx_fp_main"];
+    } else {
+        pd.vertexFunction   = [s_shader_lib newFunctionWithName:@"vs_main"];
+        pd.fragmentFunction = [s_shader_lib newFunctionWithName:@"fs_main"];
+    }
     pd.vertexDescriptor = vd;
     pd.colorAttachments[0].pixelFormat = MTLPixelFormatBGRA8Unorm;
     if (d->blend_enable) {

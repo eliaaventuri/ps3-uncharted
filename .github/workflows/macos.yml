@@ -77,6 +77,12 @@ jobs:
           # and the draw path, not just the clear.
           PS3RECOMP_METAL_HEADLESS=1 ./build/ps3recomp_host --draw
           PS3RECOMP_METAL_HEADLESS=1 ./build/ps3recomp_host --draw --frames=60
+          # Clear + a draw shaded by the GUEST's own fragment program, read out
+          # of RSX memory and decompiled to MSL. The program computes green
+          # while the vertex colour is red, so the built-in shader cannot pass
+          # this by accident.
+          PS3RECOMP_METAL_HEADLESS=1 ./build/ps3recomp_host --fp
+          PS3RECOMP_METAL_HEADLESS=1 ./build/ps3recomp_host --fp --frames=60
 
       # The boot path end to end on POSIX: a synthetic PPC64 image through the
       # loader, the lifter, a real compile and a real run. Everything else here
