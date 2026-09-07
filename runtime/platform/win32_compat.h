@@ -213,6 +213,12 @@ static inline BOOL SetEvent(HANDLE h)
     return TRUE;
 }
 
+/* Win32 reserves extra stack so a stack-overflow handler can still run. POSIX
+ * has no equivalent knob -- the size is fixed at pthread_create -- and the
+ * callers pass a large stack there anyway, so this is a no-op that exists to
+ * keep the shared code identical on both platforms. */
+static inline BOOL SetThreadStackGuarantee(ULONG* bytes) { (void)bytes; return TRUE; }
+
 static inline void Sleep(unsigned long ms)
 {
     struct timespec d = { (time_t)(ms / 1000ul), (long)(ms % 1000ul) * 1000000L };
@@ -225,6 +231,7 @@ typedef void* LPVOID;
 typedef DWORD (*PS3_THREAD_FN)(LPVOID);
 
 typedef struct { PS3_THREAD_FN fn; LPVOID arg; } ps3__thunk;
+typedef struct { pthread_t th; } ps3__thread;   /* what HANDLE points at */
 
 static inline void* ps3__thread_trampoline(void* p)
 {
@@ -234,8 +241,13 @@ static inline void* ps3__thread_trampoline(void* p)
     return NULL;
 }
 
-/* Only the "spawn and forget" subset used in-tree: the returned handle is not
- * waited on or closed anywhere, so the thread is detached. */
+/* Threads are created JOINABLE and the handle carries the pthread_t, because
+ * the SPURS policy-module path really does wait on its per-lane workers
+ * (WaitForMultipleObjects) -- detaching them there would let the dispatcher
+ * return before the lanes finished. Callers that neither wait nor close leave
+ * the thread un-reaped until exit; the runtime creates few enough threads for
+ * that to be a non-issue, and correctness on the path that does wait matters
+ * more. */
 static inline HANDLE CreateThread(void* sa, size_t stack, PS3_THREAD_FN fn,
                                   LPVOID arg, DWORD flags, DWORD* out_tid)
 {
@@ -247,14 +259,44 @@ static inline HANDLE CreateThread(void* sa, size_t stack, PS3_THREAD_FN fn,
 
     pthread_attr_t attr;
     pthread_attr_init(&attr);
-    pthread_attr_setdetachstate(&attr, PTHREAD_CREATE_DETACHED);
+    pthread_attr_setdetachstate(&attr, PTHREAD_CREATE_JOINABLE);
     if (stack) pthread_attr_setstacksize(&attr, stack < PTHREAD_STACK_MIN ? PTHREAD_STACK_MIN : stack);
 
-    pthread_t th;
-    int rc = pthread_create(&th, &attr, ps3__thread_trampoline, t);
+    ps3__thread* h = (ps3__thread*)calloc(1, sizeof(ps3__thread));
+    if (!h) { free(t); return NULL; }
+
+    int rc = pthread_create(&h->th, &attr, ps3__thread_trampoline, t);
     pthread_attr_destroy(&attr);
-    if (rc != 0) { free(t); return NULL; }
-    return (HANDLE)1;            /* non-NULL "succeeded"; never dereferenced */
+    if (rc != 0) { free(t); free(h); return NULL; }
+    return (HANDLE)h;
+}
+
+static inline BOOL CloseHandle(HANDLE h)
+{
+    if (!h) return FALSE;
+    ps3__thread* t = (ps3__thread*)h;
+    pthread_detach(t->th);
+    free(t);
+    return TRUE;
+}
+
+/* INFINITE only -- the in-tree callers pass nothing else. */
+static inline DWORD WaitForSingleObject(HANDLE h, DWORD ms)
+{
+    (void)ms;
+    if (!h) return 0xFFFFFFFFu;
+    ps3__thread* t = (ps3__thread*)h;
+    pthread_join(t->th, NULL);
+    return 0;                    /* WAIT_OBJECT_0 */
+}
+
+static inline DWORD WaitForMultipleObjects(DWORD n, const HANDLE* hs,
+                                           BOOL wait_all, DWORD ms)
+{
+    (void)wait_all; (void)ms;    /* the callers always wait for all of them */
+    for (DWORD i = 0; i < n; i++)
+        if (hs[i]) pthread_join(((ps3__thread*)hs[i])->th, NULL);
+    return 0;
 }
 
 #endif /* !_WIN32 */

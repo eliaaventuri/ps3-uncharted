@@ -399,9 +399,9 @@ static struct SpursInst* spurs_inst_find(u32 ea)
     return NULL;
 }
 
-#ifdef _WIN32
+
 static DWORD WINAPI spurs_kernel_thread(LPVOID p);
-#endif
+
 
 static s32 spurs_initialize_common(u32 spurs_ea, u32 nspus, const char* prefix)
 {
@@ -424,12 +424,12 @@ static s32 spurs_initialize_common(u32 spurs_ea, u32 nspus, const char* prefix)
     *(vm_base + spurs_ea + SPURS_NSPUS) = (u8)si->nspus;
     vm_write64(spurs_ea + SPURS_WKL_FLAG, 0xFFFFFFFFFFFFFFFFull); /* no receiver */
 
-#ifdef _WIN32
+
     if (!si->kernel_live) {
         si->kernel_live = 1;
         CreateThread(NULL, 1u << 20, spurs_kernel_thread, si, 0, NULL);
     }
-#endif
+
     printf("[cellSpurs] Initialize \"%s\" ea=0x%08X nSpus=%u (real BE instance + kernel poll)\n",
            si->prefix, spurs_ea, si->nspus);
     return CELL_OK;
@@ -1383,7 +1383,12 @@ static WklPm* spurs_resolve_pm(u32 wid)
     return r->fn ? r : NULL;
 }
 
-#ifdef _WIN32
+/* The SPURS kernel poller and the policy-module workers. These were Win32-only,
+ * so on POSIX no thread ever ran a policy module: cellSpursAddWorkload
+ * registered the workload and nothing ever dispatched it, while the log still
+ * claimed "kernel poll". Uncharted then spun at 100% CPU waiting for SPU work
+ * that could not happen. The only Win32 API the block needed and POSIX lacked
+ * was SetThreadStackGuarantee, now a no-op in win32_compat.h. */
 /* One virtual SPU running a workload's policy module. The WWS job manager
  * runs concurrently across N SPUs (RPCS3: jobmanagerCellSpursKernel0..N): each
  * claims jobs from the shared queue and advances its own lane of the sync
@@ -1608,7 +1613,7 @@ static DWORD WINAPI spurs_kernel_thread(LPVOID p)
         }
     }
 }
-#endif
+
 
 s32 cellSpursReadyCountStore(CellSpurs* spurs, CellSpursWorkloadId wid,
                              u32 value)
