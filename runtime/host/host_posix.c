@@ -188,6 +188,25 @@ static void upload_fragment_program(void)
     }
 }
 
+#define FPTEX_OFFSET 0x00031000u        /* the sampling program's own slot */
+
+/* TEX r0, tc0, unit 0 -- the guest program samples the bound texture. This is
+ * the combination that matters: the decompiled program AND the texture path in
+ * the same draw, so the expected pixel is the texture's colour and neither the
+ * built-in shader nor an unbound sampler can produce it by accident. */
+static void upload_sampling_program(void)
+{
+    static const u32 words[] = {
+        (0x17u << 24) | (0xFu << 9) | 1u | (4u << 13),  /* TEX, xyzw, END, in=TC0 */
+        (7u << 18) | 1u | ((0u<<9)|(1u<<11)|(2u<<13)|(3u<<15)),  /* uncond, src0=INPUT */
+        0u, 0u,
+    };
+    for (unsigned i = 0; i < sizeof(words) / sizeof(words[0]); i++) {
+        const u32 w = words[i];
+        guest_w32(IO_ADDR + FPTEX_OFFSET + i * 4u, (w << 16) | (w >> 16));
+    }
+}
+
 #define TVTX_OFFSET (VTX_OFFSET + 0x1000u)
 static void upload_textured_quad(void)
 {
@@ -269,11 +288,19 @@ static void emit_textured_draw(void)
  * title does. The RSX's `get` pointer lives inside cellGcmSys and chases `put`;
  * it is never rewound, so each frame must occupy fresh ring space rather than
  * overwrite the last one. */
+/* The textured quad, shaded by the guest's own sampling program. */
+static void emit_guest_fp_tex_draw(void)
+{
+    emit(NV4097_SET_SHADER_PROGRAM, FPTEX_OFFSET);
+    emit_textured_draw();
+}
+
 static void submit_frame(int with_draw)
 {
     emit(NV4097_SET_COLOR_CLEAR_VALUE, CLEAR_ARGB);
     emit(NV4097_CLEAR_SURFACE,         0xF0u);
-    if (with_draw == 3)      emit_guest_fp_draw();
+    if (with_draw == 4)      emit_guest_fp_tex_draw();
+    else if (with_draw == 3) emit_guest_fp_draw();
     else if (with_draw == 2) emit_textured_draw();
     else if (with_draw == 1) emit_triangle_draw();
 
@@ -299,6 +326,9 @@ int main(int argc, char** argv)
          * colour is red, so a backend still running its built-in shader is
          * caught by the pixel assertion rather than passing quietly. */
         else if (strcmp(argv[i], "--fp") == 0)     do_draw = 3;
+        /* --fp-tex: both at once -- the guest's program sampling the guest's
+         * texture, which is the shape every real material draw has. */
+        else if (strcmp(argv[i], "--fp-tex") == 0) do_draw = 4;
     }
 
     vm_base = (uint8_t*)calloc(1, VM_SIZE);
@@ -325,6 +355,8 @@ int main(int argc, char** argv)
     if (do_draw == 1) upload_triangle();
     if (do_draw == 2) { upload_texture(); upload_textured_quad(); }
     if (do_draw == 3) { upload_triangle(); upload_fragment_program(); }
+    if (do_draw == 4) { upload_texture(); upload_textured_quad();
+                        upload_sampling_program(); }
     submit_frame(do_draw);
 
     u32 got = host_backend_color();
@@ -357,7 +389,8 @@ int main(int argc, char** argv)
          * the TEXTURE's colour, not the quad's green -- so it also proves the
          * texture reached the sampler through layout, decode and the crossbar.
          */
-        u32 want = (do_draw == 3) ? FP_ARGB
+        u32 want = (do_draw == 4) ? TEX_ARGB
+                 : (do_draw == 3) ? FP_ARGB
                  : (do_draw == 2) ? TEX_ARGB
                  : (do_draw == 1) ? 0xFFFF0000u
                                   : CLEAR_ARGB;

@@ -87,6 +87,10 @@ jobs:
           # vertex colour, so this fails unless the texture really reached the
           # sampler through layout, decode and the crossbar.
           PS3RECOMP_METAL_HEADLESS=1 ./build/ps3recomp_host --tex
+          # Both at once: the guest's own program sampling the guest's texture,
+          # which is the shape every real material draw has.
+          PS3RECOMP_METAL_HEADLESS=1 ./build/ps3recomp_host --fp-tex
+          PS3RECOMP_METAL_HEADLESS=1 ./build/ps3recomp_host --fp-tex --frames=60
 
       # The boot path end to end on POSIX: a synthetic PPC64 image through the
       # loader, the lifter, a real compile and a real run. Everything else here
