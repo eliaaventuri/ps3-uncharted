@@ -116,6 +116,43 @@ il log è pulito —
 Le mappature che prima rispondevano `FFFFFFFF` ora riescono, il video è
 configurato a 1280x720 (pitch 5120 = 1280x4) e il backend RSX è su.
 
+## Sessione 11 — chi scrive LS 0x12A0 / 0x12C0, e dove sta davvero il PPU
+
+**Risposta alla domanda: le scrive il policy module stesso.** Non sono una
+casella postale in attesa di un DMA esterno: `stqa` verso 0x12A0 a LS 0x24CC,
+0x2F2C, 0x327C, 0x33DC; verso 0x12C0 a 0x1A7C, 0x2D04, 0x32DC. Sono le variabili
+di stato della sua macchina a stati, e il loop a 0x2DE0 è la sua attesa
+legittima di lavoro da fare.
+
+Quindi il modulo SPU non è bloccato: è **inattivo perché non arrivano job**. Il
+lavoro si è spostato di nuovo sul PPU.
+
+**Il PPU non è in deadlock.** Il rilevatore del progetto (`YDKJ_STUCKMAX`,
+default 2000 chiamate identiche di fila) non scatta mai: i target cambiano, il
+titolo sta lavorando.
+
+**E ora sappiamo su cosa.** Un EBOOT retail è stripped, ma Uncharted è compilato
+con gli assert, che portano `__PRETTY_FUNCTION__`. Il nuovo
+`tools/names_from_asserts.py` li risolve — devono essere seguiti in due passi,
+perché il puntatore alla stringa sta a un offset rispetto a una base che a sua
+volta viene dal TOC — e recupera **1772 nomi su 14605 funzioni**. Lo stack che
+sembrava anonimo si legge così:
+
+    Err BigInit()
+      bool PlatformInit(U32, U32, U32, bool, bool)
+        void RenderTargetManager::CreateCorrespondenceTextureForRenderTarget(U32)
+
+Vicine: `RenderTargetManager::AllocateOne2DMsaaRenderTarget` e
+`RenderSurfaceManager::AllocateOneRenderSurface`.
+
+Il titolo è ancora dentro **l'inizializzazione grafica**, non nel game loop — e
+il vecchio errore "dont have enough space for primary render target" non compare
+più: le allocazioni riescono.
+
+**Ipotesi in verifica:** è lentezza, non stallo. I chunk liftati erano compilati
+a `-O0`; 2,16 milioni di righe di C++ non ottimizzato rendono l'inizializzazione
+di un motore lentissima. Ricompilazione a `-O1` in corso (`build.sh` aggiornato).
+
 ## Sessione 10 — il policy module gira davvero
 
 Due errori, uno mio e uno di configurazione, tenevano fermo il kernel SPU.
