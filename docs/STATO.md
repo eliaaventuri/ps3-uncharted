@@ -43,7 +43,42 @@ Il lift completo richiede **12 secondi**: 18.628 funzioni, 4 chunk, 2,16
 milioni di righe di C++. La nota in `docs/PPU_RECOMP.md` sugli "88 MB in un
 file" è superata: il lifter emette già chunk.
 
-## Il blocco attuale
+## Sessione 5 — il SIGBUS è risolto
+
+**Causa:** `ppu_set_stack` lasciava 48 byte sopra sp. Un corpo di thread è
+compilato come una funzione qualsiasi e scrive nel frame che il suo *chiamante*
+dovrebbe possedere — e un thread non ha chiamante. Il Job Manager di Uncharted
+scriveva a sp+0x30, poi (alzando la riserva) sp+0x80, poi sp+0x200: sempre un
+byte oltre la fine dello stack, dentro la guard page del blocco successivo.
+Ora la riserva è 4 KB. Windows non lo vedeva perché lì le pagine guest si
+committano su richiesta invece di essere PROT_NONE.
+
+**Lo strumento che l'ha trovato:** la trap POSIX (`ps3_install_guest_ptr_trap`,
+prima uno stub vuoto che *nessun port chiamava*). Classifica il fault, traduce
+l'indirizzo host in EA guest e stampa cia/lr/sp e la funzione responsabile.
+
+**Dove arriva ora** (con `PS3RECOMP_METAL_HEADLESS=1`, 3195 righe di log, nessun
+crash — si ferma in attesa):
+
+- i due thread del Job Manager attendono sulle proprie event queue;
+- SPURS: `GetInfo`, **`AddWorkload(wid=0, size=12160)`** — carica il programma SPU;
+- `[SPU] initialize(nspu=6)`;
+- carica i moduli: SPURS, IO, AUDIO, FS, NET, NETCTL, LV2DBG;
+- **manda i primi comandi RSX**, e lì si ferma: `FIFO JUMP to unmapped IO
+  0x1E8101C0`, poi uno spin loop (`HOTREAD spinning on 0x00000000`).
+
+## I prossimi tre blocchi, in ordine
+
+1. **`NSWindow should only be instantiated on the main thread`** — con finestra
+   il processo muore: il backend crea la finestra da un thread guest. Serve
+   marshalling su main thread (`dispatch_sync` sulla main queue). Headless
+   aggira il problema ma non è la soluzione.
+2. **`FIFO JUMP to unmapped IO`** — il gioco salta a un indirizzo IO che il
+   nostro `cellGcmSys` non ha mappato: da qui non escono più comandi.
+3. **Gli `[vm] OOB access 0xFFFFFExx`** — decine di accessi a indirizzi vicini a
+   -1: puntatori non tradotti o parametri opzionali passati male.
+
+## Il blocco storico (risolto, tenuto come riferimento)
 
 Crash in `vm_write64` da un thread del Job Manager (`EXC_BAD_ACCESS`,
 `KERN_PROTECTION_FAILURE`). L'indirizzo host cambia a ogni run per via
