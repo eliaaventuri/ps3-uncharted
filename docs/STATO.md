@@ -116,7 +116,34 @@ il log è pulito —
 Le mappature che prima rispondevano `FFFFFFFF` ora riescono, il video è
 configurato a 1280x720 (pitch 5120 = 1280x4) e il backend RSX è su.
 
-## Sessione 8 — cosa aspetta il gioco
+## Sessione 9 — SBLOCCATO: il kernel SPURS gira
+
+**Uncharted abilitava i workload correttamente da sempre.** Lo stato nella
+struttura SPURS era già 2 (*enabled*). Il problema era che **su POSIX nessuno
+guardava**: le 225 righe che contengono `spurs_kernel_thread` e
+`spurs_pm_worker` stavano dentro un `#ifdef _WIN32`, e così la `CreateThread`
+che avvia il poller. `cellSpursAddWorkload` registrava il workload e nulla lo
+dispacciava mai — mentre il log stampava comunque "kernel poll".
+
+Il blocco non era Win32 per sostanza: usa `DWORD`/`WINAPI`/`LPVOID`/`HANDLE`,
+`Sleep`, `CreateThread`, `CloseHandle` — tutti già in `win32_compat.h` — più
+`SetThreadStackGuarantee`, che mancava e ora è un no-op.
+
+Una conseguenza andava sistemata: il percorso del policy module **aspetta** i
+suoi worker per-lane con `WaitForMultipleObjects`. I thread del compat erano
+detached, quindi il dispatcher sarebbe tornato prima che le lane finissero. Ora
+sono joinable e `HANDLE` porta il `pthread_t`.
+
+Risultato:
+
+    [spurs-kern] "" poll thread live: ea=0x1057BF80 pm=enabled
+    [spurs-kern] "" dispatch wid=0 (enabled, state=2) image=2 ready=0
+    [spurs-pm] DMA cmd=0x40 lsa=0x00B00 ea=0x02AE53E80 size=0x100 tag=8
+
+Il codice SPU ricompilato **esegue** e fa DMA fra local store e memoria guest.
+`image=2` è il policy module liftato nella sessione 8.
+
+## Sessione 8 — cosa aspettava il gioco
 
 **Non aspetta: gira a vuoto.** 101% di CPU, log fermo a 389 righe per cinque
 minuti. Il thread guest alterna fra `ps3_indirect_call` e `func_004C5464` —
