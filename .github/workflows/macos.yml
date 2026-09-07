@@ -94,6 +94,16 @@ jobs:
       - name: Check the PPU boot scaffold (ratchet)
         run: python tools/check_ppu_scaffold.py
 
+      # The fragment-program decompiler's MSL output, checked by compiling it
+      # with Apple's own metal compiler: a shader that looks plausible is not
+      # evidence, one that compiles is. The HLSL path is unaffected -- its
+      # output stays byte-identical, which the D3D12 job keeps honest.
+      - name: Run the RSX fragment MSL tests
+        run: |
+          clang -std=c11 -Wall -Wextra -I include -o /tmp/test_fp_msl \
+                libs/video/tests/test_fp_msl.c libs/video/rsx_fp_decompiler.c
+          /tmp/test_fp_msl
+
       # RSX texture layout -- format class, row sizes, Morton addressing. Pure
       # arithmetic with no host API in it, so it runs everywhere, and it is the
       # regression net for having lifted that maths out of the D3D12 uploader.

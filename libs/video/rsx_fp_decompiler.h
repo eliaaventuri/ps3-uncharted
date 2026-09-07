@@ -64,6 +64,13 @@ extern unsigned long long g_rsx_fp_nonfinite_constants;
  *          control word is available (standalone tests) to fall back to the
  *          legacy "whichever of r0/h0 was written" heuristic. */
 #define RSX_FP_CTRL_AUTO 0xFFFFFFFFu
+
+/* Output language. HLSL is what the D3D12 backend hands to D3DCompile; MSL is
+ * Metal's, for the macOS backend. The instruction bodies are all but identical
+ * between the two -- float4, swizzles and most intrinsics are spelled the same
+ * -- so only the preamble, the sampling syntax, four intrinsics and MSL's
+ * stricter rules (no C-style casts, no vector-condition ternary) differ. */
+typedef enum { RSX_FP_LANG_HLSL = 0, RSX_FP_LANG_MSL = 1 } rsx_fp_lang;
 int rsx_fp_decompile(const u8* ucode, u32 max_bytes, u32 ctrl, char* out, u32 out_size);
 
 /* Apply the NV4097 fixed-function alpha test to an already-decompiled pixel
@@ -103,6 +110,15 @@ int rsx_fp_decompile_ex(const u8* ucode, u32 max_bytes, u32 ctrl,
 int rsx_fp_decompile_buffered_ex(
     const u8* ucode, u32 max_bytes, u32 ctrl, u32 tex_cube_mask,
     char* out, u32 out_size, u32* out_constant_count);
+
+/* Language-selecting variant of rsx_fp_decompile_buffered_ex. With
+ * RSX_FP_LANG_HLSL the output is byte-identical to that function; with
+ * RSX_FP_LANG_MSL it is a Metal fragment function named rsx_fp_main, taking
+ * the texture/sampler banks at [[texture(0)]]/[[sampler(0)]] and, when
+ * buffered, the constants at [[buffer(1)]] and the alpha ref at [[buffer(2)]]. */
+int rsx_fp_decompile_lang(
+    const u8* ucode, u32 max_bytes, u32 ctrl, u32 tex_cube_mask, int buffered,
+    rsx_fp_lang lang, char* out, u32 out_size, u32* out_constant_count);
 
 /* Extract the exact runtime inline-CONST payload. Returns the slot count on
  * success or -1 for an unterminated/truncated/oversized program. */

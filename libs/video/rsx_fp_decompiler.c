@@ -399,8 +399,12 @@ int rsx_fp_decompile(const u8* ucode, u32 max_bytes, u32 ctrl, char* out, u32 ou
 
 static int rsx_fp_decompile_internal(
     const u8* ucode, u32 max_bytes, u32 ctrl, u32 tex_cube_mask,
-    int buffered, char* out, u32 out_size, u32* out_constant_count)
+    int buffered, rsx_fp_lang lang, char* out, u32 out_size,
+    u32* out_constant_count)
 {
+    /* The two dialects diverge in a handful of places only; `msl` selects the
+     * Metal spelling at each of them. */
+    const int msl = (lang == RSX_FP_LANG_MSL);
     if (!ucode || !out || out_size == 0) return -1;
 
     u32 buffered_constant_count = 0;
@@ -419,6 +423,17 @@ static int rsx_fp_decompile_internal(
 
     /* Preamble: PSInput matches the backend's placeholder layout; temp/half
      * register files; texture+sampler banks for TEX. */
+    if (msl) {
+        out_puts(&o,
+            "#include <metal_stdlib>\n"
+            "using namespace metal;\n"
+            "struct PSInput {\n"
+            "    float4 position [[position]]; float4 col0; float4 col1;\n"
+            "    float4 fog;\n"
+            "    float4 tc0; float4 tc1; float4 tc2; float4 tc3;\n"
+            "    float4 tc4; float4 tc5; float4 tc6; float4 tc7;\n"
+            "};\n");
+    } else {
     out_puts(&o,
         "struct PSInput {\n"
         "    float4 position : SV_POSITION; float4 col0 : COLOR0; float4 col1 : COLOR1;\n"
@@ -426,11 +441,38 @@ static int rsx_fp_decompile_internal(
         "    float4 tc0:TEXCOORD0; float4 tc1:TEXCOORD1; float4 tc2:TEXCOORD2; float4 tc3:TEXCOORD3;\n"
         "    float4 tc4:TEXCOORD4; float4 tc5:TEXCOORD5; float4 tc6:TEXCOORD6; float4 tc7:TEXCOORD7;\n"
         "};\n");
+    }
     /* Texture bank. With no cube units (the default) emit the exact legacy
      * array declaration so 2D-only programs are byte-identical. When any unit
      * is a cubemap, declare each unit individually at its t-register so the
      * cube units can be TextureCube while the rest stay Texture2D. */
-    if (tex_cube_mask == 0) {
+    if (msl) {
+        /* Metal takes the resource bindings as function parameters, so the
+         * banks and the constant buffers are all part of one signature. */
+        out_puts(&o, "fragment float4 rsx_fp_main(PSInput input [[stage_in]]");
+        if (tex_cube_mask == 0) {
+            out_puts(&o, ",\n    array<texture2d<float>, 16> rsx_tex [[texture(0)]]");
+        } else {
+            char decl[96];
+            for (u32 u = 0; u < 16; u++) {
+                snprintf(decl, sizeof(decl),
+                         ",\n    %s<float> rsx_tex%u [[texture(%u)]]",
+                         ((tex_cube_mask >> u) & 1u) ? "texturecube" : "texture2d",
+                         u, u);
+                out_puts(&o, decl);
+            }
+        }
+        out_puts(&o, ",\n    array<sampler, 16> rsx_samp [[sampler(0)]]");
+        if (buffered) {
+            out_puts(&o,
+                ",\n    constant float4* fp_constants [[buffer(1)]]"
+                ",\n    constant float4& fp_alpha [[buffer(2)]]");
+        }
+        out_puts(&o, ")\n{\n"
+            "    float4 r[48]; float4 h[48];\n"
+            "    for (int _i = 0; _i < 48; _i++) { r[_i] = float4(0); h[_i] = float4(0); }\n"
+            "    float4 cc0 = float4(0); float4 cc1 = float4(0);\n");
+    } else if (tex_cube_mask == 0) {
         out_puts(&o, "Texture2D    rsx_tex[16] : register(t0);\n");
     } else {
         char decl[64];
@@ -440,6 +482,7 @@ static int rsx_fp_decompile_internal(
             out_puts(&o, decl);
         }
     }
+    if (!msl) {
     out_puts(&o,
         "SamplerState rsx_samp[16] : register(s0);\n"
     );
@@ -464,6 +507,7 @@ static int rsx_fp_decompile_internal(
         /* Condition-code registers for exec_if predication / set_cond. Reset
          * to 0 (NV40 CC power-up state). Dead in non-predicated programs. */
         "    float4 cc0 = (float4)0; float4 cc1 = (float4)0;\n");
+    }
 
     int wrote_r0 = 0, wrote_h0 = 0;
     int count = 0;
@@ -565,7 +609,7 @@ static int rsx_fp_decompile_internal(
         case OP_DP4: snprintf(rhs, sizeof(rhs), "dot((%s), (%s))", a, b); break;
         case OP_MIN: snprintf(rhs, sizeof(rhs), "min((%s), (%s))", a, b); break;
         case OP_MAX: snprintf(rhs, sizeof(rhs), "max((%s), (%s))", a, b); break;
-        case OP_FRC: snprintf(rhs, sizeof(rhs), "frac(%s)", a); break;
+        case OP_FRC: snprintf(rhs, sizeof(rhs), msl ? "fract(%s)" : "frac(%s)", a); break;
         case OP_FLR: snprintf(rhs, sizeof(rhs), "floor(%s)", a); break;
         case OP_RCP: snprintf(rhs, sizeof(rhs), "(1.0 / (%s).x)", a); break;
         /* Real RSX RSQ ignores the input's sign — 1/sqrt(|x|), not 1/sqrt(x)
@@ -594,45 +638,66 @@ static int rsx_fp_decompile_internal(
          * on why it can't use a blend here. */
         case OP_DIVSQ:
             snprintf(rhs, sizeof(rhs),
-                     "(abs(%s) > 0.0 ? (%s) / sqrt(abs((%s).x)) : (float4)0.0)",
-                     a, a, b);
+                     msl ? "select(float4(0), (%s) / sqrt(abs((%s).x)), abs(%s) > 0.0)"
+                         : "(abs(%s) > 0.0 ? (%s) / sqrt(abs((%s).x)) : (float4)0.0)",
+                     a, msl ? b : a, msl ? a : b);
             break;
         case OP_DP2: snprintf(rhs, sizeof(rhs), "dot((%s).xy, (%s).xy)", a, b); break;
         case OP_NRM: snprintf(rhs, sizeof(rhs), "float4(normalize((%s).xyz), 1.0)", a); break;
-        case OP_LRP: snprintf(rhs, sizeof(rhs), "lerp((%s), (%s), (%s))", c, b, a); break;
+        case OP_LRP: snprintf(rhs, sizeof(rhs),
+                     msl ? "mix((%s), (%s), (%s))" : "lerp((%s), (%s), (%s))",
+                     c, b, a); break;
         /* Texture/branch fences: ordering hints with no result -- no-op. */
         case OP_FENCT: case OP_FENCB: rhs[0] = '\0'; handled = 0; break;
-        case OP_SLT: snprintf(rhs, sizeof(rhs), "(float4)((%s) <  (%s))", a, b); break;
-        case OP_SGE: snprintf(rhs, sizeof(rhs), "(float4)((%s) >= (%s))", a, b); break;
-        case OP_SLE: snprintf(rhs, sizeof(rhs), "(float4)((%s) <= (%s))", a, b); break;
-        case OP_SGT: snprintf(rhs, sizeof(rhs), "(float4)((%s) >  (%s))", a, b); break;
-        case OP_SNE: snprintf(rhs, sizeof(rhs), "(float4)((%s) != (%s))", a, b); break;
-        case OP_SEQ: snprintf(rhs, sizeof(rhs), "(float4)((%s) == (%s))", a, b); break;
+        case OP_SLT: snprintf(rhs, sizeof(rhs),
+                     msl ? "float4((%s) <  (%s))" : "(float4)((%s) <  (%s))",
+                     a, b); break;
+        case OP_SGE: snprintf(rhs, sizeof(rhs),
+                     msl ? "float4((%s) >= (%s))" : "(float4)((%s) >= (%s))",
+                     a, b); break;
+        case OP_SLE: snprintf(rhs, sizeof(rhs),
+                     msl ? "float4((%s) <= (%s))" : "(float4)((%s) <= (%s))",
+                     a, b); break;
+        case OP_SGT: snprintf(rhs, sizeof(rhs),
+                     msl ? "float4((%s) >  (%s))" : "(float4)((%s) >  (%s))",
+                     a, b); break;
+        case OP_SNE: snprintf(rhs, sizeof(rhs),
+                     msl ? "float4((%s) != (%s))" : "(float4)((%s) != (%s))",
+                     a, b); break;
+        case OP_SEQ: snprintf(rhs, sizeof(rhs),
+                     msl ? "float4((%s) == (%s))" : "(float4)((%s) == (%s))",
+                     a, b); break;
         case OP_TEX:
             if ((tex_cube_mask >> tex_unit) & 1u)
                 /* Cubemap: sample with the full 3-component direction vector. */
                 snprintf(rhs, sizeof(rhs),
-                         "rsx_tex%u.Sample(rsx_samp[%u], (%s).xyz)", tex_unit, tex_unit, a);
+                         msl ? "rsx_tex%u.sample(rsx_samp[%u], (%s).xyz)"
+                            : "rsx_tex%u.Sample(rsx_samp[%u], (%s).xyz)", tex_unit, tex_unit, a);
             else if (tex_cube_mask)
                 snprintf(rhs, sizeof(rhs),
-                         "rsx_tex%u.Sample(rsx_samp[%u], (%s).xy)", tex_unit, tex_unit, a);
+                         msl ? "rsx_tex%u.sample(rsx_samp[%u], (%s).xy)"
+                            : "rsx_tex%u.Sample(rsx_samp[%u], (%s).xy)", tex_unit, tex_unit, a);
             else
                 snprintf(rhs, sizeof(rhs),
-                         "rsx_tex[%u].Sample(rsx_samp[%u], (%s).xy)", tex_unit, tex_unit, a);
+                         msl ? "rsx_tex[%u].sample(rsx_samp[%u], (%s).xy)"
+                            : "rsx_tex[%u].Sample(rsx_samp[%u], (%s).xy)", tex_unit, tex_unit, a);
             break;
         case OP_TXP:
             if ((tex_cube_mask >> tex_unit) & 1u)
                 /* Projective divide is meaningless for a cube lookup; sample
                  * the direction directly. */
                 snprintf(rhs, sizeof(rhs),
-                         "rsx_tex%u.Sample(rsx_samp[%u], (%s).xyz)", tex_unit, tex_unit, a);
+                         msl ? "rsx_tex%u.sample(rsx_samp[%u], (%s).xyz)"
+                            : "rsx_tex%u.Sample(rsx_samp[%u], (%s).xyz)", tex_unit, tex_unit, a);
             else if (tex_cube_mask)
                 snprintf(rhs, sizeof(rhs),
-                         "rsx_tex%u.Sample(rsx_samp[%u], (%s).xy / (%s).w)",
+                         msl ? "rsx_tex%u.sample(rsx_samp[%u], (%s).xy / (%s).w)"
+                            : "rsx_tex%u.Sample(rsx_samp[%u], (%s).xy / (%s).w)",
                          tex_unit, tex_unit, a, a);
             else
                 snprintf(rhs, sizeof(rhs),
-                         "rsx_tex[%u].Sample(rsx_samp[%u], (%s).xy / (%s).w)",
+                         msl ? "rsx_tex[%u].sample(rsx_samp[%u], (%s).xy / (%s).w)"
+                            : "rsx_tex[%u].Sample(rsx_samp[%u], (%s).xy / (%s).w)",
                          tex_unit, tex_unit, a, a);
             break;
         case OP_KIL:
@@ -649,7 +714,8 @@ static int rsx_fp_decompile_internal(
             } else {
                 char kil[128];
                 snprintf(kil, sizeof(kil),
-                         "    if (any(cc%u.%s %s (float4)0)) discard;\n",
+                         msl ? "    if (any(cc%u.%s %s 0.0f)) discard;\n"
+                             : "    if (any(cc%u.%s %s (float4)0)) discard;\n",
                          cc_read, cswz, cmp_op);
                 out_puts(&o, kil);
             }
@@ -693,14 +759,16 @@ static int rsx_fp_decompile_internal(
                  * non-predicated programs in this capture emit unchanged. */
                 char line[800];
                 snprintf(line, sizeof(line),
-                         "    { float4 _v = (float4)(%s)%s;%s %s[%u].%s = _v.%s; }\n",
+                         msl ? "    { float4 _v = float4(%s)%s;%s %s[%u].%s = _v.%s; }\n"
+                             : "    { float4 _v = (float4)(%s)%s;%s %s[%u].%s = _v.%s; }\n",
                          rhs, scale_txt[res_scale], sat, reg, dst_idx, m, m);
                 out_puts(&o, line);
             } else {
                 /* Predicated and/or CC-writing instruction. */
                 char buf[1200];
                 snprintf(buf, sizeof(buf),
-                         "    { float4 _v = (float4)(%s)%s;%s\n",
+                         msl ? "    { float4 _v = float4(%s)%s;%s\n"
+                             : "    { float4 _v = (float4)(%s)%s;%s\n",
                          rhs, scale_txt[res_scale], sat);
                 out_puts(&o, buf);
                 if (has_dest) {
@@ -715,8 +783,10 @@ static int rsx_fp_decompile_internal(
                          * lerp(dst, _v, mask) == mask ? _v : dst since the
                          * mask is exactly 0.0/1.0 from the bool->float cast. */
                         snprintf(buf, sizeof(buf),
-                                 "      float4 _p = (float4)((cc%u).%s %s (float4)0.0);\n"
-                                 "      %s[%u].%s = lerp(%s[%u].%s, _v.%s, _p.%s);\n",
+                                 msl ? "      float4 _p = float4((cc%u).%s %s 0.0f);\n"
+                                       "      %s[%u].%s = mix(%s[%u].%s, _v.%s, _p.%s);\n"
+                                     : "      float4 _p = (float4)((cc%u).%s %s (float4)0.0);\n"
+                                       "      %s[%u].%s = lerp(%s[%u].%s, _v.%s, _p.%s);\n",
                                  cc_read, cswz, cmp_op,
                                  reg, dst_idx, m, reg, dst_idx, m, m, m);
                     }
@@ -751,20 +821,23 @@ static int rsx_fp_decompile_internal(
      * shaders accumulate into fp32 temps (r2/r3/r4) but write their FINAL
      * color to h0 — the old "wrote_r0 => return r0" heuristic returned a stale
      * intermediate, producing flat/constant surfaces. */
-    if (ctrl == RSX_FP_CTRL_AUTO) {
-        /* No control word (standalone tests): legacy heuristic. */
-        if (wrote_r0 || !wrote_h0)
-            out_puts(&o, "    float4 _o = r[0];\n"
-                         "    return (_o == _o) ? _o : (float4)0;\n}\n");
-        else
-            out_puts(&o, "    float4 _o = h[0];\n"
-                         "    return (_o == _o) ? _o : (float4)0;\n}\n");
-    } else if (ctrl & FP_CTRL_32BIT_EXPORTS) {
-        out_puts(&o, "    float4 _o = r[0];\n"
-                     "    return (_o == _o) ? _o : (float4)0;\n}\n");
-    } else {
-        out_puts(&o, "    float4 _o = h[0];\n"
-                     "    return (_o == _o) ? _o : (float4)0;\n}\n");
+    {
+        /* NaN-scrub of the output. HLSL selects per component with `?:`; MSL
+         * has no vector-condition ternary, so it uses select() -- same
+         * component-wise semantics. */
+        const char* ret_r = msl
+            ? "    float4 _o = r[0];\n    return select(float4(0), _o, _o == _o);\n}\n"
+            : "    float4 _o = r[0];\n    return (_o == _o) ? _o : (float4)0;\n}\n";
+        const char* ret_h = msl
+            ? "    float4 _o = h[0];\n    return select(float4(0), _o, _o == _o);\n}\n"
+            : "    float4 _o = h[0];\n    return (_o == _o) ? _o : (float4)0;\n}\n";
+
+        if (ctrl == RSX_FP_CTRL_AUTO) {
+            /* No control word (standalone tests): legacy heuristic. */
+            out_puts(&o, (wrote_r0 || !wrote_h0) ? ret_r : ret_h);
+        } else {
+            out_puts(&o, (ctrl & FP_CTRL_32BIT_EXPORTS) ? ret_r : ret_h);
+        }
     }
     (void)wrote_r0; (void)wrote_h0;
 
@@ -776,7 +849,8 @@ int rsx_fp_decompile_ex(const u8* ucode, u32 max_bytes, u32 ctrl,
                         u32 tex_cube_mask, char* out, u32 out_size)
 {
     return rsx_fp_decompile_internal(
-        ucode, max_bytes, ctrl, tex_cube_mask, 0, out, out_size, NULL);
+        ucode, max_bytes, ctrl, tex_cube_mask, 0, RSX_FP_LANG_HLSL,
+        out, out_size, NULL);
 }
 
 int rsx_fp_decompile_buffered_ex(
@@ -784,8 +858,8 @@ int rsx_fp_decompile_buffered_ex(
     char* out, u32 out_size, u32* out_constant_count)
 {
     return rsx_fp_decompile_internal(
-        ucode, max_bytes, ctrl, tex_cube_mask, 1, out, out_size,
-        out_constant_count);
+        ucode, max_bytes, ctrl, tex_cube_mask, 1, RSX_FP_LANG_HLSL,
+        out, out_size, out_constant_count);
 }
 
 static float fp_half_to_float(u16 h)
@@ -999,4 +1073,13 @@ u32 rsx_fp_code_hash(const u8* ucode, u32 max_bytes)
         if (w0 & FP_END) break;
     }
     return h;
+}
+
+int rsx_fp_decompile_lang(
+    const u8* ucode, u32 max_bytes, u32 ctrl, u32 tex_cube_mask, int buffered,
+    rsx_fp_lang lang, char* out, u32 out_size, u32* out_constant_count)
+{
+    return rsx_fp_decompile_internal(ucode, max_bytes, ctrl, tex_cube_mask,
+                                     buffered, lang, out, out_size,
+                                     out_constant_count);
 }
