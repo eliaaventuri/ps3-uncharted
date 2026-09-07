@@ -1,78 +1,67 @@
 # Stato del progetto
 
-Ultimo aggiornamento: **7 settembre 2026** — sessione 2.
+Ultimo aggiornamento: **7 settembre 2026** — sessione 3.
 
 ## Dove siamo
 
-Fase 2 (far partire un gioco su macOS): **il percorso di boot esegue codice
-PowerPC ricompilato su macOS arm64**. Non è un gioco — è un'immagine sintetica —
-ma loader, registrazione, HLE, syscall e `ppu_run` hanno eseguito codice guest
-fino a un ritorno pulito, ed è il primo caso su questa piattaforma.
+Fase 2 fatta nella sostanza (il boot esegue codice guest su macOS) e **Fase 3
+arrivata ai due pezzi che il README upstream dichiara mancanti per Metal**: i
+fragment program del guest e le texture. Entrambi ora funzionano.
 
 | | stato |
 |---|---|
-| Runtime library arm64 | compila |
-| Suite del lifter (9) · SPU (63) · RSX | verdi |
-| Metal end-to-end (`ps3recomp_host`) | clear, draw, 60 frame: pixel corretti |
+| Runtime library arm64, suite lifter/SPU/RSX | verdi |
 | Ratchet PPU boot scaffold | 0 (era 39) |
-| **Boot POSIX end-to-end** | **PASSED** su immagine sintetica |
+| Boot POSIX end-to-end | PASSED (immagine sintetica) |
+| Metal: clear, flip, draw | OK |
+| **Metal: fragment program del guest** | **OK** (`--fp`) |
+| **Metal: texture** | **OK** (`--tex`) |
+| **Metal: programma del guest che campiona la texture** | **OK** (`--fp-tex`) |
 | Far girare **Uncharted** | no — manca l'EBOOT decifrato |
 
-## Scoperta che cambia il piano
+## Scoperta della sessione 2, ancora la più importante
 
-**Uncharted: Drake's Fortune (BCUS98103) è il titolo di riferimento di ps3recomp
-fin dall'inizio**, non un obiettivo lontano. Da `docs/PPU_RECOMP.md` e
-`docs/SPU_LIFTER.md`:
+**Uncharted: Drake's Fortune (BCUS98103) è il titolo di riferimento di
+ps3recomp fin dall'inizio**: 14.104 funzioni, 172 import (69% coperti), ISA
+lifter al 99,8% su codice Uncharted reale, boot upstream fermo a
+`sys_initialize_tls`. Lato SPU: 1 immagine estratta dall'EBOOT, 461 funzioni,
+0 gap del lifter. Vedi `docs/PPU_RECOMP.md` e `docs/SPU_LIFTER.md`.
 
-- **14.104 funzioni** (via tabella OPD), entry `0x10230`, TOC `0x7d3190`;
-- **172 import** su 12 librerie, copertura HLE **69%** (118/172), cellGcmSys 100%;
-- copertura ISA del lifter PPU: **99,8%** su codice Uncharted reale;
-- il primo boot upstream si ferma a **`sys_initialize_tls`** (NID `0x744680A2`),
-  la prima chiamata del CRT;
-- lato SPU: **1 immagine estratta** dall'EBOOT (39.608 B), **461 funzioni**
-  rilevate, **0 gap del lifter**, e la funzione entry esegue fino a un ritorno
-  naturale nell'harness;
-- il lifter ha già `--trace` per fare il diff contro RPCS3.
+## Fatto in sessione 3
 
-Conseguenza pratica: **l'EBOOT decifrato serve ora**, non alla Fase 4. È il
-prossimo collo di bottiglia del progetto.
+1. **Il decompiler dei fragment program emette anche MSL.**
+   `rsx_fp_decompile_lang(..., RSX_FP_LANG_MSL, ...)`. I corpi sono quasi
+   identici fra i due dialetti; divergono preambolo, `frac`/`lerp`/`.Sample()`,
+   i cast C-style (vietati in MSL) e il ternario a condizione vettoriale
+   (sostituito da `select`). Test `libs/video/tests/test_fp_msl.c`: otto
+   programmi compilati dal compilatore `metal` di Apple, 8/8.
+   **L'HLSL resta byte-identico** — verificato su 256 combinazioni, 7008 righe.
+2. **Il backend Metal esegue i programmi del guest.** Una libreria compilata a
+   runtime per programma, in cache, con fallback al builtin.
+3. **Il backend Metal carica e campiona le texture**, riusando
+   `rsx_texture_layout`/`rsx_texture_decode` condivisi con D3D12.
+4. **Tre bug trovati e corretti nel test host**: il formato texture andava nei
+   bit 8-15 e non nel byte basso; mancava `ppu_vm_size`, quindi i backend non
+   avevano un limite per il controllo di validità; l'indirizzo texture va
+   risolto come in `rsx_vertex_fetch` (bit 31 = MAIN) e **validato**, perché
+   prima uno stato incoerente faceva SIGSEGV dentro `rsx_texture_decode`.
 
-Nota: `docs/PPU_RECOMP.md` dice che il lift completo sarebbe "88 MB di C in un
-file" e che lo splitting è il lavoro di scaling principale. **Non è più vero**:
-il lifter emette già chunk (`ppu_recomp_000.cpp` …). La documentazione upstream
-è indietro rispetto al codice.
+## Cosa manca ancora al backend Metal
 
-## Fatto in sessione 2
-
-1. **`vm.h`: allineamento alla pagina host.** `mprotect` rifiuta intervalli non
-   multipli della pagina host (16 KB su Apple Silicon, 4 KB nel codice): ogni
-   `vm_commit` guest falliva e la scrittura seguente andava in **SIGBUS** —
-   compreso il commit dei PT_LOAD nel loader. Aggiunte `vm_host_page()` /
-   `vm_host_range()`; guard page dello stack portata a una pagina host intera.
-   Nuovo test `runtime/memory/tests/test_vm_page_align.c` (6/6).
-2. **Primo boot POSIX.** `tools/make_test_elf.py` (genera un PPC64 minimo),
-   `runtime/ppu/tests/boot_smoke/main.cpp` (il port minimo), e
-   `tools/test_boot_posix.py` che lega generazione → lift → compilazione →
-   esecuzione. Aggiunto allo workflow macOS.
-3. **Link su Mach-O.** `ppu_hle.cpp` chiama l'hook SPURS di flOw con una
-   dichiarazione `weak`: ELF risolve a 0 da solo, Mach-O no. Serve
-   `-Wl,-U,_flow_spurs_kernel_spawn_postinit`, aggiunto al template dei port.
-   (Provato prima `weak_import` sulla dichiarazione: **non basta**, e la modifica
-   è stata scartata.)
+- **vertex program del guest** (`rsx_vp_decompiler.c` emette solo HLSL: stesso
+  trattamento del fragment, presumibilmente più semplice);
+- depth/stencil, MRT, render-to-texture;
+- il crossbar `TEXTURE_CONTROL1` e i sampler per unità (oggi un sampler unico
+  lineare/repeat per tutte).
 
 ## Prossimo passo
 
-Il lavoro a valore più alto senza materiali è finito. Da qui servono due cose,
-in parallelo:
-
-1. **Da Elia: l'`EBOOT.elf` decifrato di Uncharted.** Sblocca il lift vero,
-   il confronto con i numeri upstream e la ripresa del boot da
-   `sys_initialize_tls`.
-2. **Senza materiali** resta il backend Metal (fragment program del guest e
-   texture, testabili con `ps3recomp_host` senza gioco) — è la Fase 3.
+1. **Da Elia: l'ISO decrypted di Uncharted.** Da lì si estrae l'EBOOT.BIN e lo
+   si decifra (il progetto ha `tools/test_unfself.py`, quindi un unfself c'è).
+   Sblocca il lift vero e la ripresa del boot da `sys_initialize_tls`.
+2. Senza materiali: il vertex program in MSL, poi depth/stencil.
 
 ## Cosa serve da Elia
 
-- **Ora:** l'EBOOT decifrato (dalla sua copia), oppure il via libera a lavorare
-  sul Metal mentre lo procura.
+- **Ora:** l'ISO, quando l'ha sottomano.
 - Prima del lift completo: spazio disco (171 GB liberi oggi).
