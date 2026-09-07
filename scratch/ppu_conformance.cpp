@@ -163,7 +163,7 @@ static inline uint64_t ppc_mulhdu(uint64_t a, uint64_t b) {
 /* VM base pointer (defined by game project) */
 extern "C" uint8_t* vm_base;
 
-/* Indirect call dispatch (bctrl/bctr) — implemented by the game project.
+/* Indirect call dispatch (bctrl/bctr) â€” implemented by the game project.
  * Looks up the guest address in CTR via a hash table and calls the
  * corresponding host function. Handles OPD resolution. */
 extern "C" void ps3_indirect_call(ppu_context* ctx);
@@ -175,12 +175,7 @@ extern "C" void ps3_indirect_call(ppu_context* ctx);
 extern "C" void ps3_hle_call(unsigned int nid, ppu_context* ctx);
 
 /* Trampoline function pointer for cross-fragment branches (TLS).
- * Must match the __declspec(thread) definition in indirect_dispatch. */
-#ifdef _MSC_VER
-#  define PPU_THREAD_LOCAL __declspec(thread)
-#else
-#  define PPU_THREAD_LOCAL __thread
-#endif
+ * PPU_THREAD_LOCAL comes from ppu_recomp.h, included above. */
 extern "C" PPU_THREAD_LOCAL void (*g_trampoline_fn)(void*);
 
 /* Drain pending trampolines after any call that might set g_trampoline_fn.
