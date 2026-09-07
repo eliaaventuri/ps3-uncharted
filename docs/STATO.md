@@ -83,7 +83,58 @@ register: `put` si rileggeva come `0x080018B7`, nemmeno allineato a 4, e il
 walker decodificava dati vertex come comandi (`0x3E8101C0` è un float).
 `$PS3_HLE_INJECT_BASE` la sposta senza ricompilare; per Uncharted **0x50000000**.
 
-**3. Gli OOB — in corso.** Il gioco ora arriva più avanti e si lamenta da solo:
+**3. I puntatori corrotti — RISOLTO, e non era "Rend".**
+
+Il messaggio `Mapped mesh output buffer of 8MB at 52656e64` era una conseguenza.
+Tre righe più sopra nel log c'era la causa: `unresolved indirect call ->
+0x00705A78`. Il gioco chiamava attraverso un puntatore, il dispatch non trovava
+nulla, la chiamata non avveniva, il valore di ritorno restava quello che il
+registro conteneva — e il titolo proseguiva con spazzatura.
+
+Quell'indirizzo cade *dentro* `func_007058E8` (+0x190), su una tabella di
+ingressi alternativi che il compilatore mette in coda alla funzione:
+
+    li  r11, <n>
+    b   <corpo condiviso>
+
+Il passo mid-function del lifter genera wrapper solo per indirizzi a cui
+qualche istruzione **salta**; questi vivono nei dati e sono solo caricati in un
+registro, quindi restano invisibili. `tools/find_indirect_entries.py` li estrae
+(risalendo anche all'inizio della voce, che può precaricare r8/r6) e li unisce
+al functions.json: **501 in BCES00065**.
+
+Dopo il re-lift con quegli ingressi: **zero chiamate indirette non risolte**, e
+il log è pulito —
+
+    Trying to map 143MB of main memory IO space.
+    Mapped IO size of 143MB at 22300000 to offset 01300000,
+    Mapped SPU Job Memory of 4MB @20300000 to offset 0a200000
+    [cellVideoOut] Configure: resId=2, format=0, aspect=0, pitch=5120
+    [cellGcmSys] SetTile(index=0, loc=0, offset=0x50000, size=0x780000, pitch=5120)
+    [rsx] backend init OK
+
+Le mappature che prima rispondevano `FFFFFFFF` ora riescono, il video è
+configurato a 1280x720 (pitch 5120 = 1280x4) e il backend RSX è su.
+
+## Da qui
+
+Il gioco completa la configurazione di memoria e video, poi resta in attesa
+senza produrre errori (il processo va ucciso, non termina da solo). Il prossimo
+passo è capire cosa aspetta: quasi certamente il completamento di un job SPU —
+la Fase 5, il muro previsto fin dall'inizio.
+
+Il lift ora si fa così:
+
+```bash
+python tools/find_indirect_entries.py $D/EBOOT.elf \
+    --functions $D/analysis/EBOOT.functions.orig.json \
+    -o $D/analysis/EBOOT.functions.json
+python tools/ppu_lifter.py $D/EBOOT.elf \
+    --functions $D/analysis/EBOOT.functions.json \
+    --hle-stubs $D/analysis/EBOOT.imports.json --toc 0x7d3190 -o $D/recomp
+```
+
+## Storico del blocco 3 Il gioco ora arriva più avanti e si lamenta da solo:
 
 - `dont have enough space for primary render target` — non riesce ad allocare
   la VRAM, benché `cellGcmGetConfiguration` dichiari 256 MB a `0xC0000000`;
