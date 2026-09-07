@@ -27,6 +27,7 @@
 #include "rsx_vertex_fetch.h"
 #include "rsx_primitives.h"
 #include "rsx_fp_decompiler.h"   /* guest fragment program -> MSL */
+#include "rsx_texture_layout.h"  /* swizzle/format decode, shared with D3D12 */
 #include "cellGcmSys.h"          /* cellGcmResolveLocated */
 #include <stdio.h>
 #include <stdlib.h>
@@ -66,6 +67,7 @@ typedef struct {
     u32 blend_sfactor, blend_dfactor, blend_equation;
     float mvp[16];   /* 4 rows of the RSX vertex-constant matrix */
     u32 fp_addr;     /* NV4097_SET_SHADER_PROGRAM: 0 = built-in shader */
+    int tex0;        /* texture unit 0 enabled: pick the sampling built-in */
 } MtlDraw;
 
 static MtlVertex* s_verts;
@@ -137,6 +139,7 @@ static void mtl_set_viewport(void* ud, const rsx_state* state)
 
 static void mtl_draw_arrays(void*, u32, u32, u32);
 static void mtl_draw_indexed(void*, u32, u32, u32);
+static void mtl_bind_texture(void*, u32, const rsx_texture_state*);
 
 static rsx_backend s_backend_vtable = {
     .userdata          = NULL,
@@ -147,6 +150,7 @@ static rsx_backend s_backend_vtable = {
     .set_viewport       = mtl_set_viewport,
     .draw_arrays       = mtl_draw_arrays,
     .draw_indexed      = mtl_draw_indexed,
+    .bind_texture      = mtl_bind_texture,
 };
 
 /* ---- helpers ------------------------------------------------------------- */
@@ -322,6 +326,7 @@ static void record_draw(const rsx_state* st, u32 prim, u32 base, u32 count,
     d->blend_dfactor  = st->blend_dfactor;
     d->blend_equation = st->blend_equation;
     d->fp_addr        = st->shader_program;
+    d->tex0           = (st->textures[0].control0 & 0x80000000u) != 0;
 
     /* RSX vertex constant slots 0..3 hold the MVP rows when no vertex program
      * has been translated. An all-zero matrix would collapse every vertex to
@@ -399,7 +404,9 @@ static NSString* const kBuiltinMSL = @
 "    o.col = v.col; o.tc = v.tc;\n"
 "    return o;\n"
 "}\n"
-"fragment float4 fs_main(VOut in [[stage_in]]) { return in.col; }\n";
+"fragment float4 fs_main(VOut in [[stage_in]]) { return in.col; }\n"
+"fragment float4 fs_tex(VOut in [[stage_in]], texture2d<float> t0 [[texture(0)]],\n"
+"                       sampler s0 [[sampler(0)]]) { return t0.sample(s0, in.tc.xy); }\n";
 
 /* Appended to a decompiled guest fragment program. The decompiler emits the
  * PSInput struct and rsx_fp_main; this supplies the vertex stage that fills
@@ -417,6 +424,78 @@ static NSString* const kGuestVertexMSL = @
 "    o.tc4 = float4(0); o.tc5 = float4(0); o.tc6 = float4(0); o.tc7 = float4(0);\n"
 "    return o;\n"
 "}\n";
+
+/* One MTLTexture per unit, rebuilt when the guest rebinds a different image.
+ * The swizzle/format decode is rsx_texture_layout's, shared with D3D12, so
+ * this only owns the upload. */
+typedef struct {
+    id<MTLTexture> tex;
+    u32 offset, format, image_rect;   /* what is currently resident */
+} MtlTexUnit;
+static MtlTexUnit s_tex[RSX_MAX_TEXTURES];
+static id<MTLSamplerState> s_sampler;
+
+extern u32 ppu_vm_size;   /* guest VM size the port declared; 0 = unknown */
+
+static void mtl_bind_texture(void* ud, u32 unit, const rsx_texture_state* tex)
+{
+    (void)ud;
+    if (!s_ready || !vm_base || unit >= RSX_MAX_TEXTURES || !tex) return;
+
+    const u32 width  = (tex->image_rect >> 16) & 0xFFFFu;
+    const u32 height =  tex->image_rect        & 0xFFFFu;
+    const u32 fmt    = (tex->format >> 8) & 0xFFu;
+    if (width == 0 || height == 0) return;
+
+    MtlTexUnit* u = &s_tex[unit];
+    if (u->tex && u->offset == tex->offset && u->format == tex->format &&
+        u->image_rect == tex->image_rect)
+        return;                            /* already resident */
+
+    rsx_tex_layout tl;
+    rsx_texture_layout(fmt, width, height, &tl);
+
+    /* Bit 31 of the OFFSET selects the context DMA (1 = MAIN, 0 = LOCAL), the
+     * same convention rsx_vertex_fetch follows; the FORMAT's low two bits say
+     * the same thing when the offset carries no flag. Resolving the wrong pool
+     * lands outside the guest allocation entirely, so the range is checked
+     * before the decode reads a single byte -- guest state that does not add
+     * up must not fault the host. */
+    const u32 raw  = tex->offset;
+    const int main_mem = (raw & 0x80000000u) ? 1 : ((tex->format & 3u) != 1u);
+    const u32 ea   = cellGcmResolveLocated(!main_mem, raw & 0x7FFFFFFFu);
+    if (ppu_vm_size && (ea == 0 || tl.face_bytes == 0 ||
+                        ea + tl.face_bytes > ppu_vm_size)) {
+        static int warned = 0;
+        if (warned++ < 8)
+            fprintf(stderr, "[RSX metal] texture unit %u: offset 0x%08X resolves "
+                            "to 0x%08X + %u bytes, outside guest memory -- skipped\n",
+                    unit, raw, ea, tl.face_bytes);
+        return;
+    }
+
+    const u32 pitch = width * 4u;
+    u8* staging = (u8*)malloc((size_t)pitch * height);
+    if (!staging) return;
+    rsx_texture_decode(staging, pitch, vm_base + ea, width, height, &tl,
+                       rsx_texture_argb_is_rgba());
+
+    MTLTextureDescriptor* td = [MTLTextureDescriptor
+        texture2DDescriptorWithPixelFormat:MTLPixelFormatRGBA8Unorm
+                                     width:width height:height mipmapped:NO];
+    td.usage = MTLTextureUsageShaderRead;
+    id<MTLTexture> mt = [s_dev newTextureWithDescriptor:td];
+    if (mt) {
+        [mt replaceRegion:MTLRegionMake2D(0, 0, width, height)
+              mipmapLevel:0 withBytes:staging bytesPerRow:pitch];
+        u->tex = mt;
+        u->offset = tex->offset; u->format = tex->format;
+        u->image_rect = tex->image_rect;
+        fprintf(stderr, "[RSX metal] texture unit %u: %ux%u fmt=0x%02X\n",
+                unit, width, height, fmt);
+    }
+    free(staging);
+}
 
 /* One compiled library per guest program. A program that fails to decompile or
  * to compile is remembered as a miss (lib == nil) so it is not retried every
@@ -465,11 +544,12 @@ static u32 pso_key(const MtlDraw* d)
     /* The guest program is part of the key: two draws with identical blend
      * state but different fragment programs are different pipelines. */
     const u32 fp = d->fp_addr ? (1u | (d->fp_addr * 2654435761u)) : 0u;
-    if (!d->blend_enable) return fp << 1;
+    const u32 tx = d->tex0 ? 0x40000000u : 0u;
+    if (!d->blend_enable) return (fp << 1) | tx;
     return 1u | ((d->blend_sfactor & 0xFFFu) << 1)
               | ((d->blend_dfactor & 0xFFFu) << 13)
               | ((d->blend_equation & 0x7u) << 25)
-              | (fp & 0x80000000u);
+              | (fp & 0x80000000u) | tx;
 }
 
 static id<MTLRenderPipelineState> pso_for(const MtlDraw* d)
@@ -496,7 +576,8 @@ static id<MTLRenderPipelineState> pso_for(const MtlDraw* d)
         pd.fragmentFunction = [glib newFunctionWithName:@"rsx_fp_main"];
     } else {
         pd.vertexFunction   = [s_shader_lib newFunctionWithName:@"vs_main"];
-        pd.fragmentFunction = [s_shader_lib newFunctionWithName:@"fs_main"];
+        pd.fragmentFunction = [s_shader_lib newFunctionWithName:
+                               (d->tex0 && s_tex[0].tex) ? @"fs_tex" : @"fs_main"];
     }
     pd.vertexDescriptor = vd;
     pd.colorAttachments[0].pixelFormat = MTLPixelFormatBGRA8Unorm;
@@ -564,6 +645,13 @@ int rsx_metal_backend_init(u32 width, u32 height, const char* title)
             fprintf(stderr, "[RSX metal] vertex staging alloc failed\n");
             return -1;
         }
+
+        MTLSamplerDescriptor* sd = [MTLSamplerDescriptor new];
+        sd.minFilter = MTLSamplerMinMagFilterLinear;
+        sd.magFilter = MTLSamplerMinMagFilterLinear;
+        sd.sAddressMode = MTLSamplerAddressModeRepeat;
+        sd.tAddressMode = MTLSamplerAddressModeRepeat;
+        s_sampler = [s_dev newSamplerStateWithDescriptor:sd];
 
         NSError* serr = nil;
         s_shader_lib = [s_dev newLibraryWithSource:kBuiltinMSL options:nil error:&serr];
@@ -687,6 +775,17 @@ void rsx_metal_backend_present(void)
                 if (!pso) continue;
                 [enc setRenderPipelineState:pso];
                 [enc setVertexBytes:d->mvp length:sizeof(d->mvp) atIndex:0];
+                /* The guest's program declares all sixteen units, so bind
+                 * every resident one; the built-in sampling path only reads
+                 * unit 0. Metal leaves unbound slots null, which is fine for
+                 * a shader that does not sample them. */
+                if (s_sampler) {
+                    for (u32 t = 0; t < RSX_MAX_TEXTURES; t++) {
+                        if (!s_tex[t].tex) continue;
+                        [enc setFragmentTexture:s_tex[t].tex atIndex:t];
+                        [enc setFragmentSamplerState:s_sampler atIndex:t];
+                    }
+                }
                 [enc drawPrimitives:d->topology vertexStart:d->base vertexCount:d->count];
             }
         }

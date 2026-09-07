@@ -49,6 +49,7 @@
 
 /* The guest address space this host hands to the HLE layer. */
 uint8_t* vm_base = NULL;
+u32      ppu_vm_size = 0;
 
 /* Must reach VM_HLE_INJECT_BASE: cellGcmSetupContext plants the GCM label
  * window, the control register and the IO<->EA offset tables there, so a VM
@@ -242,8 +243,12 @@ static void emit_textured_draw(void)
 {
     /* NV4097_SET_TEXTURE_* are 0x20 apart per unit; unit 0 is the base. */
     emit(NV4097_SET_TEXTURE_OFFSET     + 0, VTX_MAIN(TEX_OFFSET));
-    /* format: A8R8G8B8 (0x85) | LN (0x20) -- linear, not swizzled. */
-    emit(NV4097_SET_TEXTURE_FORMAT     + 0, 0x85u | 0x20u);
+    /* NV4097_SET_TEXTURE_FORMAT: the format byte lives in bits 8-15, not in
+     * the low byte -- the low bits carry the context DMA (2 = main memory)
+     * and the dimension (2 = 2D). Written into the low byte the format reads
+     * back as 0x00 and the texture decodes as R8. */
+    emit(NV4097_SET_TEXTURE_FORMAT     + 0,
+         ((0x85u | 0x20u) << 8) | (2u << 4) | 2u);   /* A8R8G8B8, linear, 2D, main */
     emit(NV4097_SET_TEXTURE_CONTROL0   + 0, 0x80000000u);   /* unit enable */
     emit(NV4097_SET_TEXTURE_CONTROL1   + 0, 0xAAE4u);       /* identity crossbar */
     emit(NV4097_SET_TEXTURE_IMAGE_RECT + 0, (TEX_W << 16) | TEX_H);
@@ -298,6 +303,9 @@ int main(int argc, char** argv)
 
     vm_base = (uint8_t*)calloc(1, VM_SIZE);
     if (!vm_base) { fprintf(stderr, "[host] guest VM alloc failed\n"); return 1; }
+    /* Declare the size too: the backends bounds-check guest addresses against
+     * it before dereferencing them. */
+    ppu_vm_size = VM_SIZE;
 
     printf("[host] backend: %s\n", HOST_BACKEND_NAME);
     if (host_backend_init(1280, 720, "ps3recomp") != 0) {
