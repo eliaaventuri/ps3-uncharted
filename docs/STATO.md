@@ -1,59 +1,78 @@
 # Stato del progetto
 
-Ultimo aggiornamento: **7 settembre 2026** — sessione 1.
+Ultimo aggiornamento: **7 settembre 2026** — sessione 2.
 
 ## Dove siamo
 
-Fase 2 (far partire un gioco su macOS). Il boot scaffold PPU ora **compila** su
-macOS arm64: era il prerequisito, non ancora il traguardo.
+Fase 2 (far partire un gioco su macOS): **il percorso di boot esegue codice
+PowerPC ricompilato su macOS arm64**. Non è un gioco — è un'immagine sintetica —
+ma loader, registrazione, HLE, syscall e `ppu_run` hanno eseguito codice guest
+fino a un ritorno pulito, ed è il primo caso su questa piattaforma.
 
 | | stato |
 |---|---|
-| Runtime library su macOS arm64 | compila, `libps3recomp_runtime.a` verificata arm64 |
-| Suite del lifter (9 file Python) | 9/9 verdi |
-| SPU helper tests | 63/63 |
-| RSX texture layout + primitive | verdi |
+| Runtime library arm64 | compila |
+| Suite del lifter (9) · SPU (63) · RSX | verdi |
 | Metal end-to-end (`ps3recomp_host`) | clear, draw, 60 frame: pixel corretti |
-| **Ratchet PPU boot scaffold** | **0 errori** (era 39) |
-| Far girare un gioco ricompilato | **no** — nessuna immagine liftata, e il boot non è mai stato eseguito |
+| Ratchet PPU boot scaffold | 0 (era 39) |
+| **Boot POSIX end-to-end** | **PASSED** su immagine sintetica |
+| Far girare **Uncharted** | no — manca l'EBOOT decifrato |
 
-## Fatto in sessione 1
+## Scoperta che cambia il piano
 
-1. Clone di ps3recomp @ `d31bb91` (v0.11.0) come fork privato, remote `upstream`.
-2. **Fix build:** `libs/filesystem/cellFs.c` chiamava `RtlCaptureStackBackTrace`
-   senza includere `win32_backtrace.h` → la build macOS di `master` era rotta,
-   nonostante il README la dia per funzionante. Aggiunto l'include.
-3. **Ratchet 39 → 0** in `runtime/ppu/ppu_loader.cpp`:
-   - incluso `win32_compat.h` (dava già `LONG`, `SIZE_T`, `_Interlocked*`,
-     `YieldProcessor`, e `stdlib.h` per `getenv`);
-   - 21 × `__declspec(thread)` → `PPU_THREAD_LOCAL`, il macro che il progetto ha
-     già in `ppu_tls.h`;
-   - `ps3_guest_ptr_veh` / `ps3_install_guest_ptr_trap` isolate sotto
-     `#ifdef _WIN32` con stub POSIX, stesso pattern già usato da `ppu_guard_page`.
+**Uncharted: Drake's Fortune (BCUS98103) è il titolo di riferimento di ps3recomp
+fin dall'inizio**, non un obiettivo lontano. Da `docs/PPU_RECOMP.md` e
+`docs/SPU_LIFTER.md`:
 
-## Blocco noto, da affrontare prima di eseguire
+- **14.104 funzioni** (via tabella OPD), entry `0x10230`, TOC `0x7d3190`;
+- **172 import** su 12 librerie, copertura HLE **69%** (118/172), cellGcmSys 100%;
+- copertura ISA del lifter PPU: **99,8%** su codice Uncharted reale;
+- il primo boot upstream si ferma a **`sys_initialize_tls`** (NID `0x744680A2`),
+  la prima chiamata del CRT;
+- lato SPU: **1 immagine estratta** dall'EBOOT (39.608 B), **461 funzioni**
+  rilevate, **0 gap del lifter**, e la funzione entry esegue fino a un ritorno
+  naturale nell'harness;
+- il lifter ha già `--trace` per fare il diff contro RPCS3.
 
-**Le pagine da 16 KB.** `runtime/memory/vm.h:86` definisce `VM_PAGE_SIZE` a
-**4096**; la pagina reale su Apple Silicon è **16384** (`getconf PAGE_SIZE`).
-`vm_init()` regge (le sue regioni sono allineate), ma `vm_commit()` e
-`vm_protect()` chiamano `mprotect` arrotondando a 4 KB: qualunque indirizzo o
-dimensione non allineato a 16 KB fallirà con `EINVAL` appena il guest alloca
-davvero. Va risolto prima di sperare in un boot, e la fix non deve toccare il
-comportamento Windows (dove 4 KB è giusto).
+Conseguenza pratica: **l'EBOOT decifrato serve ora**, non alla Fase 4. È il
+prossimo collo di bottiglia del progetto.
+
+Nota: `docs/PPU_RECOMP.md` dice che il lift completo sarebbe "88 MB di C in un
+file" e che lo splitting è il lavoro di scaling principale. **Non è più vero**:
+il lifter emette già chunk (`ppu_recomp_000.cpp` …). La documentazione upstream
+è indietro rispetto al codice.
+
+## Fatto in sessione 2
+
+1. **`vm.h`: allineamento alla pagina host.** `mprotect` rifiuta intervalli non
+   multipli della pagina host (16 KB su Apple Silicon, 4 KB nel codice): ogni
+   `vm_commit` guest falliva e la scrittura seguente andava in **SIGBUS** —
+   compreso il commit dei PT_LOAD nel loader. Aggiunte `vm_host_page()` /
+   `vm_host_range()`; guard page dello stack portata a una pagina host intera.
+   Nuovo test `runtime/memory/tests/test_vm_page_align.c` (6/6).
+2. **Primo boot POSIX.** `tools/make_test_elf.py` (genera un PPC64 minimo),
+   `runtime/ppu/tests/boot_smoke/main.cpp` (il port minimo), e
+   `tools/test_boot_posix.py` che lega generazione → lift → compilazione →
+   esecuzione. Aggiunto allo workflow macOS.
+3. **Link su Mach-O.** `ppu_hle.cpp` chiama l'hook SPURS di flOw con una
+   dichiarazione `weak`: ELF risolve a 0 da solo, Mach-O no. Serve
+   `-Wl,-U,_flow_spurs_kernel_spawn_postinit`, aggiunto al template dei port.
+   (Provato prima `weak_import` sulla dichiarazione: **non basta**, e la modifica
+   è stata scartata.)
 
 ## Prossimo passo
 
-Serve un'**immagine liftata** per esercitare il boot su POSIX: senza quella non
-si può andare oltre la compilazione. Due strade da valutare nella sessione 2:
-1. i port pubblici (`sp00nznet/rubberducky`, `twistedmetal`, `flow`) — verificare
-   se pubblicano il C generato o solo gli script;
-2. liftare qualcosa di piccolo in proprio.
+Il lavoro a valore più alto senza materiali è finito. Da qui servono due cose,
+in parallelo:
 
-Poi: allineamento pagine 16 KB, e primo tentativo di boot fino a `main`.
+1. **Da Elia: l'`EBOOT.elf` decifrato di Uncharted.** Sblocca il lift vero,
+   il confronto con i numeri upstream e la ripresa del boot da
+   `sys_initialize_tls`.
+2. **Senza materiali** resta il backend Metal (fragment program del guest e
+   texture, testabili con `ps3recomp_host` senza gioco) — è la Fase 3.
 
 ## Cosa serve da Elia
 
-- Nulla per la sessione 2.
-- Prima della Fase 4: la sua copia di Uncharted e l'eseguibile decifrato.
-- Prima della Fase 4: spazio disco (oggi 171 GB liberi, non bastano per un AAA
-  liftato più gli artefatti di build).
+- **Ora:** l'EBOOT decifrato (dalla sua copia), oppure il via libera a lavorare
+  sul Metal mentre lo procura.
+- Prima del lift completo: spazio disco (171 GB liberi oggi).
