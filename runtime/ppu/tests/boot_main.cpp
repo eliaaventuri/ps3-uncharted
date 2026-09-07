@@ -47,6 +47,7 @@ void     ppu_sysprx_register(void);
 void     ppu_fs_register(void);
 int      ppu_run(uint32_t entry_opd, uint32_t stack_top);
 extern const char* ppu_vfs_root;   /* host dir that PS3 mount points map into */
+extern "C" void ps3_install_guest_ptr_trap(void);
 /* Optional hook: load real system PRX modules (libsre = cellSpurs/cellSync) into
  * guest RAM and register their exports. Weak default is a no-op; a title that
  * links a lifted PRX defines a strong version. Called after the lifted function
@@ -741,6 +742,12 @@ int main(int argc, char** argv)
     ppu_vm_size = 0xE0000000u;
 #endif
     if (!vm_base) { printf("vm alloc failed\n"); return 1; }
+
+    /* Arm the fault reporter now that vm_base exists: it classifies a fault as
+     * an untranslated guest pointer, an access inside the guest window (with
+     * the guest EA and the function that issued it), or a plain host fault.
+     * Nothing called this before, so on POSIX every fault was a bare address. */
+    ps3_install_guest_ptr_trap();
 
     uint32_t entry = ppu_load_elf(argv[1]);
     if (!entry) { printf("load failed\n"); return 1; }

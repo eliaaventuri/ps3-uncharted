@@ -192,8 +192,26 @@ static inline uint8_t ppu_xer_get_byte_count(const ppu_context* ctx)
 static inline void ppu_set_stack(ppu_context* ctx, uint64_t stack_top, uint64_t stack_size)
 {
     /* Place SP at the top of the allocated region, aligned down to 16 bytes,
-     * leaving room for the minimum stack frame (48 bytes on PPC64). */
-    uint64_t sp = (stack_top + stack_size - 48) & ~(uint64_t)0xF;
+     * leaving a whole minimum frame above it.
+     *
+     * 48 bytes is the LINKAGE area alone, and it is not enough: under the PPC64
+     * ELF v1 ABI the PS3 uses, a callee saves its register parameters into the
+     * PARAMETER SAVE area of its CALLER's frame -- 8 doublewords immediately
+     * above the linkage area -- so the very first call writes as far as sp+0x70.
+     * With only 48 reserved, Uncharted's first spawned thread stored at exactly
+     * sp+0x30, one byte past the end of its stack and into the next stack's
+     * guard page: SIGBUS at guest 0xD0014000. Windows never saw it because
+     * there the guest pages commit on demand instead of being PROT_NONE.
+     *
+     * The ABI minimum is 48 (linkage) + 64 (parameter save) = 112, but a thread
+     * body is compiled as an ordinary function and writes into the frame its
+     * CALLER is supposed to own -- and a thread has no caller, so that frame has
+     * to exist above sp or the first store runs off the end of the stack.
+     * Uncharted's Job Manager handler was measured reaching sp+0x30, then
+     * sp+0x80, then sp+0x200 as each reserve was raised. 4 KB is 6% of a 64 KB
+     * stack and covers any plausible initial frame, which ends the class of
+     * fault instead of the instance. */
+    uint64_t sp = (stack_top + stack_size - 0x1000) & ~(uint64_t)0xF;
     ctx->gpr[1] = sp;
 }
 

@@ -108,9 +108,106 @@ extern "C" void ps3_install_guest_ptr_trap(void)
             got >> 20);
 }
 #else
-/* POSIX has no VEH; the equivalent is mmap(PROT_NONE) + a SIGSEGV/SIGBUS
- * handler, which is worth building once a title actually boots here. */
-extern "C" void ps3_install_guest_ptr_trap(void) { }
+/* POSIX. Two differences from the Win32 path above.
+ *
+ * First, nothing needs reserving: macOS on arm64 (and Linux) leave the low 4 GB
+ * unmappable to user space -- an mmap(MAP_FIXED) at 0x10000 is refused -- so a
+ * guest pointer dereferenced as a host address faults by construction. What
+ * POSIX lacks is the REPORT.
+ *
+ * Second, this handler also classifies faults INSIDE the guest window, which
+ * the Win32 one does not need to: there the whole 4 GB is reserved and commits
+ * on demand from vm_commit_veh, while POSIX just callocs a block. A fault at
+ * vm_base + N therefore means something real -- the block is smaller than the
+ * runtime believes, or the access ran past its end -- and printing the guest EA
+ * with the function that issued it is the difference between a diagnosis and a
+ * hex address.
+ *
+ * Reports and re-raises: a real bug still stops the run.
+ */
+#include <signal.h>
+
+extern "C" uint32_t ppu_vm_size;   /* defined below; the handler needs it */
+extern "C" PPU_THREAD_LOCAL ppu_context* g_active_ctx;   /* likewise */
+
+static struct sigaction s_prev_segv, s_prev_bus;
+
+/* Async-signal-safe enough: format into a static buffer, write(2) it out. */
+static void ps3_fault_report(int sig, siginfo_t* si, void* uctx)
+{
+    static volatile int reported = 0;
+    const uintptr_t at = (uintptr_t)si->si_addr;
+
+    if (!reported) {
+        reported = 1;
+        char who[64];
+        ppu_guest_caller(who, sizeof who);
+
+        char buf[512];
+        int n;
+        const uintptr_t base = (uintptr_t)vm_base;
+        const uint64_t  span = ppu_vm_size ? (uint64_t)ppu_vm_size : 0x100000000ull;
+
+        if (base && at >= base && at < base + span) {
+            n = snprintf(buf, sizeof buf,
+                "\n[ps3] FAULT INSIDE THE GUEST WINDOW: %s at guest 0x%08llX\n"
+                "      host %p = vm_base %p + 0x%llX, window 0x%llX bytes\n"
+                "      guest caller: %s\n",
+                sig == SIGBUS ? "SIGBUS" : "SIGSEGV",
+                (unsigned long long)(at - base), (void*)at, (void*)base,
+                (unsigned long long)(at - base), (unsigned long long)span, who);
+        } else if (at >= 0x10000u && at < 0x100000000ull) {
+            n = snprintf(buf, sizeof buf,
+                "\n[ps3] UNTRANSLATED GUEST POINTER: access of guest 0x%08X as a host\n"
+                "      address (an HLE function dereferenced a pointer parameter\n"
+                "      without vm_base)\n      guest caller: %s\n",
+                (uint32_t)at, who);
+        } else {
+            n = snprintf(buf, sizeof buf,
+                "\n[ps3] %s at host %p (outside the guest window at %p)\n"
+                "      guest caller: %s\n",
+                sig == SIGBUS ? "SIGBUS" : "SIGSEGV", (void*)at, (void*)base, who);
+        }
+        if (n > 0) { ssize_t w = write(2, buf, (size_t)n); (void)w; }
+
+        /* The guest context that faulted: without r1 there is no way to tell a
+         * stack overflow from a bad pointer that merely happens to land in the
+         * stack region -- they look identical from the address alone. */
+        if (g_active_ctx) {
+            n = snprintf(buf, sizeof buf,
+                "      guest cia=0x%08X lr=0x%08X r1(sp)=0x%08X r2=0x%08X\n"
+                "      r3=0x%08X r4=0x%08X r5=0x%08X r6=0x%08X\n"
+                "      r30=0x%08X r31=0x%08X\n",
+                (uint32_t)g_active_ctx->cia, (uint32_t)g_active_ctx->lr,
+                (uint32_t)g_active_ctx->gpr[1], (uint32_t)g_active_ctx->gpr[2],
+                (uint32_t)g_active_ctx->gpr[3], (uint32_t)g_active_ctx->gpr[4],
+                (uint32_t)g_active_ctx->gpr[5], (uint32_t)g_active_ctx->gpr[6],
+                (uint32_t)g_active_ctx->gpr[30], (uint32_t)g_active_ctx->gpr[31]);
+            if (n > 0) { ssize_t w = write(2, buf, (size_t)n); (void)w; }
+        }
+    }
+
+    /* Hand back to whoever had it, so the process still dies of the real fault. */
+    struct sigaction* prev = (sig == SIGBUS) ? &s_prev_bus : &s_prev_segv;
+    sigaction(sig, prev, NULL);
+    (void)uctx;
+}
+
+extern "C" void ps3_install_guest_ptr_trap(void)
+{
+    if (getenv("PS3_NO_GUEST_PTR_TRAP")) return;
+
+    struct sigaction sa;
+    memset(&sa, 0, sizeof sa);
+    sa.sa_sigaction = ps3_fault_report;
+    sa.sa_flags = SA_SIGINFO | SA_ONSTACK;
+    sigemptyset(&sa.sa_mask);
+    sigaction(SIGSEGV, &sa, &s_prev_segv);
+    sigaction(SIGBUS,  &sa, &s_prev_bus);
+
+    fprintf(stderr, "[ps3] guest-pointer trap armed (POSIX: fault handler; the low "
+                    "4 GB is unmappable here, so no reservation is needed)\n");
+}
 #endif
 
 /* PS3_SCTRACE=1: every lv2 syscall with its arguments and RETURN VALUE.

@@ -374,9 +374,13 @@ int64_t sys_ppu_thread_create(ppu_context* ctx)
         *out = be_id;
     }
 
-    fprintf(stderr, "[SYS] sys_ppu_thread_create tid=%llu name=\"%s\" entry=0x%08llX arg=0x%llX stack=0x%X prio=%d\n",
+    /* The stack RANGE, not just its size: a fault in the guest stack region is
+     * only diagnosable if the log says which thread owns which range. */
+    fprintf(stderr, "[SYS] sys_ppu_thread_create tid=%llu name=\"%s\" entry=0x%08llX arg=0x%llX "
+            "stack=0x%08X-0x%08X (0x%X) sp=0x%08llX prio=%d\n",
             (unsigned long long)thread_id, t->name, (unsigned long long)entry, (unsigned long long)arg,
-            stack_size, priority);
+            stack_addr, stack_addr + stack_size, stack_size,
+            (unsigned long long)t->ctx.gpr[1], priority);
     /* YDKJ: dump the worker arg-object: func_000750A8 (thread body) does
      * this=[arg+0x8], vtable=[arg+0xC], method=[vtable+0]. If this(+0x8) is null
      * the worker dispatches its job on a null object -> construction never runs. */
