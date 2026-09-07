@@ -78,6 +78,15 @@ jobs:
           PS3RECOMP_METAL_HEADLESS=1 ./build/ps3recomp_host --draw
           PS3RECOMP_METAL_HEADLESS=1 ./build/ps3recomp_host --draw --frames=60
 
+      # The boot path end to end on POSIX: a synthetic PPC64 image through the
+      # loader, the lifter, a real compile and a real run. Everything else here
+      # proves the tree COMPILES on macOS; this is the only step that proves
+      # lifted guest code EXECUTES on it.
+      - name: Run the POSIX boot test
+        env:
+          CI: "1"
+        run: python tools/test_boot_posix.py
+
       # runtime/ppu/ is the one part of the runtime no CMake target builds --
       # it needs the lifter's per-game ppu_recomp.h. macOS has no recorded
       # baseline yet, so this reports its numbers and passes; the first run's

@@ -87,6 +87,15 @@ target_link_libraries(${PROJECT_NAME} PRIVATE
     ps3recomp_runtime
 )
 
+# ppu_hle.cpp calls the flOw port's SPURS hook through a weak declaration. ELF
+# resolves an undefined weak symbol to 0 on its own; Mach-O does not, and the
+# link fails unless the symbol is declared undefined here. A port that defines
+# the hook itself is unaffected.
+if(APPLE)
+    target_link_options(${PROJECT_NAME} PRIVATE
+        -Wl,-U,_flow_spurs_kernel_spawn_postinit)
+endif()
+
 # ---------------------------------------------------------------------------
 # Compiler-specific flags
 # ---------------------------------------------------------------------------
