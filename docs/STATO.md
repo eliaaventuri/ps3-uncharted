@@ -1,67 +1,78 @@
 # Stato del progetto
 
-Ultimo aggiornamento: **7 settembre 2026** — sessione 3.
+Ultimo aggiornamento: **7 settembre 2026** — sessione 4.
 
 ## Dove siamo
 
-Fase 2 fatta nella sostanza (il boot esegue codice guest su macOS) e **Fase 3
-arrivata ai due pezzi che il README upstream dichiara mancanti per Metal**: i
-fragment program del guest e le texture. Entrambi ora funzionano.
+**Uncharted: Drake's Fortune esegue su macOS.** Non è giocabile: il boot arriva
+all'inizializzazione del Job Manager SPU di Naughty Dog e lì crasha. Ma il
+percorso completo — ELF decifrato → lift → compilazione nativa ARM64 →
+esecuzione — funziona, e il gioco esegue il proprio codice di avvio.
 
-| | stato |
-|---|---|
-| Runtime library arm64, suite lifter/SPU/RSX | verdi |
-| Ratchet PPU boot scaffold | 0 (era 39) |
-| Boot POSIX end-to-end | PASSED (immagine sintetica) |
-| Metal: clear, flip, draw | OK |
-| **Metal: fragment program del guest** | **OK** (`--fp`) |
-| **Metal: texture** | **OK** (`--tex`) |
-| **Metal: programma del guest che campiona la texture** | **OK** (`--fp-tex`) |
-| Far girare **Uncharted** | no — manca l'EBOOT decifrato |
+Quanto arriva a fare, dal log:
 
-## Scoperta della sessione 2, ancora la più importante
+- supera `sys_initialize_tls` (dove il boot upstream si fermava);
+- inizializza il proprio TTY, alloca le strutture globali (i log portano i nomi
+  dei sorgenti originali: `game/hashtable.inl`, `game/textdb.cpp`, `game/big.cpp`);
+- stampa il proprio banner: **"Compiled on Oct 19 2007 at 10:32:52"**;
+- configura il video a **1280x720**, trova `/dev_bdvd/PS3_GAME/USRDIR`;
+- esegue `BigInit()`;
+- **inizializza SPURS** (due istanze, 5 SPU + 1) e crea i thread
+  "Job Manager Event Handler" con le loro event queue;
+- **zero import firmware non risolti** su 172.
 
-**Uncharted: Drake's Fortune (BCUS98103) è il titolo di riferimento di
-ps3recomp fin dall'inizio**: 14.104 funzioni, 172 import (69% coperti), ISA
-lifter al 99,8% su codice Uncharted reale, boot upstream fermo a
-`sys_initialize_tls`. Lato SPU: 1 immagine estratta dall'EBOOT, 461 funzioni,
-0 gap del lifter. Vedi `docs/PPU_RECOMP.md` e `docs/SPU_LIFTER.md`.
+## Il materiale
 
-## Fatto in sessione 3
+- ISO: `~/Documents/Uncharted - Drake's Fortune (Europe, Australia) ....iso`
+  (21 GB, **BCES00065**). Montato in sola lettura:
+  `hdiutil attach -readonly -nobrowse -noverify -mountpoint /tmp/uc_iso "<iso>"`.
+- Dati di lavoro **fuori dal repo**, in `~/Documents/Coding/uncharted-data/`:
+  `EBOOT.elf` (decifrato), `analysis/`, `recomp/` (136 MB di C++), `gen/`,
+  `obj/`, `uncharted` (il port), `build.sh`.
+- Decifratura: RPCS3 `--decrypt` (build ufficiale arm64 nello scratchpad della
+  sessione; va riscaricata se serve di nuovo).
 
-1. **Il decompiler dei fragment program emette anche MSL.**
-   `rsx_fp_decompile_lang(..., RSX_FP_LANG_MSL, ...)`. I corpi sono quasi
-   identici fra i due dialetti; divergono preambolo, `frac`/`lerp`/`.Sample()`,
-   i cast C-style (vietati in MSL) e il ternario a condizione vettoriale
-   (sostituito da `select`). Test `libs/video/tests/test_fp_msl.c`: otto
-   programmi compilati dal compilatore `metal` di Apple, 8/8.
-   **L'HLSL resta byte-identico** — verificato su 256 combinazioni, 7008 righe.
-2. **Il backend Metal esegue i programmi del guest.** Una libreria compilata a
-   runtime per programma, in cache, con fallback al builtin.
-3. **Il backend Metal carica e campiona le texture**, riusando
-   `rsx_texture_layout`/`rsx_texture_decode` condivisi con D3D12.
-4. **Tre bug trovati e corretti nel test host**: il formato texture andava nei
-   bit 8-15 e non nel byte basso; mancava `ppu_vm_size`, quindi i backend non
-   avevano un limite per il controllo di validità; l'indirizzo texture va
-   risolto come in `rsx_vertex_fetch` (bit 31 = MAIN) e **validato**, perché
-   prima uno stato incoerente faceva SIGSEGV dentro `rsx_texture_decode`.
+## Numeri, identici a quelli upstream
+
+L'eseguibile europeo **coincide** con la versione US documentata in
+`docs/PPU_RECOMP.md`: 14.104 funzioni OPD, entry `0x10230`, TOC `0x7d3190`,
+172 import su 12 librerie, 1 sola immagine SPU (39.608 B a `0x845000`).
+Tutti i riferimenti upstream valgono per noi 1:1.
+
+Il lift completo richiede **12 secondi**: 18.628 funzioni, 4 chunk, 2,16
+milioni di righe di C++. La nota in `docs/PPU_RECOMP.md` sugli "88 MB in un
+file" è superata: il lifter emette già chunk.
+
+## Il blocco attuale
+
+Crash in `vm_write64` da un thread del Job Manager (`EXC_BAD_ACCESS`,
+`KERN_PROTECTION_FAILURE`). L'indirizzo host cambia a ogni run per via
+dell'ASLR ma la parte bassa è costante — **guest EA `0x014000`**, dentro il
+primo segmento di codice.
+
+Da chiarire: quell'indirizzo è dentro `ppu_vm_size` (altrimenti `vm_oob()` lo
+avrebbe respinto) e il loader non chiama `mprotect`, quindi la pagina dovrebbe
+essere scrivibile. Nota la differenza fra le due piattaforme in
+`boot_main.cpp`: Windows **riserva** 4 GB e committa on demand da un vectored
+exception handler, POSIX fa un `calloc` di 0xE0000000 e basta.
+
+**Il prossimo lavoro è diagnostico, ed è già identificato dalla sessione 1:**
+implementare su POSIX `ps3_install_guest_ptr_trap` (oggi uno stub vuoto in
+`ppu_loader.cpp`) come `mmap(PROT_NONE)` più un handler SIGSEGV/SIGBUS che
+stampi EA, `vm_base` e il chiamante guest. Senza quello si procede a tentoni.
 
 ## Cosa manca ancora al backend Metal
 
-- **vertex program del guest** (`rsx_vp_decompiler.c` emette solo HLSL: stesso
-  trattamento del fragment, presumibilmente più semplice);
-- depth/stencil, MRT, render-to-texture;
-- il crossbar `TEXTURE_CONTROL1` e i sampler per unità (oggi un sampler unico
-  lineare/repeat per tutte).
+vertex program del guest in MSL; depth/stencil, MRT, render-to-texture; il
+crossbar `TEXTURE_CONTROL1` e i sampler per unità.
 
-## Prossimo passo
+## Come si ricostruisce il port
 
-1. **Da Elia: l'ISO decrypted di Uncharted.** Da lì si estrae l'EBOOT.BIN e lo
-   si decifra (il progetto ha `tools/test_unfself.py`, quindi un unfself c'è).
-   Sblocca il lift vero e la ripresa del boot da `sys_initialize_tls`.
-2. Senza materiali: il vertex program in MSL, poi depth/stencil.
+```bash
+~/Documents/Coding/uncharted-data/build.sh
+cd ~/Documents/Coding/uncharted-data
+PS3_VFS_ROOT=/tmp/uc_iso ./uncharted ~/Documents/Coding/uncharted-data/EBOOT.elf
+```
 
-## Cosa serve da Elia
-
-- **Ora:** l'ISO, quando l'ha sottomano.
-- Prima del lift completo: spazio disco (171 GB liberi oggi).
+La tabella NID è **per-port**: `ppu_hle_register_all()` nel runtime è weak e
+vuota, e senza `tools/gen_hle_nids.py --all` ogni import resta non risolto.

@@ -96,3 +96,9 @@ _drill/
 
 # macOS packaging output
 *.dmg
+
+# Dati del gioco: mai nel repo. Vivono in ~/Documents/Coding/uncharted-data/
+*.elf
+*.BIN
+EBOOT*
+uncharted-data/
