@@ -116,6 +116,47 @@ il log è pulito —
 Le mappature che prima rispondevano `FFFFFFFF` ora riescono, il video è
 configurato a 1280x720 (pitch 5120 = 1280x4) e il backend RSX è su.
 
+## Sessione 8 — cosa aspetta il gioco
+
+**Non aspetta: gira a vuoto.** 101% di CPU, log fermo a 389 righe per cinque
+minuti. Il thread guest alterna fra `ps3_indirect_call` e `func_004C5464` —
+codice che scrive campi in una struttura, cioè costruisce comandi in un loop,
+in attesa di risultati che gli SPU non producono mai.
+
+**Perché gli SPU non producono nulla.** Il programma SPU non era liftato, e non
+bastava liftare quello dell'EBOOT: `extract_spu_images.py` ne trova uno solo
+(39.608 B a `0x845000`), ma quello che il gioco passa a `cellSpursAddWorkload`
+è un altro — **12.160 byte assemblati in memoria a `0x1008eb00`**, byte SPU
+grezzi senza intestazione ELF.
+
+Ora entrambe sono liftate e registrate: **558 funzioni** l'immagine dell'EBOOT
+(88,2% del testo), **234** il policy module SPURS.
+
+Tre cose sono state aggiunte per arrivarci:
+
+- `SPU_PM_DUMP=<dir>` — dumpa il policy module così come il titolo lo registra;
+  è l'unico modo di ottenere quei byte, che nell'eseguibile non esistono.
+- `build_spu_workloads.py` registrava **solo** il fingerprint del file ELF. Un
+  titolo che consegna il payload grezzo non sarebbe mai stato trovato dal
+  dispatch, che fingerprinta i byte che riceve. Ora emette anche il fingerprint
+  del segmento PT_LOAD.
+- `boot_main` chiama `spu_register_all()` se il port l'ha generata (weak).
+
+**Dove si è fermato.** I workload sono registrati (`[boot] lifted SPU workloads
+registered`), ma il poller del kernel SPURS non li dispaccia: nel log non
+compare mai `[spurs-kern] ... dispatch wid=N (enabled, state=2)`. Il gioco non
+ha ancora portato i workload allo stato *enabled* — `cellSpursAddWorkload` li
+registra soltanto, mentre il dispatch vero parte da `cellSpursCreateTask`
+(percorso che il Job Manager di Naughty Dog non usa) o dal poller quando lo
+stato lo consente.
+
+**Il prossimo passo:** capire come Uncharted abilita i suoi workload — quale
+scrittura nella struttura SPURS o quale chiamata (`cellSpursWakeUp`?) manca dal
+nostro percorso. Da lì il policy module gira, e con lui il Job Manager.
+
+Utile: `SPURS_KERN_WATCH=1` traccia il poller, `SPURS_FORCE_SPUS=<n>` forza il
+numero di lane.
+
 ## Da qui
 
 Il gioco completa la configurazione di memoria e video, poi resta in attesa
