@@ -205,6 +205,80 @@ Vale la pena scriverlo, perche' ci si torna. Nel policy module (LS 0xA00-0x3980)
    `SPU_DMATRACE_MAX` alza il tetto di 160 righe che mi aveva fatto sbagliare
    la conclusione della 17.
 
+## Sessione 18b — SBLOCCATO: il primo job WwsJob gira davvero
+
+### La causa
+
+L'interprete dei comandi di caricamento eseguiva **un solo comando per job**.
+Misurato, non dedotto: `SPU_WWS_CMDS=1` traccia l'indice di ogni comando
+smistato, e in tutta l'esecuzione ne uscivano otto, tutti indice 1.
+
+Il perche' e' un mislift, ed e' la stessa classe che aveva morso su LBP, solo
+dall'altro lato. I gestori tornano all'interprete cosi':
+
+```
+001D18  ila $r6, 0x1BDC      ; 0x1BDC = "prendi il comando successivo"
+001D1C  br  0x2A88           ; blocco condiviso (una copia/azzeramento)
+...
+002AD4  biz $r4, $r6         ; le tre uscite del blocco condiviso
+002AF4  biz $r75, $r6
+002B14  bi  $r6
+```
+
+Ma **r6 e' anche un registro di link** nello stesso modulo (`brsl $r6, 0x2F38`,
+`brsl $r6, 0x2FB8`, `brsl $r6, 0x2A88`), quindi `compute_link_returns()` le
+classificava come ritorni di funzione ed emetteva `SPU_RET`. Invece di
+continuare la lista, il gestore **usciva dall'interprete**. Il raffinamento sui
+predecessori che il lifter gia' ha guarda solo il blocco che contiene il `bi`;
+qui il registro viene calcolato dal chiamante, due blocchi piu' su.
+
+Conseguenza a valle: il codice del job non veniva mai caricato, e il manager
+falliva l'assert del magic `0xC0DEC0DE` a 0x33FC (`stopd` a 0x15B0) — che fino
+a questa sessione era muto.
+
+### La correzione
+
+Nel lift del policy module (`uncharted-data/relift_spu.sh`):
+
+```
+--extra-funcs 0xA2C,0x1BDC,0x30E4
+--force-indirect 0x2AD4,0x2AF4,0x2B14
+```
+
+`--force-indirect` rende le tre uscite dei salti calcolati. 0x1BDC e 0x30E4
+vanno registrati come ingressi perche' `spu_indirect_branch` sa saltare solo a
+un ingresso registrato: 0x30E4 e' l'indirizzo di ritorno di
+`brsl $r6, 0x2F38`, e senza di lui il ritorno cadeva nel fallback a microstep
+(`[spu-smc] pc=0x030E4 UNKNOWN word 0x1006321B`).
+
+**E qui c'e' una trappola misurata.** Ci sono altri tre ritorni della stessa
+forma (0x1960, 0x3030, 0x3610) e registrarli sembrava ovvio. Con quel set piu'
+ampio l'interrupt di stall-and-notify **sparisce** e la pipeline dei job non
+parte proprio: tre corse su tre con zero comandi eseguiti, contro lista
+completa + overlay residente con il set minimo. Registrare un ingresso spezza
+la funzione che lo contiene e trasforma dei `goto` interni in trasferimenti via
+trampolino, e `SPU_DRAIN` scambia per un ritorno un trasferimento il cui target
+coincide con il registro di link (la scorciatoia `SPU_TAILRET`). Quindi: si
+registra solo cio' che una misura chiede, uno alla volta.
+
+### Il risultato
+
+La lista dei comandi ora viene percorsa fino in fondo — sei coppie
+(prenota buffer set, carica) e poi RunJob:
+
+```
+[wws-cmd] #1 idx=1 -> 0x1C20     #2 idx=2 -> 0x1D20   (x6)
+[wws-cmd] #13 idx=3 -> 0x22B0
+[wws-cmd] #14 idx=5 -> 0x23BC    <- RunJob
+[wws-code] codeLS=0x00EB0 loadJobNum=0x0 nextLoad=0x1
+[spu-ovl] img=2 streamed overlay src=0x10171CC0 -> LS 0x04000 size=16384
+          -> resident ovl image 227 (sig match)
+[dma-eawin] img=2 PUT lsa=0x3A000 ea=0x108DC900 size=0x2000
+```
+
+**Un modulo di job WwsJob e' residente in local store e ha riscritto 8 KB di
+risultati in memoria principale.** Non era mai successo in nessuna sessione.
+
 ## Sessione 17 — il segnale mancava sul serio, ma non dove lo cercavo
 
 Due cose, e la seconda vale piu' della prima.
