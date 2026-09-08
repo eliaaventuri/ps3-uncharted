@@ -252,6 +252,11 @@ static void sc_trace(uint64_t num, ppu_context* ctx, uint64_t a3, uint64_t a4,
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+
+/* Collassa le righe TTY identiche consecutive; definita in
+ * runtime/syscalls/lv2_register.c, che e' C. La specifica di linkage deve stare
+ * a livello di file: dentro una funzione non e' ammessa. */
+extern "C" int ps3_tty_dedup(const char* buf, uint32_t len);
 #ifdef _WIN32
 #include <windows.h>
 #endif
@@ -2132,7 +2137,6 @@ extern "C" void lv2_syscall(ppu_context* ctx)
             }
             /* Le ripetizioni identiche consecutive vengono collassate: vedi
              * ps3_tty_dedup in runtime/syscalls/lv2_register.c. */
-            extern "C" int ps3_tty_dedup(const char*, uint32_t);
             if (n && !ps3_tty_dedup(tty, n)) fwrite(tty, 1, n, out);
         }
         fflush(out);

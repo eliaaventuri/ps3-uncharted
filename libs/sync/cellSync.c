@@ -4,6 +4,21 @@
  * SPU-safe synchronization primitives using C11 atomics.
  * On real PS3, these fit within SPU local store (128-byte aligned).
  * Here we use host atomics which are functionally equivalent.
+ *
+ * ATTENZIONE, e non e' teorica: "funzionalmente equivalente" vale finche' il
+ * solo utente di questi oggetti e' il PPU. Se il lato SPU di un titolo li
+ * tocca -- e lo fa con GETLLAR/PUTLLC sugli stessi byte guest, nel layout Sony
+ * big-endian -- una struct dell'host scritta a quell'indirizzo non e'
+ * equivalente a niente: i due lati non si vedono. E' esattamente cosi' che la
+ * coda lock-free ha tenuto fermo Uncharted per tre sessioni, con il lato PPU
+ * che spingeva in campi che per l'SPU erano rumore. La coda ora vive in
+ * cellSyncLFQueue.c, sul layout vero.
+ *
+ * Le primitive qui sotto (mutex, barrier, rwlock, queue) sono ancora struct
+ * dell'host. Per Uncharted va bene: dei NID cellSync importa solo
+ * cellSyncLFQueueGetDirection. Il primo titolo il cui codice SPU tocchi una di
+ * queste va trattato come e' stata trattata la coda -- non aggiustato a
+ * tentoni.
  */
 
 #include "cellSync.h"

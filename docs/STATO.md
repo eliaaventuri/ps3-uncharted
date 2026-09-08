@@ -188,6 +188,15 @@ A parita' di tetto di tempo, righe di avanzamento: **5.263 → ~1.980.000**.
 Il titolo spinge 260 job, ogni push sveglia il task, carica `particle` (16 MB) e
 `particle-ingame`, registra VOX e IGC, e arriva a `game/hud.cpp`.
 
+### Le due leve non servono piu'
+
+`SPURS_EF_FORCE` e `LBP_WS_DRAIN` erano sonde A/B nate proprio da questo stallo.
+Con la coda vera non servono, e la misura lo dice senza margini: nella stessa
+esecuzione, senza nessuna delle due, `cellSpursEventFlagWait` si blocca **zero**
+volte e viene risvegliato 40. L'event flag ora lo alza il task, come deve.
+
+Restano nel codice come sonde, ma nessun percorso normale le tocca.
+
 ### Il fronte successivo
 
 Una chiamata indiretta irrisolta:
@@ -197,11 +206,22 @@ Una chiamata indiretta irrisolta:
       CHAIN obj=250E6BC0  *(obj)=vtable=00000194
 ```
 
-`0x194` non e' un indirizzo: l'oggetto non e' costruito, o lo costruisce un
-percorso che abbiamo ancora stubbato. Subito dopo il titolo entra in un ciclo
-infinito in `game/hud.cpp:845` ("delete an invalid pointer"). Il ciclo di
-`iterate.sh` raccoglie e rilifta i target irrisolti; se il blocco resta dopo
-quello, la causa e' il vtable a zero e va cercata a monte.
+La riga `CHAIN` e' una sonda generica che prova a leggere r3 come oggetto C++:
+qui `obj[0..7] = 00000194 00000000 00000000 00000003 0000000B ...` non e' un
+oggetto con vtable, e' una struttura dati del sistema particellare. Il vtable a
+zero e' un falso indizio.
+
+Il vero problema e' piu' semplice: `0x0048F74C` non ha un ingresso liftato
+registrato. Cade nella zona `ParticleDirectory` (fra
+`InitializeGroupMaterialIds` a `0x48ED98` e `AddGroup` a `0x48FF48`), quindi e'
+un ingresso alternativo dentro una funzione gia' liftata -- il caso per cui
+esiste `find_indirect_entries.py`. Subito dopo il fallimento il titolo entra in
+un ciclo infinito in `game/hud.cpp:845` ("delete an invalid pointer"): e' la
+conseguenza, non la causa.
+
+Nel resto dell'esecuzione: zero assert, zero NID irrisolti, zero `FIFO JUMP`,
+zero accessi OOB. Manca solo `particles-cutscenes.bin`, che il titolo stesso
+dichiara opzionale.
 
 ## Sessione 16 — CORREZIONE: non manca nessun segnale
 
