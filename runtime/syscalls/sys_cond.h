@@ -31,6 +31,11 @@ typedef struct sys_cond_info {
     int      active;
     uint32_t mutex_id;   /* associated mutex */
     char     name[8];
+    /* Live waiter count, for PS3_COND_TRACE. A signal delivered while this is
+     * zero is a signal nobody receives -- on lv2 as here -- and that is the
+     * shape of a lost wakeup. Counting it is the only way to tell that case
+     * from "the signal went to the wrong thread". */
+    int      waiters;
 
 #ifdef _WIN32
     CONDITION_VARIABLE cv;

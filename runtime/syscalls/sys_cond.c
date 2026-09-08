@@ -254,6 +254,8 @@ int64_t sys_cond_wait(ppu_context* ctx)
 
     BOOL ok = SleepConditionVariableCS(&c->cv, &m->cs, ms);
 
+    c->waiters--;
+
     /* Restore ownership */
     m->owner_tid = saved_owner;
     m->lock_count = saved_count;
@@ -277,6 +279,32 @@ int64_t sys_cond_wait(ppu_context* ctx)
       if (kick < 0) kick = getenv("FLOW_CONDKICK") ? 1 : 0;
       if (kick && timeout_us == 0) timeout_us = 1500ull * 1000ull; }
 
+    /* PS3_COND_PRED=<reg>:<hexoff> -- print the guest byte at gpr[reg]+off as the
+     * thread parks. A waiter that parks with its predicate ALREADY true has not
+     * lost a signal: it cannot see the write. A waiter that parks with it false
+     * is waiting for a producer that has not run. The two need opposite fixes,
+     * and nothing else in the log distinguishes them.
+     *
+     * Uncharted's cond-44 waiter (func_00661438+0x138) tests the byte at
+     * r28+0x20, so: PS3_COND_PRED=28:20 */
+    { static int pr = -2; static int preg = 0; static uint32_t poff = 0;
+      if (pr == -2) { const char* e = getenv("PS3_COND_PRED");
+          if (e && *e) { preg = atoi(e); const char* c2 = strchr(e, ':');
+                         poff = c2 ? (uint32_t)strtoul(c2 + 1, 0, 16) : 0; pr = 1; }
+          else pr = 0; }
+      if (pr == 1 && preg >= 0 && preg < 32) {
+          extern uint32_t vm_read32(uint64_t);
+          uint32_t ea = (uint32_t)ctx->gpr[preg] + poff;
+          uint32_t v  = vm_read32(ea & ~3u);
+          unsigned b  = (v >> (8 * (3 - (ea & 3)))) & 0xFF;
+          static int n = 0;
+          if (n++ < 40)
+              fprintf(stderr, "[PRED] cond=%u r%d=0x%08X byte[0x%08X]=%u %s\n",
+                      cond_id, preg, (uint32_t)ctx->gpr[preg], ea, b,
+                      b ? "<-- GIA' VERO: il waiter non lo vede" : "(falso: il produttore non ha scritto)");
+      } }
+
+    c->waiters++;
     if (timeout_us == 0) {
         pthread_cond_wait(&c->cv, &m->mtx);
     } else {
@@ -299,6 +327,8 @@ int64_t sys_cond_wait(ppu_context* ctx)
         }
         return CELL_OK;
     }
+
+    c->waiters--;
 
     /* Restore ownership */
     m->owner_tid = saved_owner;
@@ -325,6 +355,12 @@ int64_t sys_cond_signal(ppu_context* ctx)
     sys_cond_info* c = &g_sys_conds[cond_id - 1];
     if (!c->active)
         return (int64_t)(int32_t)CELL_ESRCH;
+
+    { static int tr = -1;
+      if (tr < 0) tr = getenv("PS3_COND_TRACE") ? 1 : 0;
+      if (tr) fprintf(stderr, "[COND] signal cond=%u waiters=%d%s\n",
+                      cond_id, c->waiters,
+                      c->waiters == 0 ? "   <-- PERSO: nessuno in attesa" : ""); }
 
 #ifdef _WIN32
     WakeConditionVariable(&c->cv);

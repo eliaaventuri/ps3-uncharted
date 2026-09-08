@@ -116,7 +116,51 @@ il log è pulito —
 Le mappature che prima rispondevano `FFFFFFFF` ora riescono, il video è
 configurato a 1280x720 (pitch 5120 = 1280x4) e il backend RSX è su.
 
-## Sessione 15 — dove si ferma adesso, e cosa lo dice
+## Sessione 16 — CORREZIONE: non manca nessun segnale
+
+**La diagnosi della sessione 15 era sbagliata, ed e' stata smontata dai log
+stessi.** Va letta come esempio di come si sbaglia una misura.
+
+Avevo concluso "manca un segnale" perche' la run con `PS3_COND_SPURIOUS_MS=250`
+faceva 10456 righe contro 7912. Ma quelle righe in piu' **sono la sonda che
+stampa se stessa**: ogni waiter si sveglia ogni 250 ms, ri-testa il predicato, lo
+trova falso e rientra in `sys_cond_wait`, che stampa una riga `[WAIT]`. Contando
+solo le righe che NON sono rientri in attesa:
+
+| run | totali | cond_wait | resto |
+|---|---|---|---|
+| normale | 7912 | 2649 | **5263** |
+| con risvegli spuri | 10456 | 5193 | **5263** |
+| con broadcast | 7921 | 2658 | **5263** |
+
+Identiche. E l'ultima riga di progresso e' la stessa in tutte e tre. La sonda non
+ha fatto avanzare il titolo di un passo.
+
+Il verdetto giusto e' l'altro ramo di quello che il commento in `sys_cond.c`
+descrive: **il predicato non e' mai vero, e va inseguito il produttore.** Il che
+combacia con la sonda `PS3_COND_PRED` scritta nella stessa sessione, che per
+cond 44 riporta il byte del predicato a **0 a ogni singola attesa**.
+
+**Anche il conteggio wait/signal era un artefatto.** `cond_signal` stampa solo le
+prime 80 chiamate e `cond_signal_all` le prime 40 (cap nel codice): le 120 righe
+`[SIGNAL]` finiscono a riga 1125 su 7912, e da li' in poi i segnali continuano
+senza essere stampati. Il rapporto "1321 attese contro 18 segnali" non dice nulla.
+
+### Dove e' davvero lo stallo
+
+    [cellSpurs] EventFlagWait BLOCKED 24s on pattern 0x0001 flagEA=0x2A870C80
+                -- waiting for an SPU workload to cellSpursEventFlagSet it
+    [spu_workload] task 0 (taskset 0x2A86F380) sleeping 16s in WAIT_SIGNAL
+
+Attesa circolare nel livello SPURS/SPU: il thread PPU aspetta che un workload SPU
+metta il bit 0x0001, e il task SPU che dovrebbe metterlo e' parcheggiato in
+WAIT_SIGNAL aspettando un segnale che nessuno manda. **I dieci thread in
+`sys_cond_wait` sono vittime a valle**, non la causa.
+
+Da provare, due leve gia' nel codice: `SPURS_EF_FORCE=1` (finge il pattern
+dell'event flag dopo 2 s) e `LBP_WS_DRAIN=2` (sblocca il task SPU parcheggiato).
+
+## Sessione 15 — la diagnosi sbagliata, tenuta come riferimento
 
 Il titolo carica i pacchetti di livello via I/O asincrono:
 
