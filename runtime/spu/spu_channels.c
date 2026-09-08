@@ -1328,6 +1328,27 @@ void spu_indirect_branch(spu_context* ctx)
           if (s_it && _r++ < 200)
               fprintf(stderr, "[irq] IRET restore at srr0=0x%05X\n", ctx->pc & SPU_LS_MASK);
       } }
+    /* Shim di salvataggio registri di WwsJob. Il gestore di interrupt del job
+     * manager si GENERA da solo, in cima alla local store (0x3FEC0..0x3FFF0),
+     * una sequenza di store che salva l'intero file registri, e la chiama con
+     * `brasl $r79, 0x3FEC0`. Li' non c'e' codice che il lifter possa aver
+     * tradotto, quindi il dispatch cadeva nel fallback a microstep, che non sa
+     * eseguire quelle store: il frame non tornava e lo stack host cresceva fino
+     * al tetto (`[spu-depth] host_depth=2000`, con 0x3FEC0 fra i siti recenti).
+     *
+     * Il lavoro dello shim qui e' comunque ridondante: il contratto hardware
+     * "il gestore preserva tutti i registri" e' gia' garantito dal runtime
+     * (spu_irq_regs_save / spu_irq_regs_maybe_restore in spu_drain.c). Quindi
+     * si torna al chiamante senza dispatchare, che e' esattamente l'effetto
+     * dello shim vero. */
+    if (ctx->policy_mode && (ctx->pc & SPU_LS_MASK) >= 0x3FEC0u) {
+        static int s_d = -1;
+        if (s_d < 0) { const char* e = getenv("SPU_SHIM_TRACE"); s_d = e ? 1 : 0; }
+        if (s_d) { static int _n = 0; if (_n++ < 8)
+            fprintf(stderr, "[spu-shim] salvataggio registri generato a 0x%05X: "
+                    "gia' coperto dal runtime, ritorno\n", ctx->pc & SPU_LS_MASK); }
+        return;
+    }
     /* SPURS kernel services (policy-module runs only): the HLE kernel plants
      * these two reserved addresses as exitToKernelAddr / selectWorkloadAddr in
      * the SpursKernelContext (spurs_policy.c). */
