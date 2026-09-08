@@ -278,6 +278,35 @@ La lista dei comandi ora viene percorsa fino in fondo — sei coppie
 
 **Un modulo di job WwsJob e' residente in local store e ha riscritto 8 KB di
 risultati in memoria principale.** Non era mai successo in nessuna sessione.
+Riproducibile: due corse su due, 14 comandi e un overlay residente per corsa,
+zero microstep.
+
+### Il prossimo blocco, gia' individuato
+
+Subito dopo RunJob scatta un'altra assert, e stavolta si vede:
+
+```
+[wws-cmd] #14 idx=5 -> handler 0x23BC
+[wws-code] codeLS=0x00EB0 loadJobNum=0x0 nextLoad=0x1 runJobNum=0xFFFFFFFF
+[spu-assert] img=2 stopd @0x015D8
+```
+
+0x15D8 arriva da `brz $r5, 0x3104`, nella routine che avvia il job:
+
+```
+0030E0  brsl $r6, 0x2F38      ; "prendi il buffer logico" -> risultato in r29
+0030F0  cgt  $r5, $r25, $r5   ; r25 > r5 ?
+0030F4  brz  $r21, 0x15D0
+0030FC  brz  $r29, 0x15D4
+003104  brz  $r5,  0x15D8     <- questa
+00310C  brnz $r18, 0x15E0
+```
+
+Il valore che 0x2F38 restituisce e' fuori intervallo, e `runJobNum` resta
+0xFFFFFFFF. Da guardare: 0x2F38 legge `bufferSetArray` (LS 0xDF0) con
+`lqx $r22, $r20, $r23`, e le tre uscite di quel blocco (0x2FB4, 0x2FE4, 0x301C)
+sono classificate in modo disomogeneo dal lifter -- due dispatch e un ritorno,
+per lo stesso registro.
 
 ## Sessione 17 — il segnale mancava sul serio, ma non dove lo cercavo
 
