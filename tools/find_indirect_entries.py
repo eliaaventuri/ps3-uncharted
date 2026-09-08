@@ -102,6 +102,69 @@ def find_table_targets(elf_bytes, known):
     return found
 
 
+_BCTR = 0x4E800420
+
+
+def find_offset_table_targets(elf_bytes, known):
+    """Switch targets from a jump table of BASE-RELATIVE offsets.
+
+    find_table_targets() looks for data words that hold the target ADDRESS.
+    Uncharted's compiler doesn't emit those: it puts the table right after the
+    `bctr` and fills it with 32-bit offsets FROM THE TABLE ITSELF --
+
+        extsw  r0, r0
+        add    r0, r0, r11        ; r11 = table base
+        mtctr  r0
+        bctr
+        .word 0x68, 0x7C, 0xB4, 0xEC, 0x68, 0x124, 0x68, ...
+
+    so no word in the image ever equals a case address and the whole family was
+    invisible. The particle loader's switch is one of these: chasing its cases
+    one "unresolved indirect call" at a time costs a lift and a rebuild per
+    case, and there are six in that table alone.
+
+    The table's own extent is what bounds the scan: it cannot reach past its
+    first target, because that target is code. Two entries minimum, offsets
+    kept local (a switch body is never far), and every target must be aligned
+    and inside an executable segment.
+    """
+    ex = [(v, o, sz) for v, o, sz, fl in segments(elf_bytes) if fl & 1]
+    if not ex:
+        return set()
+    lo = min(v for v, _, _ in ex)
+    hi = max(v + sz for v, _, sz in ex)
+
+    def read32(va):
+        for vaddr, offset, filesz in ex:
+            if vaddr <= va <= vaddr + filesz - 4:
+                return struct.unpack_from(">I", elf_bytes, offset + (va - vaddr))[0]
+        return None
+
+    found = set()
+    for vaddr, offset, filesz in ex:
+        for off in range(0, max(0, filesz - 3), 4):
+            if struct.unpack_from(">I", elf_bytes, offset + off)[0] != _BCTR:
+                continue
+            table = vaddr + off + 4
+            targets = []
+            i = 0
+            while i < 4096:
+                entry = table + 4 * i
+                if targets and entry >= min(targets):
+                    break                     # la tabella non supera il suo primo caso
+                w = read32(entry)
+                if w is None or w >= 0x10000:
+                    break
+                tgt = table + w
+                if not (lo <= tgt < hi) or (tgt & 3) or tgt <= entry:
+                    break
+                targets.append(tgt)
+                i += 1
+            if len(targets) >= 2:
+                found.update(targets)
+    return found - set(known)
+
+
 def branch_targets(elf_bytes):
     """Every address some branch instruction names directly."""
     out = set()
@@ -226,13 +289,15 @@ def main():
 
     slots = set(find_entries(blob, known))
     tables = find_table_targets(blob, known) - slots
+    offtab = find_offset_table_targets(blob, known) - slots - tables
     extra = {int(x, 0) for x in a.extra.split(",") if x.strip()}
     blocks = set()
     if a.computed_blocks:
-        blocks = find_unreachable_blocks(blob, known, sorted(known)) - slots - tables
-    found = sorted((slots | tables | blocks | extra) - known)
+        blocks = find_unreachable_blocks(blob, known, sorted(known)) - slots - tables - offtab
+    found = sorted((slots | tables | offtab | blocks | extra) - known)
     print(f"{len(items)} known functions, {len(found)} alternate entries found "
-          f"({len(slots)} li-r11 slots, {len(tables)} jump-table targets"
+          f"({len(slots)} li-r11 slots, {len(tables)} jump-table targets, "
+          f"{len(offtab)} offset-table targets"
           + (f", {len(blocks)} computed-only blocks" if blocks else "")
           + (f", {len(extra)} explicit" if extra else "") + ")")
     if not found:
