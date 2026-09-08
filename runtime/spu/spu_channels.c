@@ -155,9 +155,19 @@ void spu_stop_at(spu_context* ctx, uint32_t addr)
     for (int i = 0; i < n; i++) if (seen[i] == key) { known = 1; break; }
     if (!known) {
         if (n < 32) seen[n++] = key;
-        fprintf(stderr, "[spu-assert] img=%d stopd @0x%05X -- il modulo si ferma "
-                "qui e riparte al tick dopo\n", ctx->image_id, addr);
-        fflush(stderr);
+        char b[600];
+        int q = snprintf(b, sizeof b, "[spu-assert] img=%d stopd @0x%05X -- il modulo "
+                         "si ferma qui e riparte al tick dopo\n         r0-31:",
+                         ctx->image_id, addr);
+        /* I registri servono quanto l'indirizzo: un'assert di WwsJob dice
+         * "questo valore e' fuori intervallo", e senza il valore resta una
+         * riga di log. Solo r0-r31: le condizioni stanno tutte li'. */
+        for (int i = 0; i < 32 && q < (int)sizeof b - 12; i++)
+            q += snprintf(b + q, sizeof(b) - q, "%s%08X",
+                          (i % 8) ? " " : (i ? "\n         " : " "),
+                          ctx->gpr[i]._u32[0]);
+        snprintf(b + q, sizeof(b) - q, "\n");
+        fputs(b, stderr); fflush(stderr);
     }
     spu_stop(ctx);
 }
@@ -183,6 +193,8 @@ int spu_run_with_halt(void (*entry)(spu_context*), spu_context* ctx)
      * an earlier run would be restored over this job's arguments. */
     { extern void spu_irq_regs_forget(spu_context*); spu_irq_regs_forget(ctx); }
     ctx->steps = 0;   /* fresh run: step 0 is the entry */
+    ctx->ret_link = 0;  /* nessuna chiamata in corso: i contesti sono locali di
+                         * stack e l'indirizzo si ripete fra run diversi */
     s_spu_halt_armed = 1;
     g_spu_trampoline_fn = 0;                        /* no stale transfer pending */
     /* Lockstep gate (env YZ_SPU_LOCKSTEP, default off): join the round-robin

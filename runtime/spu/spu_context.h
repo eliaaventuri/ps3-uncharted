@@ -264,6 +264,14 @@ typedef struct spu_context {
      * persistent workload-module image adopted at LS 0xA00, re-applied at
      * dispatch after a call-bracket image restore. */
     uint32_t host_depth;
+    /* Indirizzo di ritorno del brsl/bisl attualmente in esecuzione (0 se
+     * nessuno). Serve perche' `bi $rN` con rN != r0 puo' essere sia un salto
+     * calcolato sia il ritorno di questa chiamata: se il target E' esattamente
+     * questo indirizzo, e' il ritorno, e va fatto tornando dalla funzione host
+     * invece di rientrare nel blocco dal trampolino (altrimenti il blocco viene
+     * eseguito due volte -- una nel drain della chiamata e una per la caduta in
+     * avanti del chiamante). Salvato e ripristinato attorno a ogni chiamata. */
+    uint32_t ret_link;
 
     /* Trampoline steps taken since this context started running. Only needed
      * to tell a job's INITIAL entry at LS 0 from a later return to LS 0, which
@@ -640,6 +648,7 @@ void spu_ch_wake(spu_context* ctx);
  * SPU_HOST_DEPTH_MAX overrides the limit. */
 void spu_depth_guard(spu_context* ctx);
 int  spu_tailret_enabled(void);
+int  spu_retlink_enabled(void);
 /* Take a pending SPU interrupt (spu_drain.c): srr0 <- ctx->pc, int_enable <- 0,
  * decode the guest-planted branch at LS 0 into ctx->pc, and return the
  * dispatcher to run instead of the interrupted transfer. Returns `tf`
@@ -652,6 +661,17 @@ void (*spu_take_interrupt(spu_context* ctx,
 #define SPU_DRAIN(ctx) do {                                    \
         spu_depth_guard(ctx);                                  \
         while (g_spu_trampoline_fn) {                           \
+            /* Ritorno ESATTO: il trasferimento in sospeso punta                \
+             * all'indirizzo di ritorno di questa chiamata. Non e' un'euristica \
+             * come quello su gpr[0] qui sotto -- e' l'indirizzo che il brsl ha \
+             * piantato -- ma cambia il dispatch di tutti i titoli, quindi resta \
+             * dietro SPU_RETLINK finche' non e' misurato altrove. */            \
+            if (spu_retlink_enabled() && (ctx)->host_depth > 0 &&              \
+                (ctx)->ret_link &&                                             \
+                (((uint32_t)(ctx)->pc & SPU_LS_MASK) == (ctx)->ret_link)) {    \
+                g_spu_trampoline_fn = 0;                                       \
+                break;                                                         \
+            }                                                                  \
             /* SPU_TAILRET=1: a pending transfer whose target equals the   \
              * link register IS a return. SPU_RET only recognises `bi $r0`;\
              * code returning through another register (`bi $r6`, r6 = the \

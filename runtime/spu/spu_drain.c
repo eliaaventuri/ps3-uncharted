@@ -341,3 +341,11 @@ int spu_tailret_enabled(void)
     if (s_on < 0) { const char* e = getenv("SPU_TAILRET"); s_on = (e && e[0] == 0x31) ? 1 : 0; }
     return s_on;
 }
+/* SPU_RETLINK=1: vedi il commento in SPU_DRAIN. Spento di default. */
+int spu_retlink_enabled(void)
+{
+    static int s = -1;
+    if (s < 0) { const char* e = getenv("SPU_RETLINK"); s = (e && *e && *e != '0') ? 1 : 0; }
+    return s;
+}
+

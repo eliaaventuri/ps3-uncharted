@@ -858,9 +858,14 @@ class SPULifter:
                 # `bi $r0` returns via host return) + SPU_DRAIN (drains the
                 # callee's own tail-chains so they don't grow the caller frame)
                 # + image save/restore (adopt-on-serve cannot leak upward).
+                # ret_link = l'indirizzo di ritorno di QUESTA chiamata: SPU_DRAIN
+                # lo usa per riconoscere un `bi $rN` (rN != r0) che e' il ritorno
+                # e non un salto calcolato. Salvato/ripristinato per annidamento.
                 return (f"{link} {{ int32_t _si = (int32_t)ctx->image_id; "
+                        f"uint32_t _rl = ctx->ret_link; ctx->ret_link = 0x{addr + 4:X}u; "
                         f"ctx->host_depth++; {self.prefix}spu_func_{tgt:08X}(ctx); "
-                        f"SPU_DRAIN(ctx); ctx->host_depth--; spu_img_restore(ctx, _si); }}")
+                        f"SPU_DRAIN(ctx); ctx->host_depth--; ctx->ret_link = _rl; "
+                        f"spu_img_restore(ctx, _si); }}")
             return f"{link} /* TODO spu: brsl unresolved target */;"
         if mn in _COND_BR:
             tgt = self._branch_target(insn)
@@ -917,9 +922,10 @@ class SPULifter:
             # here and its `bi $r0` returns via host return.
             return (f"{g(link_rt)} = spu_link(0x{addr + 4:X}); "
                     f"{{ int32_t _si = (int32_t)ctx->image_id; "
+                    f"uint32_t _rl = ctx->ret_link; ctx->ret_link = 0x{addr + 4:X}u; "
                     f"{_ied}ctx->pc = {g(tgt_reg)}._u32[0]; ctx->host_depth++; "
                     f"spu_indirect_branch(ctx); SPU_DRAIN(ctx); "
-                    f"ctx->host_depth--; spu_img_restore(ctx, _si); }}")
+                    f"ctx->host_depth--; ctx->ret_link = _rl; spu_img_restore(ctx, _si); }}")
         # bisled: set link, branch to RA only if an external event is pending.
         if mn in ("bisled",):
             link_rt = insn.raw & 0x7F            # rt = link; ra (last) = target

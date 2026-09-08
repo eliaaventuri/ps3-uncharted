@@ -244,6 +244,7 @@ Nel lift del policy module (`uncharted-data/relift_spu.sh`):
 --extra-funcs 0xA2C,0x1BDC,0x30E4
 --force-indirect 0x2AD4,0x2AF4,0x2B14
 ```
+piu' `SPU_RETLINK=1` in `run.sh` (vedi sotto).
 
 `--force-indirect` rende le tre uscite dei salti calcolati. 0x1BDC e 0x30E4
 vanno registrati come ingressi perche' `spu_indirect_branch` sa saltare solo a
@@ -251,15 +252,38 @@ un ingresso registrato: 0x30E4 e' l'indirizzo di ritorno di
 `brsl $r6, 0x2F38`, e senza di lui il ritorno cadeva nel fallback a microstep
 (`[spu-smc] pc=0x030E4 UNKNOWN word 0x1006321B`).
 
-**E qui c'e' una trappola misurata.** Ci sono altri tre ritorni della stessa
-forma (0x1960, 0x3030, 0x3610) e registrarli sembrava ovvio. Con quel set piu'
-ampio l'interrupt di stall-and-notify **sparisce** e la pipeline dei job non
-parte proprio: tre corse su tre con zero comandi eseguiti, contro lista
-completa + overlay residente con il set minimo. Registrare un ingresso spezza
-la funzione che lo contiene e trasforma dei `goto` interni in trasferimenti via
-trampolino, e `SPU_DRAIN` scambia per un ritorno un trasferimento il cui target
-coincide con il registro di link (la scorciatoia `SPU_TAILRET`). Quindi: si
-registra solo cio' che una misura chiede, uno alla volta.
+### SPU_RETLINK: il ritorno di un `bi $rN` che non e' r0
+
+Registrare 0x30E4 apre un problema nuovo. Il blocco 0x2F38 e' chiamato con
+`brsl $r6, 0x2F38`, e la sua uscita `bi $r6` ora e' un dispatch: dentro il
+`SPU_DRAIN` della chiamata il dispatch salta gia' a 0x30E4, e poi il chiamante
+ci cade dentro un'altra volta. **Il blocco veniva eseguito due volte**, e la
+seconda passa -- con i registri gia' consumati dalla prima -- faceva scattare
+l'assert 0x15D8.
+
+La soluzione e' un controllo esatto, non un'euristica: il lifter registra in
+`ctx->ret_link` l'indirizzo di ritorno della chiamata in corso (salvato e
+ripristinato per annidamento), e `SPU_DRAIN` tratta come ritorno un
+trasferimento il cui target E' quell'indirizzo. Diverso dalla scorciatoia
+`SPU_TAILRET`, che confronta con `gpr[0]` e quindi indovina. Dietro
+`SPU_RETLINK` perche' cambia il dispatch di tutti i titoli; acceso in `run.sh`
+per questo port.
+
+Tre serie da tre corse, stesso binario a parte i flag:
+
+| configurazione | comandi | overlay | microstep | assert |
+|---|---|---|---|---|
+| prima della correzione | 8, tutti indice 1 | 0 | 0 | 0x15B0 |
+| `0xA2C,0x1BDC` | 14 in 2 corse su 3 | 1 | 5 | 0 |
+| `+0x30E4` | 14 in 3 su 3 | 1 | 0 | **0x15D8** |
+| `+0x30E4` e `SPU_RETLINK=1` | **14 in 3 su 3** | 1 | 0 | **0** |
+
+**E una trappola misurata.** Ci sono altri tre ritorni della stessa forma
+(0x1960, 0x3030, 0x3610) e registrarli sembrava ovvio. Con quel set piu' ampio
+l'interrupt di stall-and-notify **sparisce** e la pipeline non parte: tre corse
+su tre con zero comandi. Registrare un ingresso spezza la funzione che lo
+contiene e trasforma dei `goto` interni in trasferimenti via trampolino. Quindi:
+si registra solo cio' che una misura chiede, uno alla volta.
 
 ### Il risultato
 
@@ -278,35 +302,16 @@ La lista dei comandi ora viene percorsa fino in fondo — sei coppie
 
 **Un modulo di job WwsJob e' residente in local store e ha riscritto 8 KB di
 risultati in memoria principale.** Non era mai successo in nessuna sessione.
-Riproducibile: due corse su due, 14 comandi e un overlay residente per corsa,
-zero microstep.
+Riproducibile: **tre corse su tre**, identiche -- 14 comandi, un overlay
+residente, zero microstep, cinque stall e due interrupt per corsa.
 
-### Il prossimo blocco, gia' individuato
+### Il prossimo blocco
 
-Subito dopo RunJob scatta un'altra assert, e stavolta si vede:
-
-```
-[wws-cmd] #14 idx=5 -> handler 0x23BC
-[wws-code] codeLS=0x00EB0 loadJobNum=0x0 nextLoad=0x1 runJobNum=0xFFFFFFFF
-[spu-assert] img=2 stopd @0x015D8
-```
-
-0x15D8 arriva da `brz $r5, 0x3104`, nella routine che avvia il job:
-
-```
-0030E0  brsl $r6, 0x2F38      ; "prendi il buffer logico" -> risultato in r29
-0030F0  cgt  $r5, $r25, $r5   ; r25 > r5 ?
-0030F4  brz  $r21, 0x15D0
-0030FC  brz  $r29, 0x15D4
-003104  brz  $r5,  0x15D8     <- questa
-00310C  brnz $r18, 0x15E0
-```
-
-Il valore che 0x2F38 restituisce e' fuori intervallo, e `runJobNum` resta
-0xFFFFFFFF. Da guardare: 0x2F38 legge `bufferSetArray` (LS 0xDF0) con
-`lqx $r22, $r20, $r23`, e le tre uscite di quel blocco (0x2FB4, 0x2FE4, 0x301C)
-sono classificate in modo disomogeneo dal lifter -- due dispatch e un ritorno,
-per lo stesso registro.
+La pipeline carica **un** job per corsa: 14 comandi, poi si ferma. La lista di
+wid=7 ne ha otto. Da guardare: dopo RunJob il manager dovrebbe rimettere
+`loadState` a 0, spostare `loadJob` in `runJob` e allocare il job successivo
+(0x33A0, poi 0x31E8 quando `nextLoad >= 0`). Il primo controllo utile e'
+`SPU_JOBEXEC=1`, che dice se il codice del job viene davvero eseguito.
 
 ## Sessione 17 — il segnale mancava sul serio, ma non dove lo cercavo
 
