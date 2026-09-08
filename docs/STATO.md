@@ -305,13 +305,37 @@ risultati in memoria principale.** Non era mai successo in nessuna sessione.
 Riproducibile: **tre corse su tre**, identiche -- 14 comandi, un overlay
 residente, zero microstep, cinque stall e due interrupt per corsa.
 
-### Il prossimo blocco
+### Il codice del job gira
 
-La pipeline carica **un** job per corsa: 14 comandi, poi si ferma. La lista di
-wid=7 ne ha otto. Da guardare: dopo RunJob il manager dovrebbe rimettere
-`loadState` a 0, spostare `loadJob` in `runJob` e allocare il job successivo
-(0x33A0, poi 0x31E8 quando `nextLoad >= 0`). Il primo controllo utile e'
-`SPU_JOBEXEC=1`, che dice se il codice del job viene davvero eseguito.
+`SPU_JOBEXEC=1` lo conferma: sedici dispatch dentro l'overlay 227, con
+`runJobNum=0`. Non e' piu' una questione di caricamento.
+
+### E lo spin del PPU e' lo stesso fronte
+
+Le 89.852 righe `[HOTREAD] spinning on 0x20000000` (su 104.710 totali) non sono
+un problema separato. L'indirizzo di ritorno diceva `lr=0x00532620`, e la
+funzione chiamata li' e' `func_00566108`:
+
+```c
+r11 = [r3 + 0x320];              // il puntatore al flag
+loc_00566120:
+    r9 = [r11];
+    r9 = rlwinm(r9, 0, 31, 31);  // bit 0
+    if (r9 == 0) goto loc_00566120;
+```
+
+**Il PPU aspetta che il bit 0 di `[0x20000000]` diventi 1: e' l'attesa del
+completamento di un job SPU.** Il gioco e' fermo li' perche' quel flag non viene
+mai scritto:
+
+```
+[WWATCH] write32 0x20000000 = 0x00000000  ra=...   <- solo il PPU, che lo azzera
+=== DMA SPU verso 0x20000000..0x20000100 ===  0
+```
+
+Nessun DMA della SPU tocca quell'indirizzo. Il job viene caricato ed eseguito,
+ma la fase di store / decremento della dipendenza non arriva mai a scrivere il
+flag. E' li' che continua l'indagine.
 
 ## Sessione 17 — il segnale mancava sul serio, ma non dove lo cercavo
 
