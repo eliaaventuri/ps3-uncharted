@@ -418,7 +418,8 @@ Due cose da notare, entrambe misurate:
 1. **Nessun DMA va mai a LS 0x4000.** Il manager legge e scrive solo le strutture
    di controllo (LS 0xB00, 0xD00, 0x14C0 da/verso `0x2AE53E80`). Non arriva mai a
    mettere in scena del codice, quindi la firma dei moduli non ha nulla da
-   riconoscere -- non e' il riconoscimento a mancare.
+   riconoscere -- non e' il riconoscimento a mancare. **Questa resta la domanda
+   aperta**, ed e' sul protocollo dei comandi WwsJob, non sulla schedulazione.
 
 2. **Il workload con i comandi non viene quasi mai eseguito.** Attenzione a come
    si arriva a questo numero: la riga `RUN#` e' campionata (le prime 64, poi una
@@ -430,8 +431,20 @@ Due cose da notare, entrambe misurate:
    [spurs-pm] esecuzioni per wid: 0=868 1=882 2=177 3=169 4=210 5=1010 6=779
    ```
 
-   **wid=7 non compare: zero esecuzioni.** In un'altra esecuzione ne aveva fatta
-   una. E' quello la cui job list ha i quattro comandi.
+   In quella esecuzione wid=7 non compare. Ma anche questa e' una lettura da un
+   campione solo, e in una esecuzione da 90 secondi il quadro e' diverso:
+
+   ```
+   esecuzioni per wid: 0=1681 1=1685 2=339 3=331 4=422 5=1977 6=1603 7=156
+   ```
+
+   **wid=7 gira eccome**, 156 volte. Il numero cambia da un run all'altro perche'
+   il gioco abilita i workload mentre carica, e una finestra corta puo' finire
+   prima. Con una traccia esplicita su quale delle tre condizioni ferma un
+   workload (`SPURS_WKL_GATE=1`), nessun workload abilitato viene mai scartato.
+
+   Quindi: **tutti e otto i workload girano, wid=7 compreso, e nessun modulo di
+   job viene comunque messo in scena.** Il problema non e' la schedulazione.
 
 Gli EA dei comandi (`0x108E0900`...) NON stanno nell'immagine dell'EBOOT: i 28
 moduli mappano a VA `0x100B2C00`..`0x10171CC0`, e questi sono oltre. Sono

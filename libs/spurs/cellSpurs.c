@@ -1483,9 +1483,40 @@ static DWORD WINAPI spurs_kernel_thread(LPVOID p)
         if (!enabled) continue;
 
         for (u32 wid = 0; wid < 16; wid++) {
-            if (!(enabled & (0x80000000u >> wid))) continue;
-            if (*(vm_base + ea + SPURS_WKL_STATE1 + wid) != 2) continue;
-            if (!s_workloads[wid].in_use || s_workloads[wid].spurs_ea != ea) continue;
+            /* Perche' un workload NON viene dispacciato. wid=7 di Uncharted --
+             * l'unico la cui job list ha comandi dentro -- non gira mai, e con
+             * tre condizioni in fila e nessuna traccia non si puo' dire quale
+             * delle tre lo ferma. Una riga per (istanza, wid, motivo). */
+            int _gate = 0;
+            if (!(enabled & (0x80000000u >> wid))) _gate = 1;
+            else if (*(vm_base + ea + SPURS_WKL_STATE1 + wid) != 2) _gate = 2;
+            else if (!s_workloads[wid].in_use) _gate = 3;
+            else if (s_workloads[wid].spurs_ea != ea) _gate = 4;
+            if (_gate) {
+                static int s_wg = -1;
+                if (s_wg < 0) s_wg = getenv("SPURS_WKL_GATE") ? 1 : 0;
+                if (s_wg) {
+                    /* "Non abilitato" e' lo stato normale di quasi tutti i wid e
+                     * si dice una volta sola. Gli altri tre motivi valgono per un
+                     * workload che il gioco HA abilitato e che pero' non gira: e'
+                     * il caso interessante, ed e' raro -- se ne stampano di piu'. */
+                    static uint8_t _said[MAX_SPURS_INST][16];
+                    int slot = (int)(si - s_inst);
+                    uint8_t cap = (_gate == 1) ? 1 : 8;
+                    if (slot >= 0 && slot < MAX_SPURS_INST && _said[slot][wid] < cap) {
+                        _said[slot][wid]++;
+                        static const char* why[] = { "", "non abilitato", "state != 2",
+                                                     "slot non in uso",
+                                                     "registrato su un'altra istanza SPURS" };
+                        fprintf(stderr, "[spurs-kern] wid=%u su istanza 0x%08X saltato: %s"
+                                        " (in_use=%d spurs_ea=0x%08X)\n",
+                                wid, ea, why[_gate], s_workloads[wid].in_use,
+                                s_workloads[wid].spurs_ea);
+                        fflush(stderr);
+                    }
+                }
+                continue;
+            }
 
             /* A SPURS policy module is a PERSISTENT SPU program. The real kernel
              * schedules an ENABLED, runnable workload onto an SPU and the module
