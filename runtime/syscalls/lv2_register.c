@@ -28,7 +28,8 @@
 #include "sys_event.h"
 
 #include <stdio.h>
-#include <string.h>
+#include <string.h>
+
 #include "../platform/win32_compat.h"   /* QueryPerformanceCounter shim for the SPU_SPEED timing */
 
 /* ---------------------------------------------------------------------------
@@ -53,9 +54,38 @@ static int64_t sys_tty_write(ppu_context* ctx)
     (void)ch; /* channel number, ignored */
 
     if (buf_ea && len > 0 && vm_base) {
-        /* Write guest string data to host stderr */
-        fwrite(vm_base + buf_ea, 1, len, stderr);
-        fflush(stderr);
+        /* Un titolo bloccato ripete la stessa riga all'infinito -- Uncharted ne
+         * ha scritte 4,5 milioni ("delete an invalid pointer", game/hud.cpp:845)
+         * in due minuti. Stamparle tutte non aggiunge nulla e seppellisce cio'
+         * che le sta intorno, che e' esattamente quello che serve leggere.
+         * Collassa le ripetizioni consecutive identiche e riporta il conto.
+         * PS3_TTY_NODEDUP=1 disattiva il collasso. */
+        static char s_prev[512]; static size_t s_prev_len = 0;
+        static unsigned long s_rep = 0;
+        static int s_dd = -1;
+        if (s_dd < 0) s_dd = getenv("PS3_TTY_NODEDUP") ? 0 : 1;
+        int same = 0;
+        if (s_dd && len < sizeof s_prev) {
+            same = (len == s_prev_len && memcmp(s_prev, vm_base + buf_ea, len) == 0);
+            if (!same) {
+                if (s_rep)
+                    fprintf(stderr, "[tty] ... la riga precedente si e' ripetuta %lu volte\n",
+                            s_rep + 1);
+                s_rep = 0;
+                memcpy(s_prev, vm_base + buf_ea, len); s_prev_len = len;
+            } else {
+                s_rep++;
+                /* un segno di vita ogni tanto: un blocco silenzioso e un blocco
+                 * che gira sono cose diverse e vanno distinte a occhio. */
+                if ((s_rep & 0xFFFFF) == 0)
+                    fprintf(stderr, "[tty] ... ancora la stessa riga (%lu volte)\n", s_rep + 1);
+            }
+        }
+        if (!same) {
+            /* Write guest string data to host stderr */
+            fwrite(vm_base + buf_ea, 1, len, stderr);
+            fflush(stderr);
+        }
         /* CRI error back-chain (YDKJ_CRIBT=1): dump the guest LR chain when a CRI
          * null-pointer / criFs error is printed, to locate the failing call. */
         if (getenv("YDKJ_CRIBT") && len < 4096) {
