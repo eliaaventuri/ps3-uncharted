@@ -201,6 +201,27 @@ static inline int mfc_do_transfer(spu_context* spu, uint32_t lsa, uint64_t ea,
                               " size=%u covers 0x%08X\n",
                       (uint32_t)spu->pc & SPU_LS_MASK, cmd, lsa, (uint32_t)ea, size,
                       (uint32_t)s_w); } }
+    /* SPU_DMA_EAWIN=<lo>:<hi> -- ogni trasferimento la cui finestra di memoria
+     * principale tocca [lo,hi). Serve quando la domanda non e' "cosa fa questa
+     * immagine" ma "qualcuno arriva mai fin qui": il job manager di WwsJob
+     * legge la sua lista di lavoro e poi dovrebbe andare a prendere i comandi
+     * di caricamento agli EA che ci trova dentro. Con un filtro per immagine
+     * quelle letture si perdono nel traffico di SPURS; con un filtro per
+     * indirizzo si vedono, o si vede che non ci sono. */
+    { static long s_lo = -1; static long s_hi = 0;
+      if (s_lo < 0) { const char* e = getenv("SPU_DMA_EAWIN");
+                      if (e && *e) { s_lo = (long)strtoul(e, 0, 16);
+                                     const char* c = strchr(e, ':');
+                                     s_hi = c ? (long)strtoul(c + 1, 0, 16) : s_lo + 0x100; }
+                      else { s_lo = 0; s_hi = 0; } }
+      if (s_hi && (uint32_t)ea < (uint32_t)s_hi && (uint32_t)ea + size > (uint32_t)s_lo) {
+          static int _n = 0;
+          if (_n++ < 200)
+              fprintf(stderr, "[dma-eawin] img=%d pc=0x%05X %s lsa=0x%05X ea=0x%08X size=0x%X\n",
+                      spu->image_id, (uint32_t)spu->pc & SPU_LS_MASK,
+                      mfc_is_get(cmd) ? "GET" : mfc_is_put(cmd) ? "PUT" : "cmd",
+                      lsa, (uint32_t)ea, size);
+      } }
     /* SPU_DMA_DUMP_EA=<hex>: il contenuto di ogni GET che parte da quell'EA.
      * Il dump generico si ferma a 64 byte, e le strutture che contano qui non
      * ci stanno: il job manager di WwsJob legge 256 byte dalla sua struttura di
@@ -210,7 +231,21 @@ static inline int mfc_do_transfer(spu_context* spu, uint32_t lsa, uint64_t ea,
     { static long s_de = -1;
       if (s_de < 0) { const char* e = getenv("SPU_DMA_DUMP_EA");
                       s_de = e && *e ? (long)strtoul(e, 0, 16) : 0; }
-      if (s_de && mfc_is_get(cmd) && (uint32_t)ea == (uint32_t)s_de &&
+      /* SPU_DMA_DUMP_NZ=<off>: stampa solo quando la parola a quell'offset non
+       * e' zero. Una struttura che passa la vita vuota riempie il log di zeri e
+       * nasconde l'unico momento che interessa -- quello in cui il gioco ci ha
+       * messo dentro qualcosa. */
+      static long s_nz = -1;
+      if (s_nz < 0) { const char* e = getenv("SPU_DMA_DUMP_NZ");
+                      s_nz = e && *e ? (long)strtoul(e, 0, 0) + 1 : 0; }
+      int _nz_ok = 1;
+      if (s_nz) {
+          uint32_t off = (uint32_t)(s_nz - 1);
+          uint32_t w;
+          memcpy(&w, vm_base + (uint32_t)ea + off, 4);
+          _nz_ok = (w != 0);
+      }
+      if (s_de && mfc_is_get(cmd) && (uint32_t)ea == (uint32_t)s_de && _nz_ok &&
           vm_base && mfc_ea_range_committed(ea, size)) {
           static int _n = 0;
           if (_n++ < 12) {
@@ -847,16 +882,21 @@ static inline int mfc_submit(mfc_engine* mfc, spu_context* spu, uint32_t cmd)
          * parameter block from a bad address computed later. */
         static int64_t only=-2;
         if (only==-2){ const char* e=getenv("SPU_DMATRACE"); only = e ? strtol(e,0,0) : -1; }
+        /* SPU_DMATRACE_MAX alza il tetto delle righe (default 160). Il tetto
+         * basso taglia il traffico interessante: un policy module fa centinaia
+         * di trasferimenti di servizio prima del primo che conta. */
+        static int64_t cap=-2;
+        if (cap==-2){ const char* e=getenv("SPU_DMATRACE_MAX"); cap = e ? strtol(e,0,0) : 160; }
         if ((dt && (spu->image_id==22 || spu->image_id==23)) ||
             (only >= 0 && spu->image_id == only)) {
-            static int _n=0; if (_n++ < 160)
+            static int _n=0; if (_n++ < cap)
                 fprintf(stderr, "[DMA] img%d cmd=0x%02X lsa=0x%05X ea=0x%09llX size=0x%X tag=%u\n",
                         spu->image_id, cmd, lsa, (unsigned long long)ea, size, tag);
             /* Show what a GET actually delivered. A job that reads its parameter
              * block and then computes a nonsense address is telling you the block
              * was empty, not that its arithmetic is wrong -- but only if you can
              * see the bytes. */
-            if (_n <= 160 && mfc_is_get(cmd) && size <= 64 && vm_base &&
+            if (_n <= cap && mfc_is_get(cmd) && size <= 64 && vm_base &&
                 mfc_ea_range_committed(ea, size)) {
                 const uint8_t* s = vm_base + (uint32_t)ea;
                 fprintf(stderr, "        got:");
