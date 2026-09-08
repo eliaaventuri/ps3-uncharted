@@ -420,11 +420,18 @@ Due cose da notare, entrambe misurate:
    mettere in scena del codice, quindi la firma dei moduli non ha nulla da
    riconoscere -- non e' il riconoscimento a mancare.
 
-2. **Il workload con i comandi gira una volta sola** in 100 secondi (wid=7,
-   `POKE ready=1`), contro le 31-32 dei workload vuoti (wid 0 e 1). Il freno
-   d'inerzia del kernel (`s_idle[wid]`, cadenza fino a 1 su 16) e' pensato per
-   non bruciare core sui moduli che non hanno niente da fare, ma qui rallenta
-   proprio quello che il lavoro ce l'ha.
+2. **Il workload con i comandi non viene quasi mai eseguito.** Attenzione a come
+   si arriva a questo numero: la riga `RUN#` e' campionata (le prime 64, poi una
+   ogni 4096), e contare quelle righe e credere di aver contato le esecuzioni e'
+   lo stesso errore che ha prodotto la diagnosi sbagliata della sessione 15. Con
+   un contatore vero, per 100 secondi:
+
+   ```
+   [spurs-pm] esecuzioni per wid: 0=868 1=882 2=177 3=169 4=210 5=1010 6=779
+   ```
+
+   **wid=7 non compare: zero esecuzioni.** In un'altra esecuzione ne aveva fatta
+   una. E' quello la cui job list ha i quattro comandi.
 
 Gli EA dei comandi (`0x108E0900`...) NON stanno nell'immagine dell'EBOOT: i 28
 moduli mappano a VA `0x100B2C00`..`0x10171CC0`, e questi sono oltre. Sono

@@ -169,6 +169,19 @@ int spu_run_policy_module(spu_lifted_entry_fn entry, int image_id,
     static unsigned long s_runs = 0;
     unsigned long runno = ++s_runs;
     int log_this = s_trace && (runno <= 64 || (runno & 0xFFF) == 0);
+    /* Conteggio per workload. Il log sopra e' campionato (primi 64, poi uno ogni
+     * 4096): contare le righe che stampa e credere di aver contato le esecuzioni
+     * e' lo stesso errore che ha prodotto la diagnosi sbagliata della sessione
+     * 15. Qui il conto e' vero, e viene stampato per intero ogni 4096 esecuzioni. */
+    { static unsigned long s_per_wkl[SPURS_PM_MAX_WKL];
+      if (wid < SPURS_PM_MAX_WKL) s_per_wkl[wid]++;
+      if (s_trace && (runno & 0xFFF) == 0) {
+          char b[300]; int p = snprintf(b, sizeof b, "[spurs-pm] esecuzioni per wid:");
+          for (unsigned k = 0; k < SPURS_PM_MAX_WKL && p < (int)sizeof b - 24; k++)
+              if (s_per_wkl[k]) p += snprintf(b + p, sizeof(b) - p, " %u=%lu", k, s_per_wkl[k]);
+          snprintf(b + p, sizeof(b) - p, "\n");
+          fputs(b, stderr); fflush(stderr);
+      } }
     if (log_this) {
         fprintf(stderr, "[spurs-pm] RUN#%lu wid=%u data=0x%llX spurs=0x%08X image=%d entry=0xA00 size=%u\n",
                 runno, wid, (unsigned long long)wkl_data, spurs_ea, image_id, pm_size);
