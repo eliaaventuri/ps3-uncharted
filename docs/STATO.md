@@ -116,6 +116,26 @@ il log è pulito —
 Le mappature che prima rispondevano `FFFFFFFF` ora riescono, il video è
 configurato a 1280x720 (pitch 5120 = 1280x4) e il backend RSX è su.
 
+## Il ciclo di lavoro, automatizzato
+
+`uncharted-data/iterate.sh` esegue il titolo, raccoglie gli indirizzi che il
+runtime riporta come *unresolved indirect call*, li accumula in
+`analysis/extra_targets.txt`, rilifta, ricostruisce e ripete. Si ferma quando un
+giro non produce target nuovi: a quel punto il blocco non e' piu' un ingresso
+mancante e serve guardarlo.
+
+Ogni giro costa ~7 minuti di lift+build e non richiede decisioni finche' i
+target continuano ad arrivare, quindi conviene lasciarlo girare.
+
+**Quando i target si concentrano in una regione, non inseguirli uno alla volta.**
+Passare in blocco tutti i blocchi raggiungibili solo per calcolo di quella
+regione costa un giro invece di dieci:
+
+| regione | cosa contiene | blocchi |
+|---|---|---|
+| `0x650000-0x680000` | FIOS, threading del titolo | 341 |
+| `0xE0000-0xF0000` + `0x30000-0x40000` | PackageMgr e il loader di livelli | 108 |
+
 ## Sessione 13 — il primo frame, e il file system del titolo
 
 **Il flip.** Il titolo arrivava a `SwapBuffers` e restava a girare su una propria
