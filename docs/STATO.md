@@ -157,8 +157,40 @@ metta il bit 0x0001, e il task SPU che dovrebbe metterlo e' parcheggiato in
 WAIT_SIGNAL aspettando un segnale che nessuno manda. **I dieci thread in
 `sys_cond_wait` sono vittime a valle**, non la causa.
 
-Da provare, due leve gia' nel codice: `SPURS_EF_FORCE=1` (finge il pattern
-dell'event flag dopo 2 s) e `LBP_WS_DRAIN=2` (sblocca il task SPU parcheggiato).
+### Le due leve, misurate
+
+Entrambe sono sonde A/B, non fix: **non vanno lasciate in una run che si misura**
+e non sono in `run.sh`. Contando le righe di progresso (totali meno i rientri in
+attesa, baseline **5263**):
+
+| leva | resto | effetto |
+|---|---|---|
+| `LBP_WS_DRAIN=2` | 5283 | il task SPU si sblocca, il PPU resta fermo |
+| `SPURS_EF_FORCE=1` | 5343 | il PPU si sblocca, poi si riblocca (waits=1000) |
+| entrambe | **5367** | l'immagine SPU del titolo esegue e un job arriva a fine |
+
+Che il titolo avanzi solo forzando l'event flag conferma che **dipende davvero da
+quel workload**: non e' un'attesa spuria.
+
+### Il fronte successivo
+
+Con entrambe le leve compare il vero ostacolo a valle:
+
+    [spu] SPURS taskset syscall num=3 (raw=0x3 args=0x00000A70) image=1
+    [spu-dma] img=1 pc=0x09900: 256 identical transfers to ea=0x05000000 -- halting the SPU
+    [spu_workload] async image=1 RETURNED rc=0 (job ran to completion, did not loop)
+
+**L'immagine SPU del titolo (image=1, quella estratta dall'EBOOT) esegue.** Ma un
+suo job ripete 256 DMA identici verso `ea=0x05000000` e il runtime lo ferma.
+
+`0x05000000` sta nella memoria principale PS3 ma fuori da tutto cio' che il
+titolo alloca (IO a `0x21000000`, heap fino a ~`0x2B200000`): e' l'indirizzo che
+il job riceve, non uno che ha calcolato da un puntatore valido. Il DMA parte
+dalla funzione SPU a `0x9DA0`, chiamata da `0x098FC`; al ritorno il codice
+compone un comando MFC (`0x80410900`).
+
+Da qui: trovare chi riempie il descrittore del job con quell'EA -- il kernel
+SPURS, il job manager del titolo, o una nostra struttura HLE che lo passa male.
 
 ## Sessione 15 — la diagnosi sbagliata, tenuta come riferimento
 
