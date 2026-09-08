@@ -223,6 +223,57 @@ Nel resto dell'esecuzione: zero assert, zero NID irrisolti, zero `FIFO JUMP`,
 zero accessi OOB. Manca solo `particles-cutscenes.bin`, che il titolo stesso
 dichiara opzionale.
 
+### Le tabelle di salto a offset: 2359 ingressi che non vedevamo
+
+Liftato `0x0048F74C`, il giro dopo e' comparso `0x0048F718`: stesso chiamante,
+0x34 piu' indietro. A quel punto invece di rilanciare il ciclo ho guardato il
+disassemblato, ed era una tabella di switch:
+
+```
+0048F6C0:  extsw  r0, r0
+0048F6C4:  add    r0, r0, r11        ; r11 = 0x48F6D0, base della tabella
+0048F6C8:  mtctr  r0
+0048F6CC:  bctr
+0048F6D0:  .word 0x68 0x7C 0xB4 0xEC 0x68 0x124 0x68 ... 0x48
+```
+
+Le voci sono **offset relativi alla tabella**, non indirizzi:
+`0x48F6D0 + 0x48 = 0x48F718`, `+ 0x7C = 0x48F74C`. `find_table_targets` cercava
+parole che contenessero l'indirizzo del caso, e di quelle non ce n'e' nessuna:
+l'intera famiglia era invisibile. Sei casi in questa tabella sola, **2359 in
+tutto il binario**.
+
+`find_offset_table_targets` li trova in un colpo. Il limite della scansione e' la
+tabella stessa — non puo' arrivare oltre il suo primo caso, perche' quello e'
+gia' codice — piu' tre vincoli: minimo due voci, offset locali (il corpo di uno
+switch non e' mai lontano), destinazioni allineate e dentro un segmento
+eseguibile. Sul caso noto trova esattamente i sei indirizzi giusti.
+
+Lezione, e vale piu' del codice: inseguire i target irrisolti uno alla volta col
+ciclo automatico costava un lift e una ricostruzione per caso. Guardare il
+disassemblato una volta ne ha chiusi 2359.
+
+Con quelli liftati (26.257 funzioni) il titolo va oltre le particelle: carica
+`main/pak19/post`, **prefetcha i task del menu principale**
+(`pre-game-introduction`, `main-menu-autosave-warning`, `main-menu-ndi`), apre
+`sound1/speech/english.psarc`, e il kernel SPURS distribuisce workload veri
+(`POKE wid=6 ready=8 ... state=2`). Il ciclo infinito di `hud.cpp` non c'e' piu'.
+
+### Dove si ferma adesso
+
+```
+Assertion failed at job/src/ppu/jobapi/joblist.cpp(333): WwsJob_IsAligned(numElts, 16)
+[cellGcmSys] fence queue overflow -- oldest dropped
+[ps3] FAULT INSIDE THE GUEST WINDOW: SIGBUS at guest 0xD0000060
+      guest caller: func_0073FDF0+0x4F0   lr=0x0073FF14
+```
+
+`func_0073FDF0` e' proprio la funzione che contiene quell'assert (il nome viene
+da `names_from_asserts.py`). `0xD0000060` e' `VM_STACK_BASE + 0x60`, il fondo
+della regione degli stack. Restano anche due chiamate indirette irrisolte
+(`0x004C8834`, `0x006983FC`) che le tabelle a offset non coprono: quelle sono di
+un'altra forma e vanno guardate a parte.
+
 ## Sessione 16 — CORREZIONE: non manca nessun segnale
 
 **La diagnosi della sessione 15 era sbagliata, ed e' stata smontata dai log
