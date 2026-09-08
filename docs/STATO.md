@@ -397,9 +397,39 @@ non compare una sola riga `[spu-ovl]`. Il kernel dispaccia i workload a ogni
 passo, il PPU scrive `ready=8` su wid=6, e il modulo esce senza aver caricato
 niente. Il PPU resta sull'attesa della fisica a `0x20000000`.
 
-Il prossimo filo e' l'argomento per-workload che il kernel passa al modulo
-(`SPURS_WKL_INFO1 + wid*sz + 8`): e' l'EA della job list, ed e' da li' che il
-job manager dovrebbe pescare il primo modulo da caricare.
+L'argomento per-workload arriva, ed e' valido. Il dump della job list a ogni
+esecuzione del modulo (`SPURS_PM_TRACE=1`) mostra sei liste distinte, e una ha
+comandi veri dentro:
+
+```
+RUN#8192 wid=7 data=0x108DFD00
+  joblist@0x108DFD00:  1008EB00 00002F80 00000000 0000017C
+                       00060001 0000FFFF FFFFFFFF FFFFFFFF
+                       00900001 108E0900  00900001 108F0580
+                       00900001 108E2390  00900001 108F0620
+```
+
+`00900001` piu' un EA, quattro volte: sono comandi WwsJob. Le altre cinque liste
+hanno solo l'intestazione (`1008EB00` = l'EA del policy module, `0x2F80` = la sua
+dimensione) e nessun comando.
+
+Due cose da notare, entrambe misurate:
+
+1. **Nessun DMA va mai a LS 0x4000.** Il manager legge e scrive solo le strutture
+   di controllo (LS 0xB00, 0xD00, 0x14C0 da/verso `0x2AE53E80`). Non arriva mai a
+   mettere in scena del codice, quindi la firma dei moduli non ha nulla da
+   riconoscere -- non e' il riconoscimento a mancare.
+
+2. **Il workload con i comandi gira una volta sola** in 100 secondi (wid=7,
+   `POKE ready=1`), contro le 31-32 dei workload vuoti (wid 0 e 1). Il freno
+   d'inerzia del kernel (`s_idle[wid]`, cadenza fino a 1 su 16) e' pensato per
+   non bruciare core sui moduli che non hanno niente da fare, ma qui rallenta
+   proprio quello che il lavoro ce l'ha.
+
+Gli EA dei comandi (`0x108E0900`...) NON stanno nell'immagine dell'EBOOT: i 28
+moduli mappano a VA `0x100B2C00`..`0x10171CC0`, e questi sono oltre. Sono
+puntatori a memoria allocata a runtime -- il titolo copia altrove cio' che passa
+al job, oppure `0x00900001` non e' il comando "carica codice" ma un altro.
 
 ## Sessione 16 — CORREZIONE: non manca nessun segnale
 

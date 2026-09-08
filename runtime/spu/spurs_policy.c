@@ -172,6 +172,22 @@ int spu_run_policy_module(spu_lifted_entry_fn entry, int image_id,
     if (log_this) {
         fprintf(stderr, "[spurs-pm] RUN#%lu wid=%u data=0x%llX spurs=0x%08X image=%d entry=0xA00 size=%u\n",
                 runno, wid, (unsigned long long)wkl_data, spurs_ea, image_id, pm_size);
+        /* `data` e' l'EA della job list: e' da li' che il manager pesca il
+         * prossimo modulo da caricare, ed e' l'unico posto dove si vede se il
+         * titolo ci ha messo dentro qualcosa. Senza questo dump "il modulo gira
+         * ma non carica niente" resta una frase, non una misura. */
+        { extern uint8_t* vm_base;
+          uint32_t jl = (uint32_t)wkl_data;
+          if (vm_base && jl) {
+              char b[420]; int p = snprintf(b, sizeof b, "[spurs-pm]   joblist@0x%08X:", jl);
+              for (int o = 0; o < 0x40; o += 4) {
+                  const uint8_t* m = vm_base + jl + o;
+                  p += snprintf(b + p, sizeof(b) - p, "%s%02X%02X%02X%02X",
+                                (o % 16) ? " " : "  ", m[0], m[1], m[2], m[3]);
+              }
+              snprintf(b + p, sizeof(b) - p, "\n");
+              fputs(b, stderr);
+          } }
         fflush(stderr);
     }
 
