@@ -1,13 +1,15 @@
 # Stato del progetto
 
-Ultimo aggiornamento: **7 settembre 2026** — sessione 4.
+Ultimo aggiornamento: **8 settembre 2026** — sessione 17.
 
 ## Dove siamo
 
-**Uncharted: Drake's Fortune esegue su macOS.** Non è giocabile: il boot arriva
-all'inizializzazione del Job Manager SPU di Naughty Dog e lì crasha. Ma il
+**Uncharted: Drake's Fortune esegue su macOS.** Non è giocabile, ma dalla
+sessione 17 il canale di lavoro PPU→SPU funziona davvero: il titolo carica i
+pacchetti dei livelli, spinge job nella propria coda lock-free, ogni push sveglia
+il task SPU che li consuma, e arriva a eseguire il proprio codice di HUD. Il
 percorso completo — ELF decifrato → lift → compilazione nativa ARM64 →
-esecuzione — funziona, e il gioco esegue il proprio codice di avvio.
+esecuzione — funziona.
 
 Quanto arriva a fare, dal log:
 
@@ -115,6 +117,91 @@ il log è pulito —
 
 Le mappature che prima rispondevano `FFFFFFFF` ora riescono, il video è
 configurato a 1280x720 (pitch 5120 = 1280x4) e il backend RSX è su.
+
+## Sessione 17 — il segnale mancava sul serio, ma non dove lo cercavo
+
+Due cose, e la seconda vale piu' della prima.
+
+### La leva che avevo scambiato per una pista
+
+`LBP_WS_DRAIN=2` fa ripartire un task SPU parcheggiato in WAIT_SIGNAL anche se
+nessuno lo ha svegliato. Con quella leva attiva comparivano un DMA malformato
+verso `ea=0x05000000` e un ciclo di syscall taskset, e la sessione 16 li aveva
+indicati come "il fronte successivo". Un A/B a quattro configurazioni dice che
+non lo erano:
+
+| configurazione | righe | DMA malformati | syscall num=3 | ea=0x05000000 |
+|---|---|---|---|---|
+| base | 7917 | 0 | 0 | 0 |
+| `SPURS_EF_FORCE=1` | 8011 | 0 | 0 | 0 |
+| `LBP_WS_DRAIN=2` | 7935 | 8 | 23 | 0 |
+| entrambe | 8052 | 8 | 23 | 9 |
+
+Esistono **solo** con `LBP_WS_DRAIN`. Sono lo stato inconsistente prodotto dalla
+mia stessa sonda: un task ripreso senza aver ricevuto i dati che aspettava
+calcola parametri MFC da registri che non significano nulla. Inseguire quell'EA
+sarebbe stato inseguire l'ombra della sonda.
+
+### La causa vera: la coda lock-free non era una coda
+
+`CellSyncLFQueue` era una struct dell'host scritta nella memoria del gioco:
+`atomic_uint` nativi, little-endian, e un **puntatore host a 64 bit** dentro
+l'oggetto guest. Ma il consumatore di quella coda e' codice SPU del titolo, che
+legge gli stessi 128 byte con `GETLLAR` nel layout Sony, big-endian. I due lati
+non potevano incontrarsi: il PPU spingeva in campi che per l'SPU erano rumore, e
+l'SPU vedeva una coda per sempre vuota.
+
+Da qui lo stallo che sembrava un segnale perso nei condvar. Il log lo diceva in
+chiaro, bastava leggerlo nell'ordine giusto:
+
+```
+CreateTaskset  ea=0x2A86F380
+EventFlagInitialize(dir=1 = SPU2PPU)  flagEA=0x2A870C80
+LFQueueInitialize(queue=0x2A870D00 owner=0x2A86F380 size=32 depth=12 dir=2 = PPU2SPU)
+CreateTask(id=0, arg=2A870D00 ...)          <- il primo argomento del task E' la coda
+WAIT_SIGNAL#1 enter task=0 ran=0ms          <- pop su coda vuota, parcheggia subito
+```
+
+Il PPU aspettava l'event flag che quel task avrebbe alzato a lavoro finito; i
+dieci thread in `sys_cond_wait` erano vittime a valle.
+
+**Il segnale mancante c'era davvero, ma stava nella chiusura della push.**
+`_cellSyncLFQueueCompletePushPointer` rilegge da `m_hs1` l'id del consumatore che
+si era registrato prima di parcheggiare e chiama `fpSendSignal`; per una coda
+SPURS quella callback e' `_cellSpursSendSignal` e `m_eaSignal` e' l'EA del
+taskset. E' il risveglio, non la scrittura del dato, a far ripartire il task.
+
+Il layout e' stato verificato due volte, da fonti indipendenti: RPCS3
+(`Emu/Cell/Modules/cellSync.h`) e il codice SPU dell'immagine 1 del titolo, che
+fa `GETLLAR` di 128 byte sulla coda e legge `m_h4` a +0x06, `m_h5` a +0x08,
+`m_depth` a +0x14 e i tre campi da 5 bit di `push2` a +0x30 — esattamente
+questi offset. Le due letture coincidono.
+
+La read-modify-write del PPU prende lo stesso lucchetto che serializza gli
+atomici SPU (`spu_atomic_line_lock`). Una `PUTLLC` a cavallo della nostra
+scrittura fallisce da sola: la commit confronta la linea con lo snapshot preso
+alla `GETLLAR`, che e' esattamente la semantica dell'hardware.
+
+### Misura
+
+A parita' di tetto di tempo, righe di avanzamento: **5.263 → ~1.980.000**.
+Il titolo spinge 260 job, ogni push sveglia il task, carica `particle` (16 MB) e
+`particle-ingame`, registra VOX e IGC, e arriva a `game/hud.cpp`.
+
+### Il fronte successivo
+
+Una chiamata indiretta irrisolta:
+
+```
+[ppu] unresolved indirect call -> 0x0048F74C (tid=1 lr=0x0048EFBC)
+      CHAIN obj=250E6BC0  *(obj)=vtable=00000194
+```
+
+`0x194` non e' un indirizzo: l'oggetto non e' costruito, o lo costruisce un
+percorso che abbiamo ancora stubbato. Subito dopo il titolo entra in un ciclo
+infinito in `game/hud.cpp:845` ("delete an invalid pointer"). Il ciclo di
+`iterate.sh` raccoglie e rilifta i target irrisolti; se il blocco resta dopo
+quello, la causa e' il vtable a zero e va cercata a monte.
 
 ## Sessione 16 — CORREZIONE: non manca nessun segnale
 
