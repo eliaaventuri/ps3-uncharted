@@ -738,7 +738,16 @@ u128 spu_rdch(spu_context* ctx, uint32_t channel)
     }
     case SPU_RdEventMask:   v = ctx->event_mask;                        break;
     case SPU_RdEventStat:   v = ctx->event_status;                      break;
-    case SPU_RdMachStat:    v = (ctx->status == SPU_STATUS_RUNNING) ? 1 : 0; break;
+    /* SPU_RdMachStat (canale 13) NON e' "la SPU sta girando": per il CBEA il
+     * bit 0 e' lo stato di abilitazione degli interrupt e il bit 1 lo stato di
+     * isolamento. Il codice del gioco ci fa affidamento in entrambi i versi --
+     * la routine di interrupt del policy module asserisce che il bit 0 sia 0
+     * (siamo dentro il gestore), i moduli di job asseriscono che sia 1 prima di
+     * armare una finestra DMA (jobmod_008cc900 a 0x6110 e 0x6024). Restituire
+     * lo stato di esecuzione faceva passare la prima per caso e fallire la
+     * seconda, e per giunta in cascata: dopo il primo stop lo stato non torna
+     * piu' RUNNING e ogni lettura successiva dava 0. */
+    case SPU_RdMachStat:    v = (ctx->int_enable ? 1u : 0u);            break;
     case SPU_RdSRR0:        v = ctx->srr0;                              break;
     default:
         v = 0;

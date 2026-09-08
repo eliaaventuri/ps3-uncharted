@@ -693,6 +693,19 @@ void (*spu_take_interrupt(spu_context* ctx,
 #define SPU_DRAIN(ctx) do {                                    \
         spu_depth_guard(ctx);                                  \
         while (g_spu_trampoline_fn) {                           \
+            /* L'interrupt si prende PRIMA delle scorciatoie di ritorno.      \
+             * Sull'hardware un interrupt abilitato e pendente entra fra due  \
+             * istruzioni qualunque, ritorno compreso; qui invece le due      \
+             * scorciatoie interrompevano il drain e saltavano il controllo.  \
+             * Nel policy module di WwsJob quella e' la differenza fra funzio-\
+             * nare e no: la sua finestra di interrupt e' `bid $r0` verso un   \
+             * indirizzo calcolato che coincide con gpr[0], cioe' esattamente  \
+             * il caso che SPU_TAILRET scambia per un ritorno -- e quella      \
+             * finestra e' l'unico punto in cui lo stall-and-notify puo'       \
+             * entrare. */                                                    \
+            int _irq = ((ctx)->int_enable &&                                  \
+                        ((ctx)->event_status & (ctx)->event_mask)) ? 1 : 0;   \
+            if (!_irq) {                                                      \
             /* Ritorno ESATTO: il trasferimento in sospeso punta                \
              * all'indirizzo di ritorno di questa chiamata. Non e' un'euristica \
              * come quello su gpr[0] qui sotto -- e' l'indirizzo che il brsl ha \
@@ -717,12 +730,12 @@ void (*spu_take_interrupt(spu_context* ctx,
                 g_spu_trampoline_fn = 0;                                   \
                 break;                                                     \
             }                                                              \
+            }                                                              \
             void (*_tf)(spu_context*) = g_spu_trampoline_fn;    \
             g_spu_trampoline_fn = 0;                            \
             yz_lockstep_tick(ctx);                             \
             spu_task_launch_check((ctx), (void*)_tf);          \
-            if ((ctx)->int_enable &&                            \
-                ((ctx)->event_status & (ctx)->event_mask))      \
+            if (_irq)                                           \
                 _tf = spu_take_interrupt((ctx), _tf);          \
             _tf(ctx);                                          \
         }                                                      \
