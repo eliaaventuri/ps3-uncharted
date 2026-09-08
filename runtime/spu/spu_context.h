@@ -418,6 +418,27 @@ static inline u128 spu_ls_read128(const spu_context* ctx, uint32_t lsa)
      * 0xDF0 + (jobNum<<6) + (logBufSet<<2), so the raw address encodes both.
      * Log them (capped) to see which set each command -- especially RunJob --
      * resolves to. Uses the RAW lsa before 16-byte alignment masking. */
+    /* Traccia dei comandi di caricamento: l'interprete (LS 0x1BB0) sceglie il
+     * gestore con `lqd $r6, 0x1590($r17)`, dove r17 = indice*4. L'indirizzo
+     * grezzo di quella lettura E' l'indice del comando, ed e' l'unico punto in
+     * cui si vede quali comandi il job manager esegue davvero e in che ordine.
+     * I gestori nella tabella (nell'immagine di Uncharted): 0=0x2418 fine,
+     * 1=0x1C20, 2=0x1D20 caricamento, 3=0x22B0, 4=0x2368, 5=0x23BC RunJob,
+     * 6=0x2418, 7=0x1604. */
+    if (ctx->image_id == 2 && ctx->policy_mode && lsa >= 0x1590 && lsa < 0x15B0) {
+        static int s_cmd = -1;
+        if (s_cmd < 0) s_cmd = getenv("SPU_WWS_CMDS") ? 1 : 0;
+        if (s_cmd) {
+            static int n = 0;
+            if (n++ < 400) {
+                static const uint16_t H[8] = { 0x2418, 0x1C20, 0x1D20, 0x22B0,
+                                               0x2368, 0x23BC, 0x2418, 0x1604 };
+                unsigned idx = ((lsa - 0x1590) >> 2) & 7;
+                fprintf(stderr, "[wws-cmd] #%d idx=%u -> handler 0x%04X\n",
+                        n, idx, H[idx]);
+            }
+        }
+    }
     if (ctx->image_id == 2 && ctx->policy_mode && lsa >= 0xDF0 && lsa < 0xEB0) {
         extern int g_wws_read_probe;
         if (g_wws_read_probe < 48) {
