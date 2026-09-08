@@ -116,6 +116,37 @@ il log è pulito —
 Le mappature che prima rispondevano `FFFFFFFF` ora riescono, il video è
 configurato a 1280x720 (pitch 5120 = 1280x4) e il backend RSX è su.
 
+## Sessione 13 — il primo frame, e il file system del titolo
+
+**Il flip.** Il titolo arrivava a `SwapBuffers` e restava a girare su una propria
+variabile globale che solo il suo handler vblank puo' far avanzare. Ma
+cellGcmSys consegna quegli handler da `ppu_gcm_pump`, che `ps3_hle_call` invoca
+**ai confini delle chiamate HLE** — e l'attesa di SwapBuffers e' un puro loop di
+lettura, senza chiamate HLE. Nessun pump, nessun handler, attesa infinita.
+
+`vm_read32` ora chiama il pump quando la stessa lettura si e' ripetuta 4096
+volte: abbastanza da essere uno spin e non un campo caldo. Lo spin sparisce
+(HOTREAD da centinaia a **zero**) e il titolo esce dall'attesa del flip.
+
+Prima di quel punto il titolo aveva gia' fatto la sua prima `CLEAR_SURFACE` e
+chiesto due flip: il percorso grafico funziona.
+
+**Il file system.** Subito dopo il titolo avvia i thread del FIOS di Sony (si
+vedono i suoi `cond_wait`/`cond_signal` fra quattro thread) e cerca il proprio
+indice di cache su `/dev_hdd1`. Quel mount point non aveva mapping: cadeva sulla
+VFS root, cioe' sull'immagine del disco, in **sola lettura**. Ora c'e'
+`$PS3_HDD1_ROOT`. E un `open` con `O_CREAT` su una directory inesistente crea i
+genitori e riprova — su una PS3 quell'albero esiste gia' perche' e' del sistema.
+
+**Dove si ferma.** Ancora una chiamata indiretta non risolta, ora a `0x0066B458`,
+nella regione FIOS del titolo: il dispatch non trova nulla, r3 resta `0xFFFFFFFF`
+e il gioco lo usa come puntatore (SIGSEGV a guest `0xFFFFFFFF`, intercettato
+dalla trap con contesto completo).
+
+Invece di inseguirli uno alla volta, l'ultimo lift copre **tutti i 341 blocchi
+raggiungibili solo per calcolo nella regione 0x650000-0x680000**, dove i target
+si concentrano.
+
 ## Sessione 12 — il gioco carica i livelli
 
 **Il loop dell'inizializzazione grafica era un bug mio.** In sessione 7 avevo
