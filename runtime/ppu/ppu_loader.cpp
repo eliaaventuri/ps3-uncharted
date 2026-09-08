@@ -2130,7 +2130,10 @@ extern "C" void lv2_syscall(ppu_context* ctx)
                 if (ppu_vm_size && buf + i >= ppu_vm_size) break;
                 tty[n++] = (char)vm_read8(buf + i);
             }
-            if (n) fwrite(tty, 1, n, out);
+            /* Le ripetizioni identiche consecutive vengono collassate: vedi
+             * ps3_tty_dedup in runtime/syscalls/lv2_register.c. */
+            extern "C" int ps3_tty_dedup(const char*, uint32_t);
+            if (n && !ps3_tty_dedup(tty, n)) fwrite(tty, 1, n, out);
         }
         fflush(out);
         if (pwl) vm_write32(pwl, len);

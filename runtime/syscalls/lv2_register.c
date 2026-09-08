@@ -43,6 +43,44 @@
 
 extern uint8_t* vm_base;
 
+/* Un titolo bloccato ripete la stessa riga all'infinito -- Uncharted ne ha
+ * scritte 4,5 milioni ("delete an invalid pointer", game/hud.cpp:845) in due
+ * minuti, 489 MB di log. Stamparle tutte non aggiunge nulla e seppellisce cio'
+ * che le sta intorno, che e' esattamente quello che serve leggere.
+ *
+ * Torna 1 se questo blocco e' identico al precedente e va soppresso. Il conto
+ * esce quando la riga cambia, piu' un segno di vita ogni milione: un blocco
+ * fermo e un blocco che gira sono cose diverse e vanno distinte a occhio.
+ * PS3_TTY_NODEDUP=1 per riavere l'output integrale.
+ *
+ * Vive qui e non nei due chiamanti perche' sys_tty_write ha due
+ * implementazioni (questa e il case 403/988 in ppu_loader.cpp) e una sola delle
+ * due filtrata non serve a niente: e' l'altra quella che il titolo usa. */
+int ps3_tty_dedup(const char* buf, uint32_t len)
+{
+    static char s_prev[512];
+    static uint32_t s_prev_len = 0;
+    static unsigned long s_rep = 0;
+    static int s_on = -1;
+
+    if (s_on < 0) s_on = getenv("PS3_TTY_NODEDUP") ? 0 : 1;
+    if (!s_on || !buf || len == 0 || len >= sizeof s_prev) return 0;
+
+    if (len == s_prev_len && memcmp(s_prev, buf, len) == 0) {
+        s_rep++;
+        if ((s_rep & 0xFFFFF) == 0)
+            fprintf(stderr, "[tty] ... ancora la stessa riga (%lu volte)\n", s_rep + 1);
+        return 1;
+    }
+    if (s_rep) {
+        fprintf(stderr, "[tty] ... la riga precedente si e' ripetuta %lu volte\n", s_rep + 1);
+        s_rep = 0;
+    }
+    memcpy(s_prev, buf, len);
+    s_prev_len = len;
+    return 0;
+}
+
 static int64_t sys_tty_write(ppu_context* ctx)
 {
     /* s32 sys_tty_write(s32 ch, const void* buf, u32 len, u32* pwritelen) */
@@ -54,35 +92,7 @@ static int64_t sys_tty_write(ppu_context* ctx)
     (void)ch; /* channel number, ignored */
 
     if (buf_ea && len > 0 && vm_base) {
-        /* Un titolo bloccato ripete la stessa riga all'infinito -- Uncharted ne
-         * ha scritte 4,5 milioni ("delete an invalid pointer", game/hud.cpp:845)
-         * in due minuti. Stamparle tutte non aggiunge nulla e seppellisce cio'
-         * che le sta intorno, che e' esattamente quello che serve leggere.
-         * Collassa le ripetizioni consecutive identiche e riporta il conto.
-         * PS3_TTY_NODEDUP=1 disattiva il collasso. */
-        static char s_prev[512]; static size_t s_prev_len = 0;
-        static unsigned long s_rep = 0;
-        static int s_dd = -1;
-        if (s_dd < 0) s_dd = getenv("PS3_TTY_NODEDUP") ? 0 : 1;
-        int same = 0;
-        if (s_dd && len < sizeof s_prev) {
-            same = (len == s_prev_len && memcmp(s_prev, vm_base + buf_ea, len) == 0);
-            if (!same) {
-                if (s_rep)
-                    fprintf(stderr, "[tty] ... la riga precedente si e' ripetuta %lu volte\n",
-                            s_rep + 1);
-                s_rep = 0;
-                memcpy(s_prev, vm_base + buf_ea, len); s_prev_len = len;
-            } else {
-                s_rep++;
-                /* un segno di vita ogni tanto: un blocco silenzioso e un blocco
-                 * che gira sono cose diverse e vanno distinte a occhio. */
-                if ((s_rep & 0xFFFFF) == 0)
-                    fprintf(stderr, "[tty] ... ancora la stessa riga (%lu volte)\n", s_rep + 1);
-            }
-        }
-        if (!same) {
-            /* Write guest string data to host stderr */
+        if (!ps3_tty_dedup((const char*)(vm_base + buf_ea), len)) {
             fwrite(vm_base + buf_ea, 1, len, stderr);
             fflush(stderr);
         }
