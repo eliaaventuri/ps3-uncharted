@@ -116,6 +116,58 @@ il log è pulito —
 Le mappature che prima rispondevano `FFFFFFFF` ora riescono, il video è
 configurato a 1280x720 (pitch 5120 = 1280x4) e il backend RSX è su.
 
+## Sessione 15 — dove si ferma adesso, e cosa lo dice
+
+Il titolo carica i pacchetti di livello via I/O asincrono:
+
+    ### SyncLoad (loado) on [particle]
+    >>> PackageMgr::RequestLevel [particle]
+    !    OpenAsync: file:".../pak19/particle.pak" issued:1
+    <   PreadAsync: size:0x00100000 offset:0x00000000 ... issued:1
+
+`issued:1` -- prima era 0. Poi si ferma: **7912 righe a 90s, 7912 a 240s, 7912
+a 390s**. Non e' lentezza, e' uno stallo.
+
+**Non e' un deadlock circolare come sembrava.** Il log mostra il PPU in attesa
+di un event flag SPU2PPU e un task SPU in WAIT_SIGNAL, ma i due interruttori del
+progetto per quella classe (`SPURS_EF_WAKE_PARKED`, `SPURS_EF_OBJ_DELIVER`) non
+cambiano nulla: con e senza, il titolo arriva identico a `particle.pak`, stesse
+letture asincrone, stessi 518 riferimenti. Quel thread e' un worker in attesa,
+non il titolo fermo. Il policy module SPU intanto fa 90 esecuzioni e 24 uscite
+pulite al kernel in 100 secondi.
+
+**La misura che conta.** `PS3_COND_SPURIOUS_MS` e `FLOW_CONDKICK` erano
+Win32-only; portate su POSIX, danno la diagnosi:
+
+| run | righe |
+|---|---|
+| normale | 7912 |
+| con risvegli spuri (250 ms) | **10456** |
+
+Il titolo avanza solo con la sonda: **manca un segnale, e il predicato era gia'
+soddisfacibile**. Se non fosse mai vero, la sonda non cambierebbe nulla.
+
+Dieci thread guest sono fermi in `sys_cond_wait`. Il conteggio per condvar:
+
+| cond | wait | signal |
+|---|---|---|
+| 44 | 1321 | 18 |
+| 42 | 879 | 74 |
+| 1 | 438 | 20 |
+
+Nessuna e' orfana, quindi il produttore esiste e segnala -- ma un waiter non
+riceve mai il suo.
+
+**Ipotesi scartata:** che `pthread_cond_signal` svegliasse un waiter arbitrario
+dove lv2 ne sveglia uno specifico. Provato il broadcast: 7921 righe, nessuna
+differenza. Rimosso.
+
+**Da qui:** trovare quale segnale si perde. Il candidato e' una race fra il
+rilascio del mutex e il signal, oppure un produttore che segnala prima che il
+consumatore parcheggi -- e a quel punto su PS3 il segnale sarebbe perso lo
+stesso, il che punterebbe invece a un predicato che il consumatore legge da
+memoria che il produttore non ha ancora reso visibile.
+
 ## Sessione 14 — il titolo legge i propri dati
 
 Le correzioni della notte, in ordine di quanto hanno sbloccato:
