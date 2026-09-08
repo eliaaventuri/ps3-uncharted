@@ -675,7 +675,12 @@ unsigned long long ps3_ms_now(void)
 #ifdef _WIN32
     return (unsigned long long)GetTickCount64();
 #else
-    return 0;
+    /* Restituiva 0 su POSIX. Non e' un dettaglio da diagnostica: la usano anche
+     * la temporizzazione del policy module SPURS e quella dei workload, e un
+     * orologio fermo rende ogni differenza di tempo zero. */
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (unsigned long long)ts.tv_sec * 1000ull + (unsigned long long)(ts.tv_nsec / 1000000);
 #endif
 }
 
@@ -1021,6 +1026,11 @@ static void gcm_fifo_bad_branch(const char* kind, u32 target, u32 word)
 #define GCM_TRACE_N 64
 static u32 s_tr_off[GCM_TRACE_N], s_tr_w[GCM_TRACE_N];
 static u32 s_tr_i = 0;
+/* Quando il rilevatore di ciclo scatta, stampa i passi SUCCESSIVI cosi' come
+ * accadono: la traccia all'indietro mostra solo le ultime 64 parole, e il giro
+ * del ciclo e' piu' lungo di cosi' -- senza i passi in avanti non si vede come
+ * il walker arrivi da un segmento all'altro. */
+static int s_fwd_steps = 0;
 
 /* A branch we cannot take leaves the walker pointing at whatever it
  * mis-decoded, and it never recovers -- get freezes for the rest of the
@@ -1062,6 +1072,22 @@ static void gcm_fifo_resync_why(const char* why, u32* getoff, u32 put)
                     " 0x%08X..0x%08X\n", rescued, from, put); }
     }
     *getoff = put;
+}
+
+/* Come gcm_fifo_dump_around ma senza il gate su GCM_RECDBG: chi la chiama ha
+ * gia' deciso che vale la pena stampare. */
+static void gcm_fifo_dump_chain(void)
+{
+    static int d = 0;
+    if (d++ >= 2) return;
+    for (u32 t = 0; t < GCM_TRACE_N; t++) {
+        u32 k = (s_tr_i + t) % GCM_TRACE_N;
+        if (!s_tr_w[k]) continue;
+        u32 w = s_tr_w[k];
+        fprintf(stderr, "[FIFOSTEP] io=%08X w=%08X  type=%u method=0x%04X count=%u\n",
+                s_tr_off[k], w, w >> 29, w & 0x1FFCu, (w >> 18) & 0x7FFu);
+    }
+    fflush(stderr);
 }
 
 static void gcm_fifo_dump_around(u32 getoff)
@@ -1266,6 +1292,9 @@ static void gcm_rsx_process_fifo_unlocked(void)
         s_tr_off[s_tr_i % GCM_TRACE_N] = s_fifo_getoff;
         s_tr_w[s_tr_i % GCM_TRACE_N] = w;
         s_tr_i++;
+        if (s_fwd_steps > 0) { s_fwd_steps--;
+            fprintf(stderr, "[FIFOFWD] io=%08X ea=%08X w=%08X type=%u method=0x%04X count=%u\n",
+                    s_fifo_getoff, ea, w, w >> 29, w & 0x1FFCu, (w >> 18) & 0x7FFu); }
         u32 type = w >> 29;
 
         if ((w & 0xFFFF0000u) == 0xFEAD0000u) {
@@ -1286,6 +1315,48 @@ static void gcm_rsx_process_fifo_unlocked(void)
               if (_rd) fprintf(stderr, "[JMP] %08X -> %08X (put=%08X)\n",
                                s_fifo_getoff, w & 0x1FFFFFFCu, put); }
             { u32 tgt = w & 0x1FFFFFFCu;
+              /* Ciclo di JUMP: il walker rientra all'infinito sullo stesso arco
+               * senza mai arrivare a `put`, ridrenando ogni giro lo stesso
+               * fence -- misurato 38.863 giri su 0x10008 -> 0x660000 con il
+               * fence 0x49 ripubblicato ogni volta, mentre il gioco aspettava
+               * il 74. Il salto non e' il problema: e' il segmento in mezzo,
+               * decodificato male, che porta il walker su un'uscita che non e'
+               * la sua. Quando l'arco si ripete, stampa la catena di parole
+               * consumate: il comando col conteggio sbagliato e' li' dentro. */
+              { static int _ld = -1; if (_ld < 0) _ld = getenv("GCM_LOOPDBG") ? 1 : 0;
+                if (_ld) {
+                  /* Il ciclo ALTERNA due archi (0x10008->0x660000 e
+                   * 0x8608D8->0x10000), quindi contare le ripetizioni
+                   * consecutive dello stesso arco non vede niente. Si conta
+                   * per sorgente, in una tabella piccola, e si azzera tutto
+                   * quando `put` si muove -- perche' `put` che avanza e'
+                   * l'unica prova che il gioco stia facendo progressi. */
+                  static u32 seen_src[16], seen_n[16], last_put = 0xFFFFFFFFu;
+                  if (put != last_put) { last_put = put;
+                      for (int i = 0; i < 16; i++) { seen_src[i] = 0; seen_n[i] = 0; } }
+                  int h = (int)((s_fifo_getoff >> 2) & 15);
+                  if (seen_src[h] != s_fifo_getoff) { seen_src[h] = s_fifo_getoff; seen_n[h] = 0; }
+                  if (++seen_n[h] == 256) {
+                      fprintf(stderr, "[cellGcmSys] ciclo di JUMP: %08X -> %08X visto "
+                              "256 volte senza che `put` (%08X) si muova -- catena:\n",
+                              s_fifo_getoff, tgt, put);
+                      gcm_fifo_dump_chain();
+                      s_fwd_steps = 900;
+                      /* E le parole del ring fino a `put`: se dopo il salto ci
+                       * sono comandi veri, quel salto e' vecchio -- il gioco
+                       * l'ha scritto un giro fa e poi ci ha accodato sopra,
+                       * dando per scontato che `get` fosse gia' passato. */
+                      { static int _once = 0;
+                        if (!_once++) {
+                          fprintf(stderr, "[cellGcmSys] ring fino a put:\n");
+                          for (u32 io = s_fifo_getoff & ~0xFFFu; io <= put + 0x20; io += 4) {
+                              u32 e = gcm_io2ea(io); if (!e) continue;
+                              u32 v = vm_read32(e);
+                              fprintf(stderr, "  io=%08X w=%08X%s%s\n", io, v,
+                                      (io == s_fifo_getoff) ? "  <- get" : "",
+                                      (io == put) ? "  <- put" : "");
+                          } } }
+                  } } }
               if (!gcm_io2ea(tgt)) { gcm_fifo_bad_branch("JUMP", tgt, w); gcm_fifo_dump_around(s_fifo_getoff); gcm_fifo_resync_why("unmapped-JUMP", &s_fifo_getoff, put); break; }
               /* A JUMP to its own address is the "park the RSX here" idiom:
                * the title leaves it at the write head so the GPU stops if it
