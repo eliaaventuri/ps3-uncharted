@@ -270,9 +270,88 @@ Assertion failed at job/src/ppu/jobapi/joblist.cpp(333): WwsJob_IsAligned(numElt
 
 `func_0073FDF0` e' proprio la funzione che contiene quell'assert (il nome viene
 da `names_from_asserts.py`). `0xD0000060` e' `VM_STACK_BASE + 0x60`, il fondo
-della regione degli stack. Restano anche due chiamate indirette irrisolte
-(`0x004C8834`, `0x006983FC`) che le tabelle a offset non coprono: quelle sono di
-un'altra forma e vanno guardate a parte.
+della regione degli stack. Restano anche due chiamate indirette irrisolte:
+`0x004C8834` e `0x006983FC`.
+
+### Il trap del guest: correzione di una mia lettura
+
+Il lifter ignorava `tw 31, rX, rX` con il commento "safe to no-op in recomp".
+Avevo concluso che fosse il terminatore che il compilatore mette dopo una
+chiamata noreturn, e che ignorarlo facesse eseguire codice morto -- attribuendo
+il SIGBUS a questo. **Sbagliato**, e il disassemblato lo dice in tre righe:
+
+```
+0x4A5070  bl     ReportAssert        ; stampa e torna "continuare?"
+0x4A5080  bne    cr7, 0x49EC80       ; si' -> prosegui
+0x4A5084  tw     31, r1, r1          ; no -> fermati nel debugger
+0x4A5088  b      0x49EC80            ; ...e poi prosegui lo stesso
+```
+
+Entrambi i rami finiscono a `0x49EC80`: e' il break del debugger dell'idioma di
+assert di Naughty Dog, e senza debugger attaccato il titolo prosegue. Come
+flusso, ignorarlo era corretto.
+
+Come diagnostica no: un assert del gioco passava senza che nulla lo segnalasse
+dal lato nostro, e i suoi effetti si vedevano molto piu' tardi come dati
+sbagliati. Ora `ppu_guest_trap` riporta indirizzo, registri e stack guest e
+prosegue; `PS3_TRAP_FATAL=1` ferma il processo quando serve lo stack del primo
+assert e non quello che il titolo combina dopo averlo ignorato.
+
+Il SIGBUS viene da altro: dai dati che l'assert WwsJob segnalava gia' come
+sbagliati.
+
+### Cosa ha fatto vedere subito
+
+Il primo trap che scatta non e' quello di WwsJob:
+
+```
+*** ASSERTION:
+***      File: void RenderTargetManager::CreateCorrespondenceTextureForRenderTarget(U32)
+***      Line: 81
+```
+
+La condizione sta a `0x49EC78`, e la catena e' leggibile per intero:
+
+```
+0049EC44  bl     0x4C8168          ; RenderTargetManager::AllocateOne2DRenderTarget(...)
+0049EC50  cmpwi  cr7, r3, -1       ; ha fallito?
+0049EC74  lwz    r0, 0xE0(r4)
+0049EC7C  bne    cr7, 0x4A5058     ; assert: [obj+0xE0] deve essere 0
+```
+
+E `0x004C8834` -- una delle due chiamate indirette rimaste irrisolte -- e' un
+caso della tabella di salto **dentro `AllocateOne2DRenderTarget`**, a
+`0x4C85F8`. La funzione saltava a un ingresso che non esisteva, tornava un
+valore qualsiasi, e l'assert subito dopo lo segnalava. Con gli offset con segno
+quel caso e' coperto.
+
+### Dopo (26.650 funzioni liftate)
+
+**Zero chiamate indirette irrisolte. Zero assert. Zero trap. Nessun crash.**
+Sono spariti insieme, ed erano la stessa causa: due tabelle di salto che non
+vedevamo. Il titolo prosegue, apre i banchi audio (`sound1/banks/common.bnk`) e
+i thread `q1-worker` girano.
+
+Si ferma su un'attesa nuova, e questa e' leggibile per intero:
+
+```
+0056611C  lwz    r11, 0x320(r3)     ; r11 = this->[0x320] = 0x20000000
+00566120  lwz    r0,  0x0(r11)
+00566124  lwz    r9,  0x0(r11)
+00566128  rlwinm r9, r9, 0, 31, 31  ; bit 0
+00566130  beq    cr7, 0x566120      ; gira finche' bit0 != 1
+```
+
+E' `func_00566108`, chiamata da `0x0053261C` -- codice di fisica, accanto a
+`PhysIngameTest::FrameSyncBegin` (`0x531880`) e a `InitPhysSpuModules`
+(`0x565468`). Il PPU aspetta che un job SPU della fisica alzi il bit 0 di una
+parola condivisa a `0x20000000`, e quel bit non arriva mai. Poco sotto c'e' la
+stessa attesa su `[r11+0xC]`, per una lista di job.
+
+Da qui: capire se il modulo SPU della fisica viene davvero eseguito -- i
+workload SPURS vengono distribuiti (`POKE wid=4 ready=5`, `wid=6 ready=8`), ma
+il task del taskset resta fermo in WAIT_SIGNAL, e la fisica passa da un'altra
+strada.
 
 ## Sessione 16 — CORREZIONE: non manca nessun segnale
 
