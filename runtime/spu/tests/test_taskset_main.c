@@ -11,6 +11,11 @@
  * events. Here the taskset runner is a minimal host stand-in for cellSpurs; the
  * integration rung promotes it into cellSpurs.c + the lv2 thread-group path.
  */
+/* NOTA (dopo il passaggio al layout reale): CellSyncLFQueue ora e' memoria del
+ * gioco -- gli argomenti sono EA guest, non puntatori host, perche' il
+ * consumatore e' codice SPU che legge quei byte con GETLLAR. Questo test
+ * dichiara ancora la coda sullo stack dell'host: per rieseguirlo va spostata
+ * dentro la VM guest e passata come EA. Vedi libs/sync/cellSyncLFQueue.c. */
 #include "spu_recomp.h"
 #include "spu_helpers.h"
 #include "spu_dma.h"

@@ -251,6 +251,14 @@ static void resv_lock(void)   { while (atomic_flag_test_and_set_explicit(&g_resv
 static void resv_unlock(void) { atomic_flag_clear_explicit(&g_resv_lock, memory_order_release); }
 #endif
 
+/* The PPU-side HLE of a lock-free queue does its read-modify-write on the SAME
+ * 128-byte guest line the SPU reaches with GETLLAR/PUTLLC. Holding this lock for
+ * the whole RMW serialises it against each SPU atomic; an SPU commit that
+ * straddled our write fails on its own, because PUTLLC compares the line with
+ * the snapshot taken at GETLLAR. Exported for libs/sync/cellSyncLFQueue.c. */
+void spu_atomic_line_lock(void)   { resv_lock(); }
+void spu_atomic_line_unlock(void) { resv_unlock(); }
+
 /* Total PUTLLC attempts (all SPUs). The PM flow trace (spurs_policy.c) reads
  * the delta across one policy run to find the run that performed a claim. */
 volatile unsigned g_spu_putllc_count = 0;

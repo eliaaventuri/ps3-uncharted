@@ -105,19 +105,24 @@ s32 cellSyncQueueClear(CellSyncQueue* queue);
 /* ---------------------------------------------------------------------------
  * CellSyncLFQueue -- lock-free queue
  * -----------------------------------------------------------------------*/
-#define CELL_SYNC_LFQUEUE_DIR_PUSH  0
-#define CELL_SYNC_LFQUEUE_DIR_POP   1
+/* Chi spinge e chi svuota. Il valore e' quello che il gioco scrive in
+ * m_direction e che il lato SPU rilegge: non e' rinominabile. */
+#define CELL_SYNC_QUEUE_SPU2SPU     0
+#define CELL_SYNC_QUEUE_SPU2PPU     1
+#define CELL_SYNC_QUEUE_PPU2SPU     2
+#define CELL_SYNC_QUEUE_ANY2ANY     3
 
-typedef struct CellSyncLFQueue {
-    atomic_uint head;
-    atomic_uint tail;
-    atomic_uint count;
-    u32         depth;
-    u32         elemSize;
-    u8*         buffer;
-    u32         direction;
-    atomic_uint lock;
-} CellSyncLFQueue;
+/* L'oggetto e' 128 byte di memoria DEL GIOCO nel layout reale big-endian: il
+ * lato SPU (codice del titolo, liftato) lo legge e lo scrive con GETLLAR/PUTLLC,
+ * quindi il lato PPU deve toccare gli stessi byte e non una struct dell'host.
+ * Gli offset dei campi stanno in cellSyncLFQueue.c, l'unico che li conosce. */
+typedef struct CellSyncLFQueue { u8 opaque[128]; } CellSyncLFQueue;
+
+/* Chi sveglia il consumatore. Su hardware la completamento di una push chiama
+ * questa callback con (m_eaSignal, taskId letto da m_hs1): per una coda SPURS
+ * e' _cellSpursSendSignal, ed e' l'unico modo in cui il task SPU parcheggiato
+ * torna a girare. Passare NULL significa "nessuno da svegliare". */
+typedef s32 (*CellSyncLFQueueSendSignal)(u32 eaSignal, u32 arg);
 
 s32 cellSyncLFQueueInitialize(CellSyncLFQueue* queue, void* buffer,
                                u32 size, u32 depth, u32 direction,
@@ -130,6 +135,12 @@ s32 cellSyncLFQueueGetDirection(const CellSyncLFQueue* queue, u32* dir);
 s32 cellSyncLFQueueDepth(const CellSyncLFQueue* queue, u32* depth);
 s32 cellSyncLFQueueSize(CellSyncLFQueue* queue, u32* size);
 s32 cellSyncLFQueueClear(CellSyncLFQueue* queue);
+s32 cellSyncLFQueueGetEntrySize(const CellSyncLFQueue* queue, u32* entry_size);
+
+/* Push completa di callback di risveglio: cellSyncLFQueuePush e' questa con
+ * send = NULL. La usa _cellSpursLFQueuePushBody. */
+s32 cellSyncLFQueuePushSignal(CellSyncLFQueue* queue, const void* data,
+                              u32 isBlocking, CellSyncLFQueueSendSignal send);
 
 #ifdef __cplusplus
 }

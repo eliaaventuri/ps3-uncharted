@@ -58,18 +58,38 @@ s32 _cellSpursLFQueueInitialize(void* pTasksetOrSpurs, void* queue,
            qea, (u32)(uintptr_t)pTasksetOrSpurs, (u32)(uintptr_t)buffer,
            size, depth, direction);
 
-    /* The queue body itself is a plain CellSyncLFQueue: reuse that. It takes
-     * guest EAs and translates them the same way. */
+    /* Il corpo della coda e' un CellSyncLFQueue: l'inizializzatore scrive il
+     * layout reale nella memoria del gioco, e l'owner (taskset o istanza SPURS)
+     * diventa m_eaSignal -- il destinatario del risveglio. */
     return cellSyncLFQueueInitialize((CellSyncLFQueue*)queue, (void*)(uintptr_t)buffer,
                                      size, depth, direction, pTasksetOrSpurs);
 }
 
-/* NID: 0x8A85674D -- push with a timeout the PPU side ignores (we never block). */
-s32 _cellSpursLFQueuePushBody(void* queue, const void* buffer, u32 timeout)
+/* Chi svegliare quando una push rende la coda non vuota.
+ *
+ * Il consumatore SPU, trovando la coda vuota, registra il proprio task id in
+ * m_hs1 dentro l'oggetto coda e poi parcheggia con la syscall WAIT_SIGNAL del
+ * taskset. La chiusura della push rilegge quell'id e chiama questa callback con
+ * (m_eaSignal, id): per una coda SPURS m_eaSignal e' l'EA del taskset, che e'
+ * esattamente cio' che _cellSpursLFQueueInitialize ci ha passato come owner.
+ *
+ * Senza questa callback il dato finisce nel buffer e nessuno se ne accorge: e'
+ * il segnale, non la scrittura, a far ripartire il task. */
+static s32 spurs_lfq_send_signal(u32 eaSignal, u32 arg)
 {
-    (void)timeout;
+    return cellSpursSendSignal((CellSpursTaskset*)(uintptr_t)eaSignal,
+                               (CellSpursTaskId)arg);
+}
+
+/* NID: 0x8A85674D
+ *
+ * Il terzo argomento e' isBlocking, come in _cellSyncLFQueuePushBody:
+ * cellSpursLFQueuePush passa 1, cellSpursLFQueueTryPush passa 0. */
+s32 _cellSpursLFQueuePushBody(void* queue, const void* buffer, u32 isBlocking)
+{
     if (!queue) return CELL_SPURS_CORE_ERROR_NULL_POINTER;
-    return cellSyncLFQueuePush((CellSyncLFQueue*)queue, buffer);
+    return cellSyncLFQueuePushSignal((CellSyncLFQueue*)queue, buffer,
+                                     isBlocking, spurs_lfq_send_signal);
 }
 
 /* NID: 0x1656D49F
