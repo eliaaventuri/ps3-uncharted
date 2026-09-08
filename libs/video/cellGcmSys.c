@@ -1285,6 +1285,36 @@ static void gcm_rsx_process_fifo_unlocked(void)
             break;
         }
         u32 w = vm_read32(ea);
+        /* Una sequenza di parole a zero non e' un flusso di comandi: e' un
+         * buffer azzerato, o non ancora riempito da chi lo scrive. Trattarle
+         * come metodo 0 con conteggio 0 fa avanzare il walker di 4 byte alla
+         * volta nel vuoto, e siccome quel vuoto sta FUORI dal ring il controllo
+         * "fermati a `put`" non scatta mai: il walker esce dal segmento, cammina
+         * per megabyte e finisce sulla coda di un altro segmento, da cui torna
+         * nel ring -- il ciclo che ridrenava lo stesso fence 38.863 volte.
+         *
+         * Ci si ferma invece, SENZA far avanzare `get`: la passata dopo rilegge
+         * le stesse parole (se nel frattempo il buffer viene riempito si
+         * prosegue), e se restano zero mentre `put` si e' mosso ci pensa il
+         * watchdog di stuck-get piu' sotto a risincronizzare. */
+        if (w == 0) {
+            u32 z = 0, probe_io = s_fifo_getoff;
+            while (z < 4) {
+                u32 pe = gcm_io2ea(probe_io);
+                if (!pe || vm_read32(pe) != 0) break;
+                z++; probe_io += 4;
+            }
+            if (z >= 4) {
+                static int _n = 0; static u32 _last = 0xFFFFFFFFu;
+                if (s_fifo_getoff != _last && _n++ < 8) {
+                    _last = s_fifo_getoff;
+                    fprintf(stderr, "[cellGcmSys] FIFO: zeri a 0x%08X (put=0x%08X)"
+                            " -- buffer non ancora scritto, la passata si ferma qui\n",
+                            s_fifo_getoff, put);
+                }
+                break;
+            }
+        }
         /* Only remember offsets BELOW put -- those are positions in the
          * ring the title is writing. A park in another region is where the
          * walker gave up, not how far it got through the ring. */
