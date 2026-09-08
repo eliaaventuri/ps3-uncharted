@@ -303,6 +303,11 @@ extern "C" void ps3_indirect_call(ppu_context* ctx);
  * pointer table the recomp never fills). See --hle-stubs. */
 extern "C" void ps3_hle_call(unsigned int nid, ppu_context* ctx);
 
+/* Trap incondizionato del guest (`tw 31, rX, rX`): il break del debugger
+ * dell'idioma di assert del titolo. Riporta e prosegue -- serve a non lasciare
+ * passare in silenzio un assert del gioco. */
+extern "C" void ppu_guest_trap(ppu_context* ctx, unsigned int addr);
+
 /* Trampoline function pointer for cross-fragment branches (TLS).
  * PPU_THREAD_LOCAL comes from ppu_recomp.h, included above. */
 extern "C" PPU_THREAD_LOCAL void (*g_trampoline_fn)(void*);
@@ -1920,9 +1925,25 @@ class PPULifter:
                     f"ctx->cr = (ctx->cr & ~(0xFu << 28)) | (_sc ? (2u << 28) : 0u); "
                     f"ctx->reserve_addr = 0; }}")
 
-        # ------- Trap (tw) — used for assertions, safe to no-op in recomp -------
+        # ------- Trap (tw/td) -------
+        # TO=31 e' il trap incondizionato. In questo titolo NON termina: e' il
+        # break del debugger nell'idioma di assert di Naughty Dog, e il ramo che
+        # lo salta e quello che lo attraversa finiscono nello stesso posto --
+        # senza debugger attaccato il gioco prosegue in entrambi i casi.
+        # Ignorarlo era corretto come flusso e sbagliato come diagnostica: un
+        # assert del gioco passava senza che nulla lo segnalasse. ppu_guest_trap
+        # lo riporta e prosegue (PS3_TRAP_FATAL=1 per fermarsi).
+        # Sui 17503 trap di BCES00065 sono TO=31 tutti quanti.
         if mn == "tw" or mn == "twi" or mn == "td" or mn == "tdi":
-            return f"/* trap: {mn} {insn.operands} — ignored */;"
+            to = None
+            try:
+                to = int(str(insn.operands).split(",")[0].strip())
+            except (ValueError, AttributeError):
+                pass
+            if to == 31:
+                return (f"/* {mn} {insn.operands}: trap incondizionato */ "
+                        f"ppu_guest_trap(ctx, 0x{insn.addr:08X}u);")
+            return f"/* trap: {mn} {insn.operands} — condizionale, ignorato */;"
 
         # ------- Byte-reverse loads/stores -------
         if mn == "lwbrx":

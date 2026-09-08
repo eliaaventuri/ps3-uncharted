@@ -251,6 +251,9 @@ static void sc_trace(uint64_t num, ppu_context* ctx, uint64_t a3, uint64_t a4,
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
+#ifndef _WIN32
+#include <unistd.h>   /* _exit: uscire da un trap senza gli atexit */
+#endif
 #include <string.h>
 
 /* Collassa le righe TTY identiche consecutive; definita in
@@ -1344,6 +1347,58 @@ extern "C" void ppu_recomp_register(void)
 /* Reusable guest-stack dumper: scan the guest stack for saved return addresses
  * (words landing inside a lifted function) and resolve them via function_table.
  * Callable from other TUs (e.g. sys_event.c) to identify a blocked thread's chain. */
+/* Trap incondizionato del guest (`tw 31, rX, rX`).
+ *
+ * NON e' un terminatore, e la prima lettura che ne ho dato era sbagliata. In
+ * questo titolo e' il break del debugger dell'idioma di assert di Naughty Dog:
+ *
+ *     0x4A5070  bl     ReportAssert        ; stampa e torna "continuare?"
+ *     0x4A5078  rlwinm r3, r3, 0, 24, 31
+ *     0x4A5080  bne    cr7, 0x49EC80       ; si' -> prosegui
+ *     0x4A5084  tw     31, r1, r1          ; no -> fermati nel debugger
+ *     0x4A5088  b      0x49EC80            ; ...e poi prosegui lo stesso
+ *
+ * Entrambi i rami arrivano a 0x49EC80: senza un debugger attaccato il titolo va
+ * avanti. Ignorarlo era quindi corretto come flusso -- ma non come diagnostica,
+ * perche' un assert del gioco passava senza che nulla lo segnalasse dal lato
+ * nostro, e i suoi effetti si vedevano molto piu' tardi come dati sbagliati.
+ *
+ * Quindi: si riporta, e si prosegue. PS3_TRAP_FATAL=1 ferma il processo, che
+ * serve quando si vuole lo stack esatto del primo assert e non quello che il
+ * titolo combina dopo averlo ignorato. */
+extern "C" void ppu_dump_guest_stack(ppu_context* ctx, const char* tag);   /* definita sotto */
+
+extern "C" void ppu_guest_trap(ppu_context* ctx, unsigned int addr)
+{
+    static int s_fatal = -1;
+    if (s_fatal < 0) s_fatal = getenv("PS3_TRAP_FATAL") ? 1 : 0;
+
+    static int s_n = 0;
+    if (s_n++ < 8) {
+        fprintf(stderr, "[ppu] TRAP del guest a 0x%08X (tid=%llu lr=0x%08X): "
+                        "il break del debugger dopo un assert del titolo\n",
+                addr, (unsigned long long)ctx->thread_id, (uint32_t)ctx->lr);
+        /* Un trap e' il punto in cui un assert del titolo ha appena stampato le
+         * sue ragioni: i registri sono ancora quelli che le hanno prodotte, e
+         * senza di loro resta solo il numero di riga. */
+        for (int r = 0; r < 32; r += 8) {
+            fprintf(stderr, "      r%-2d:", r);
+            for (int k = 0; k < 8; k++)
+                fprintf(stderr, " %08X", (uint32_t)ctx->gpr[r + k]);
+            fputc('\n', stderr);
+        }
+        ppu_dump_guest_stack(ctx, "trap");
+        fflush(stderr);
+    }
+    if (!s_fatal) return;
+    fprintf(stderr, "[ppu] PS3_TRAP_FATAL: mi fermo qui\n");
+    /* Un trap puo' scattare su qualsiasi thread guest. exit() eseguirebbe gli
+     * atexit mentre gli altri thread tengono ancora i loro lock, e invece di
+     * uscire si resta appesi. Si svuotano gli stream e si esce subito. */
+    fflush(NULL);
+    _exit(4);
+}
+
 extern "C" void ppu_dump_guest_stack(ppu_context* ctx, const char* tag)
 {
     if (!ctx || !vm_base) return;

@@ -119,7 +119,8 @@ def find_offset_table_targets(elf_bytes, known):
         .word 0x68, 0x7C, 0xB4, 0xEC, 0x68, 0x124, 0x68, ...
 
     so no word in the image ever equals a case address and the whole family was
-    invisible. The particle loader's switch is one of these: chasing its cases
+    invisible. Gli offset sono con segno: il caso di default sta spesso appena
+    prima della tabella. The particle loader's switch is one of these: chasing its cases
     one "unresolved indirect call" at a time costs a lift and a rebuild per
     case, and there are six in that table alone.
 
@@ -147,18 +148,28 @@ def find_offset_table_targets(elf_bytes, known):
                 continue
             table = vaddr + off + 4
             targets = []
+            ahead = []                        # solo i casi DOPO la tabella la limitano
             i = 0
             while i < 4096:
                 entry = table + 4 * i
-                if targets and entry >= min(targets):
+                if ahead and entry >= min(ahead):
                     break                     # la tabella non supera il suo primo caso
                 w = read32(entry)
-                if w is None or w >= 0x10000:
+                if w is None:
                     break
-                tgt = table + w
-                if not (lo <= tgt < hi) or (tgt & 3) or tgt <= entry:
+                # Gli offset sono CON SEGNO: il caso di default sta spesso prima
+                # della tabella. Trattarli come senza segno faceva finire la
+                # scansione alla prima voce negativa, e la tabella del renderer
+                # (0x4C8614, con quattro voci a -0x1A4) restava invisibile.
+                sw = w - 0x100000000 if w & 0x80000000 else w
+                if abs(sw) >= 0x10000:
+                    break                     # uno switch non salta cosi' lontano
+                tgt = table + sw
+                if not (lo <= tgt < hi) or (tgt & 3) or tgt == entry:
                     break
                 targets.append(tgt)
+                if tgt > table:
+                    ahead.append(tgt)
                 i += 1
             if len(targets) >= 2:
                 found.update(targets)
