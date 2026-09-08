@@ -263,6 +263,20 @@ int64_t sys_cond_wait(ppu_context* ctx)
         return (int64_t)(int32_t)CELL_ETIMEDOUT;
     }
 #else
+    /* PS3_COND_SPURIOUS_MS / FLOW_CONDKICK, same probes as the Win32 branch
+     * above -- they were Win32-only, which left POSIX without the one
+     * measurement that separates "a signal is missing" from "the predicate is
+     * never true". A spurious wakeup is legal for a condition variable (correct
+     * guest code re-tests its predicate), so neither can invent progress the
+     * title would not otherwise make. Probes, not fixes: do not leave them set
+     * in a run you are measuring. */
+    { static long sp = -1;
+      if (sp < 0) { const char* e = getenv("PS3_COND_SPURIOUS_MS"); sp = e ? atol(e) : 0; }
+      if (sp > 0 && timeout_us == 0) timeout_us = (uint64_t)sp * 1000ull; }
+    { static int kick = -1;
+      if (kick < 0) kick = getenv("FLOW_CONDKICK") ? 1 : 0;
+      if (kick && timeout_us == 0) timeout_us = 1500ull * 1000ull; }
+
     if (timeout_us == 0) {
         pthread_cond_wait(&c->cv, &m->mtx);
     } else {
