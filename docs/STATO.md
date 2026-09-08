@@ -116,6 +116,42 @@ il log è pulito —
 Le mappature che prima rispondevano `FFFFFFFF` ora riescono, il video è
 configurato a 1280x720 (pitch 5120 = 1280x4) e il backend RSX è su.
 
+## Sessione 14 — il titolo legge i propri dati
+
+Le correzioni della notte, in ordine di quanto hanno sbloccato:
+
+**1. Le code lock-free SPURS non esistevano.** `_cellSpursLFQueueInitialize` e
+`cellSpursLFQueueAttachLv2EventQueue` tornavano *unresolved NID* a ogni avvio.
+Sono il canale con cui il lato PPU consegna lavoro al proprio lato SPU: senza
+di loro il kernel SPURS vedeva `ready=0` per sempre. Il lato SPU girava da
+sessioni; non gli arrivava niente. Implementate come wrapper sulle `cellSync`
+LFQueue, che il runtime aveva gia' complete.
+
+**2. I callback durante uno spin.** `SwapBuffers` aspettava il proprio handler
+vblank, ma cellGcmSys li consegna solo ai confini delle chiamate HLE e
+quell'attesa e' un loop di lettura puro. Ora `vm_read32` chiama il pump dopo
+4096 letture uguali.
+
+**3. Il file system del titolo.** `/dev_hdd1` — il disco scratch, dove il FIOS
+di Sony tiene la cache — non aveva mapping e cadeva sull'ISO in sola lettura.
+Aggiunto `$PS3_HDD1_ROOT`; e un `open` con `O_CREAT` ora crea le directory
+genitore, che su una PS3 esistono gia' perche' le possiede il sistema.
+
+**4. Lo stack dei thread guest, 8x.** Il codice liftato costa circa quattro
+volte lo stack del PowerPC originale: ogni funzione tiene il frame per l'intera
+chiamata e gli helper del runtime ne aggiungono di propri. Il thread "Load Text"
+chiede 16 KB e ne consumava 61. `$PS3_STACK_SCALE` lo regola.
+
+**Dove e' arrivato:**
+
+    [fs] open '/dev_bdvd/PS3_GAME/USRDIR/build/main/text1/2.subtitles' -> fd 89
+    <  ReadSync: size:0x00017c2f read:0x00017c2f ... result:kNOERR
+    ?   StatSync: file:".../dc1/anim-descendant.bin" result:kNOERR
+    [RSX] CLEAR_SURFACE ...   (un frame dopo l'altro)
+
+Apre, legge e chiude i propri file — testi, sottotitoli, animazioni — mentre il
+ciclo di frame gira e gli SPU eseguono task. Log fino a 5206 righe (era 500).
+
 ## Il ciclo di lavoro, automatizzato
 
 `uncharted-data/iterate.sh` esegue il titolo, raccoglie gli indirizzi che il
