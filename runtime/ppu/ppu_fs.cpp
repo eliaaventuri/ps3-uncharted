@@ -21,6 +21,7 @@
 #include <string.h>
 #include <stdlib.h>
 #include <sys/stat.h>
+#include <errno.h>
 #include "../platform/win32_dirent.h"   /* <dirent.h>, or a Win32 stand-in */
 
 /* Guest-resolving host backtrace (ppu_loader.cpp). Must be declared at file scope:
@@ -96,6 +97,21 @@ static void host_path(char* out, size_t cap, const char* guest)
     if (!hdd0_init) { hdd0_root = getenv("PS3_HDD0_ROOT"); hdd0_init = 1; }
     if (hdd0_root && strncmp(guest, "/dev_hdd0/", 10) == 0) {
         snprintf(out, cap, "%s/%s", hdd0_root, guest + 10);
+        for (char* p = out; *p; p++) if (*p == '\\') *p = '/';
+        return;
+    }
+
+    /* /dev_hdd1 is the PS3's scratch disc: temporary, WRITABLE, wiped between
+     * boots. Sony's FIOS keeps its cache index there, and a title that cannot
+     * create it gets an error back and -- Uncharted does exactly this -- carries
+     * on with the failure code as if it were a pointer.
+     *
+     * It must not fall through to the VFS root, which is the disc image and is
+     * read-only. $PS3_HDD1_ROOT names a host directory for it. */
+    static const char* hdd1_root = nullptr; static int hdd1_init = 0;
+    if (!hdd1_init) { hdd1_root = getenv("PS3_HDD1_ROOT"); hdd1_init = 1; }
+    if (hdd1_root && strncmp(guest, "/dev_hdd1/", 10) == 0) {
+        snprintf(out, cap, "%s/%s", hdd1_root, guest + 10);
         for (char* p = out; *p; p++) if (*p == '\\') *p = '/';
         return;
     }
@@ -197,6 +213,29 @@ static void cellFsOpen(ppu_context* ctx)
         }
     }
     int hfd = open(hpath, oflags | O_BINARY, 0666);
+    if (hfd < 0 && (oflags & O_CREAT) && errno == ENOENT) {
+        /* Creating a file whose directory does not exist yet. On a PS3 those
+         * directories are already there -- the system owns /dev_hdd1's cache
+         * tree, and a title just opens its file inside it. Here nothing has
+         * created them, so make the parents and retry.
+         *
+         * Only on O_CREAT: a plain read of a missing file must still fail, or a
+         * title probing for optional data would think everything exists.
+         * Uncharted needs this for Sony's FIOS cache index
+         * (/dev_hdd1/cache/<title>/fios/cache.idx): the failure came back as
+         * -1 and the title used it as a pointer. */
+        char dir[1024];
+        snprintf(dir, sizeof dir, "%s", hpath);
+        for (char* q = dir + 1; *q; q++) {
+            if (*q != '/') continue;
+            *q = 0;
+            mkdir(dir, 0777);          /* EEXIST is fine */
+            *q = '/';
+        }
+        hfd = open(hpath, oflags | O_BINARY, 0666);
+        if (hfd >= 0)
+            fprintf(stderr, "[fs] created parent dirs for '%s'\n", gpath);
+    }
     if (hfd < 0) {
         fprintf(stderr, "[fs] open FAIL '%s' -> '%s'\n", gpath, hpath);
         ctx->gpr[3] = (uint64_t)(int64_t)CELL_FS_ENOENT; return;
