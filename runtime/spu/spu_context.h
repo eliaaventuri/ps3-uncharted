@@ -527,6 +527,38 @@ static inline void spu_ls_write128(spu_context* ctx, uint32_t lsa, u128 val)
         p[i*4 + 3] = (uint8_t)w;
     }
 #endif
+    /* SPU_WWS_STATE=1: le sei parole di stato del job manager di WwsJob, solo
+     * quando cambiano. Sono l'unico modo di vedere se la pipeline avanza da
+     * Load a Run a Store: una watch generica su quegli indirizzi stampa anche
+     * ogni LETTURA, e il loop di scheduling le rilegge a ogni giro -- centinaia
+     * di MB di log per sei valori che cambiano una manciata di volte. */
+    if (ctx->image_id == 2 && ctx->policy_mode) {
+        static int s_ws = -1;
+        if (s_ws < 0) { const char* e = getenv("SPU_WWS_STATE"); s_ws = e ? 1 : 0; }
+        if (s_ws) {
+            const char* nm = 0; int idx = -1;
+            switch (lsa) {
+            case 0x12A0: nm = "loadState"; idx = 0; break;
+            case 0x12C0: nm = "nextLoad";  idx = 1; break;
+            case 0x12D0: nm = "loadJob";   idx = 2; break;
+            case 0x12E0: nm = "runJob";    idx = 3; break;
+            case 0x12F0: nm = "storeJob";  idx = 4; break;
+            case 0x1300: nm = "lastStore"; idx = 5; break;
+            default: break;
+            }
+            if (nm) {
+                static uint32_t last[6] = { 0xDEADBEEFu, 0xDEADBEEFu, 0xDEADBEEFu,
+                                            0xDEADBEEFu, 0xDEADBEEFu, 0xDEADBEEFu };
+                uint32_t nv = val._u32[0];
+                if (nv != last[idx]) {
+                    last[idx] = nv;
+                    static int n = 0;
+                    if (n++ < 200)
+                        fprintf(stderr, "[wws-state] %s = 0x%08X\n", nm, nv);
+                }
+            }
+        }
+    }
     spu_ls_watch_hit2(lsa, 1, p, (uint32_t)ctx->pc & SPU_LS_MASK,
                       ctx->gpr[0]._u32[0] & SPU_LS_MASK);
     /* SPU_SMC_WATCH=<img>: self-modification detector. Log any store whose

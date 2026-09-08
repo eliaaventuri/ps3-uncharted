@@ -305,6 +305,49 @@ risultati in memoria principale.** Non era mai successo in nessuna sessione.
 Riproducibile: **tre corse su tre**, identiche -- 14 comandi, un overlay
 residente, zero microstep, cinque stall e due interrupt per corsa.
 
+### SBLOCCATO sul serio: il ciclo Load -> Run -> Store si chiude
+
+La saltuarieta' aveva una causa, ed era la scorciatoia `SPU_TAILRET`. Il suo
+controllo dice: *un trasferimento in sospeso il cui target coincide con `gpr[0]`
+E' un ritorno* -- e interrompe il drain **prima** del punto in cui l'interrupt
+viene preso. Ma il policy module usa r0 anche per i salti CALCOLATI: la finestra
+di interrupt di una sola istruzione
+
+```
+002E1C  ila $r0, 0x2E30
+002E20  ila $r2, 0x2E28
+002E24  bie $r2          ; abilita gli interrupt, salta a 0x2E28
+002E28  ai  $r0, $r0, 0
+002E2C  bid $r0          ; disabilita e salta a r0  <- salto calcolato, non ritorno
+```
+
+e' **l'unico punto in cui l'interrupt di stall-and-notify puo' essere preso**, e
+l'euristica lo scambiava per un ritorno esattamente li'.
+
+Spegnendolo -- il lavoro che faceva lo copre `SPU_RETLINK`, che confronta con
+l'indirizzo di ritorno vero invece di indovinare:
+
+| | `SPU_TAILRET=1` | `SPU_TAILRET=0` + `SPU_RETLINK=1` |
+|---|---|---|
+| comandi di caricamento eseguiti | 14 | **oltre 400** (tetto della sonda) |
+| moduli di job residenti | 1 | **2** (immagini 227 e 212) |
+| interrupt di stall-and-notify | 3 | **16** |
+| ciclo della pipeline | si ferma dopo il primo job | **si chiude e riparte** |
+
+E lo stato del job manager, che prima restava a 1 per sempre, ora percorre tutto
+il giro e lo rifa':
+
+```
+[wws-state] loadState = 0x00900001   <- header del job, stato 1
+[wws-state] loadState = 0x00000002   <- esegui i comandi
+[wws-state] loadState = 0x00000003   <- pronto
+[wws-state] runJob    = 0x00000000   <- gira
+[wws-state] storeJob  = 0x00000000   <- store
+[wws-state] storeJob  = 0xFFFFFFFF   <- fatto, e si ricomincia
+```
+
+Due corse su due identiche.
+
 ### Il codice del job gira
 
 `SPU_JOBEXEC=1` lo conferma: sedici dispatch dentro l'overlay 227, con
