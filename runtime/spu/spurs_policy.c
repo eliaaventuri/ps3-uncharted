@@ -173,6 +173,20 @@ int spu_run_policy_module(spu_lifted_entry_fn entry, int image_id,
      * 4096): contare le righe che stampa e credere di aver contato le esecuzioni
      * e' lo stesso errore che ha prodotto la diagnosi sbagliata della sessione
      * 15. Qui il conto e' vero, e viene stampato per intero ogni 4096 esecuzioni. */
+    /* L'insieme dei `data` distinti, una riga per valore nuovo. Il dump della
+     * job list sotto e' campionato, e da un campione non si sa quali liste il
+     * manager veda davvero: e' la stessa trappola del conteggio per workload. */
+    { static uint64_t s_seen[32]; static int s_seen_n = 0;
+      int known = 0;
+      for (int k = 0; k < s_seen_n; k++) if (s_seen[k] == wkl_data) { known = 1; break; }
+      if (!known && s_seen_n < 32) {
+          s_seen[s_seen_n++] = wkl_data;
+          if (s_trace) {
+              fprintf(stderr, "[spurs-pm] nuova job list: wid=%u data=0x%llX\n",
+                      wid, (unsigned long long)wkl_data);
+              fflush(stderr);
+          }
+      } }
     { static unsigned long s_per_wkl[SPURS_PM_MAX_WKL];
       if (wid < SPURS_PM_MAX_WKL) s_per_wkl[wid]++;
       if (s_trace && (runno & 0xFFF) == 0) {

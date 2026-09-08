@@ -201,6 +201,31 @@ static inline int mfc_do_transfer(spu_context* spu, uint32_t lsa, uint64_t ea,
                               " size=%u covers 0x%08X\n",
                       (uint32_t)spu->pc & SPU_LS_MASK, cmd, lsa, (uint32_t)ea, size,
                       (uint32_t)s_w); } }
+    /* SPU_DMA_DUMP_EA=<hex>: il contenuto di ogni GET che parte da quell'EA.
+     * Il dump generico si ferma a 64 byte, e le strutture che contano qui non
+     * ci stanno: il job manager di WwsJob legge 256 byte dalla sua struttura di
+     * sincronizzazione, ed e' esattamente li' che si vede se la coda ha lavoro
+     * o e' vuota. Senza guardarci dentro, "il manager gira ma non carica
+     * niente" resta una frase. */
+    { static long s_de = -1;
+      if (s_de < 0) { const char* e = getenv("SPU_DMA_DUMP_EA");
+                      s_de = e && *e ? (long)strtoul(e, 0, 16) : 0; }
+      if (s_de && mfc_is_get(cmd) && (uint32_t)ea == (uint32_t)s_de &&
+          vm_base && mfc_ea_range_committed(ea, size)) {
+          static int _n = 0;
+          if (_n++ < 12) {
+              const uint8_t* m = vm_base + (uint32_t)ea;
+              uint32_t n = size > 256 ? 256 : size;
+              char b[1400];
+              int p = snprintf(b, sizeof b, "[dma-dump] img=%d GET ea=0x%08X size=%u:",
+                               spu->image_id, (uint32_t)ea, size);
+              for (uint32_t o = 0; o + 4 <= n && p < (int)sizeof b - 16; o += 4)
+                  p += snprintf(b + p, sizeof(b) - p, "%s%02X%02X%02X%02X",
+                                (o % 16) ? " " : "\n    ", m[o], m[o+1], m[o+2], m[o+3]);
+              snprintf(b + p, sizeof(b) - p, "\n");
+              fputs(b, stderr); fflush(stderr);
+          } } }
+
     /* Malformed transfers are REJECTED, as the hardware MFC does. The rules
      * are the ones the SDK's own dma.h asserts: a non-zero size, at most
      * 16 KB, a multiple of 16 once >= 16 bytes, and LSA/EA sharing 16-byte
