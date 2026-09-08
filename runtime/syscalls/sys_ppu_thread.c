@@ -327,7 +327,7 @@ int64_t sys_ppu_thread_create(ppu_context* ctx)
      *
      * The title never learns the real size: it gets its stack top where it
      * expects, and only the floor moves down. $PS3_STACK_SCALE overrides. */
-    uint32_t stack_scale = 4;
+    uint32_t stack_scale = 8;
     { const char* e = getenv("PS3_STACK_SCALE");
       if (e && *e) { unsigned long v = strtoul(e, 0, 0); if (v >= 1 && v <= 64) stack_scale = (uint32_t)v; } }
     uint32_t stack_addr = vm_stack_allocate(&g_vm_stack_alloc, stack_size * stack_scale);
