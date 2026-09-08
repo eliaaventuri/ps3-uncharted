@@ -1471,6 +1471,16 @@ void spu_indirect_branch(spu_context* ctx)
         if (codeBase + 16 <= SPU_LS_SIZE) {
             extern int spu_overlay_match_sig(const uint8_t hdr[16]);
             int img = spu_overlay_match_sig(&ctx->ls[codeBase]);
+            /* LS[0x1320] e' dove il job manager di LBP tiene la base del buffer
+             * di codice: e' una cosa di quella build, non del formato. I moduli
+             * di Uncharted dichiarano la propria base nell'header (campo a
+             * +0x28) e vale 0x4000 in tutti e 28, che e' anche la base a cui
+             * sono stati liftati. Se il primo tentativo non riconosce nulla,
+             * si guarda li'. */
+            if (!img && 0x4000 + 16 <= SPU_LS_SIZE) {
+                img = spu_overlay_match_sig(&ctx->ls[0x4000]);
+                if (img) codeBase = 0x4000;
+            }
             if (img) {
                 if (ctx->resident_ovl != img) {
                     ctx->resident_ovl = img;
