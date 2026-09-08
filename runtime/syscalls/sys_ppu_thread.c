@@ -315,8 +315,22 @@ int64_t sys_ppu_thread_create(ppu_context* ctx)
     ppu_thread_info* t = &g_ppu_threads[slot];
     memset(t, 0, sizeof(*t));
 
-    /* Allocate guest stack */
-    uint32_t stack_addr = vm_stack_allocate(&g_vm_stack_alloc, stack_size);
+    /* Allocate guest stack.
+     *
+     * Deliberately larger than the title asked for. Lifted code spends more
+     * guest stack than the PowerPC it came from: every function keeps its frame
+     * for the whole call, and the runtime's own helpers push frames the original
+     * never had. Uncharted's file-loading thread asks for 64 KB, which is
+     * comfortable on hardware, and here ran off the bottom -- sp landed 96 bytes
+     * above the end of its stack and the ABI red zone below sp fell into the
+     * next stack's guard page (SIGBUS at guest 0xD00A3FE0).
+     *
+     * The title never learns the real size: it gets its stack top where it
+     * expects, and only the floor moves down. $PS3_STACK_SCALE overrides. */
+    uint32_t stack_scale = 4;
+    { const char* e = getenv("PS3_STACK_SCALE");
+      if (e && *e) { unsigned long v = strtoul(e, 0, 0); if (v >= 1 && v <= 64) stack_scale = (uint32_t)v; } }
+    uint32_t stack_addr = vm_stack_allocate(&g_vm_stack_alloc, stack_size * stack_scale);
     if (stack_addr == 0) {
         table_unlock();
         return (int64_t)(int32_t)CELL_ENOMEM;
@@ -326,7 +340,7 @@ int64_t sys_ppu_thread_create(ppu_context* ctx)
     ppu_context_init(&t->ctx);
     t->ctx.cia = entry;
     t->ctx.gpr[3] = arg;
-    ppu_set_stack(&t->ctx, (uint64_t)stack_addr, (uint64_t)stack_size);
+    ppu_set_stack(&t->ctx, (uint64_t)stack_addr, (uint64_t)stack_size * stack_scale);
     /* Copy TOC from creating thread */
     t->ctx.gpr[2] = ctx->gpr[2];
 
