@@ -348,10 +348,58 @@ E' `func_00566108`, chiamata da `0x0053261C` -- codice di fisica, accanto a
 parola condivisa a `0x20000000`, e quel bit non arriva mai. Poco sotto c'e' la
 stessa attesa su `[r11+0xC]`, per una lista di job.
 
-Da qui: capire se il modulo SPU della fisica viene davvero eseguito -- i
-workload SPURS vengono distribuiti (`POKE wid=4 ready=5`, `wid=6 ready=8`), ma
-il task del taskset resta fermo in WAIT_SIGNAL, e la fisica passa da un'altra
-strada.
+### I 28 moduli SPU dei job erano dentro l'EBOOT
+
+La risposta alla domanda "il modulo SPU della fisica viene eseguito?" era: non
+esiste nel port. `extract_spu_images.py` cerca ELF SPU annidati; i moduli del
+job manager WwsJob non sono ELF. Sono immagini grezze con un header di 0x30 byte
+che finisce col magic `0xC0DEC0DE`, e nell'EBOOT ce ne sono **28** -- circa
+460 KB di codice SPU del titolo, fisica e render e animazione, che il port non
+aveva mai visto.
+
+Il layout e' stato risolto sul binario, non preso da una specifica. Nel primo
+modulo la tripla PIC
+
+```
+ila  $r2, 0x41C0
+brsl $r126, <istruzione seguente>
+sf   $r126, $r2, $r126
+```
+
+fissa l'indirizzo di link dell'istruzione dopo il `brsl`. Delle tre ipotesi su
+dove cominci l'immagine, una sola da' un numero tondo -- 0x4000, che e'
+esattamente il campo a +0x28 dell'header -- ed e' che l'immagine parta da
+`module_start`, header incluso. Con quella l'entry cade su un prologo pulito
+(`stqd $r80..$r126`, `rdch $r82, SPU_RdDec`). Tutti e 28 escono coerenti.
+
+Il layout coincide con quello che `lift_jobmods.py` gia' assumeva per LBP: e'
+una conferma indipendente, non una coincidenza. Quel tool sapeva gia' fare
+questo lavoro ma aveva le cartelle di LBP cablate; ora e' parametrico.
+
+**28 moduli, ~11.000 funzioni SPU liftate**, registrate per firma di 16 byte
+sotto gli image id 200..227.
+
+### E l'ingresso che mancava al policy module
+
+Con i moduli registrati il job manager cadeva in `BRANCH-TO-0` a LS `0xA2C`,
+dodici volte per esecuzione. `0xA2C` sta dentro `func_00000A00`: e' la
+`brasl $r79, 0x3FEC0` che chiama lo stub di salvataggio registri che il modulo
+si genera da solo in cima alla local store. `--auto-functions` non puo' vederlo
+-- ci si arriva solo con un salto calcolato. `--extra-funcs 0xA2C` e sparisce.
+
+I passi del lift SPU vivono ora in `uncharted-data/relift_spu.sh`: i file che
+producono non stanno in nessun repo, e senza lo script si perdono i parametri.
+
+### Dove siamo fermi
+
+Il job manager gira pulito, ma **nessun modulo di job diventa mai residente**:
+non compare una sola riga `[spu-ovl]`. Il kernel dispaccia i workload a ogni
+passo, il PPU scrive `ready=8` su wid=6, e il modulo esce senza aver caricato
+niente. Il PPU resta sull'attesa della fisica a `0x20000000`.
+
+Il prossimo filo e' l'argomento per-workload che il kernel passa al modulo
+(`SPURS_WKL_INFO1 + wid*sz + 8`): e' l'EA della job list, ed e' da li' che il
+job manager dovrebbe pescare il primo modulo da caricare.
 
 ## Sessione 16 — CORREZIONE: non manca nessun segnale
 
