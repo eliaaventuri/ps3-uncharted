@@ -765,6 +765,24 @@ uint32_t vm_read32(uint64_t a) { if (vm_oob((uint32_t)a,4)) return 0;
           fprintf(stderr,"[HOTMAP] hottest read32: 0x%08X (%ux)  2nd: 0x%08X (%ux)\n",
                   addr[bi],cnt[bi],addr[b2],cnt[b2]);
           for(uint32_t i=0;i<NB;i++) cnt[i]=0; } } }
+    /* A guest that spins on memory must still receive its callbacks.
+     *
+     * cellGcmSys delivers the game's vblank/flip handlers from ppu_gcm_pump,
+     * which ps3_hle_call invokes at HLE boundaries -- fine while the guest keeps
+     * calling firmware, and a deadlock the moment it stops. Uncharted's
+     * SwapBuffers waits for its own vblank handler to advance a global, and that
+     * wait is a pure read loop: no HLE call, so no pump, so the handler never
+     * runs and the poll never ends. Pump here too, once a read has repeated
+     * enough to be a spin rather than a hot field. ppu_gcm_pump is re-entrancy
+     * guarded and cheap when nothing is pending. */
+    { static PPU_THREAD_LOCAL uint32_t plast=0xFFFFFFFFu; static PPU_THREAD_LOCAL uint32_t pn=0;
+      if ((uint32_t)a==plast) {
+          if (++pn >= 4096) { pn = 0;
+              extern void ppu_gcm_pump(void) __attribute__((weak));
+              if (ppu_gcm_pump) ppu_gcm_pump();
+          }
+      } else { plast=(uint32_t)a; pn=0; } }
+
     /* Hot-poll detector: a thread spinning on the same address (e.g. a GCM FIFO
      * get-pointer / label waiting on RSX) reads it thousands of times in a row. */
     { static PPU_THREAD_LOCAL uint32_t last=0xFFFFFFFFu; static PPU_THREAD_LOCAL uint32_t n=0;
