@@ -139,6 +139,29 @@ void spu_stop(spu_context* ctx)
     if (s_halt) spu_halt(ctx);
 }
 
+/* `stopd` in questo codice non e' un'uscita: e' un'assert. Il job manager di
+ * WwsJob ha una banca di `stopd` uno per controllo (nel policy module di
+ * Uncharted sta a LS 0x15F0-0x1668), e ognuno significa "il codice ha trovato
+ * uno stato che non doveva esistere". spu_stop() da solo non stampa niente e
+ * ritorna: un'assert scattata era quindi indistinguibile da un giro di lavoro
+ * andato bene, e il modulo veniva semplicemente rieseguito al tick dopo. Qui
+ * l'indirizzo arriva dal lifter, cosi' si legge QUALE controllo e' fallito.
+ * Deduplicato per (immagine, indirizzo) perche' scatta a ogni esecuzione. */
+void spu_stop_at(spu_context* ctx, uint32_t addr)
+{
+    static uint32_t seen[32]; static int n = 0;
+    uint32_t key = ((uint32_t)ctx->image_id << 24) | (addr & 0x3FFFF);
+    int known = 0;
+    for (int i = 0; i < n; i++) if (seen[i] == key) { known = 1; break; }
+    if (!known) {
+        if (n < 32) seen[n++] = key;
+        fprintf(stderr, "[spu-assert] img=%d stopd @0x%05X -- il modulo si ferma "
+                "qui e riparte al tick dopo\n", ctx->image_id, addr);
+        fflush(stderr);
+    }
+    spu_stop(ctx);
+}
+
 /* Run a lifted SPU entry with a halt landing pad. Returns 1 if the job halted
  * (via spu_halt), 0 if it returned normally. */
 int spu_run_with_halt(void (*entry)(spu_context*), spu_context* ctx)

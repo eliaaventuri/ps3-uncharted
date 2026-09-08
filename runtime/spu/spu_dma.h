@@ -704,12 +704,16 @@ static inline int mfc_run_list(spu_context* spu, uint32_t elem_lsa,
               unsigned d = spu_sn_defer_ticks();
               if (d) { g_sn_defer_ctx = (void*)spu; g_sn_defer = d; } }
             spu_ch_wake(spu);
+            extern volatile unsigned g_sn_defer;
             { static int _n = 0; if (_n++ < 16)
                 fprintf(stderr, "[mfc-list] STALL img=%d tag=%u elem@0x%05X "
                         "left=%u dest=0x%05X (SN raised, parked mask=0x%X) "
+                        "ie=%d evmask=0x%X evstat=0x%X defer=%u "
                         "loadJobState@12A0=%02X%02X%02X%02X %02X%02X%02X%02X\n",
                         spu->image_id, t, el, num_left - i - 1, dest_lsa,
                         spu->list_stall_mask,
+                        spu->int_enable, spu->event_mask, spu->event_status,
+                        g_sn_defer,
                         spu->ls[0x12A0], spu->ls[0x12A1],
                         spu->ls[0x12A2], spu->ls[0x12A3],
                         spu->ls[0x12A4], spu->ls[0x12A5],

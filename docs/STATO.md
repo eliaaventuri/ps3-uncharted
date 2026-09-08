@@ -1,6 +1,6 @@
 # Stato del progetto
 
-Ultimo aggiornamento: **8 settembre 2026** — sessione 17.
+Ultimo aggiornamento: **8 settembre 2026** — sessione 18.
 
 ## Dove siamo
 
@@ -117,6 +117,93 @@ il log è pulito —
 
 Le mappature che prima rispondevano `FFFFFFFF` ora riescono, il video è
 configurato a 1280x720 (pitch 5120 = 1280x4) e il backend RSX è su.
+
+## Sessione 18 — il job manager carica davvero, e la correzione della 17
+
+### Prima la correzione
+
+Alla fine della sessione 17 avevo scritto che il job manager legge una job list
+popolata **ma non stagia mai niente** — «nessun DMA arriva mai a LS 0x4000».
+**Era falso, ed era falso per il modo in cui l'avevo misurato**: `SPU_DMATRACE`
+si ferma a 160 righe, e il policy module fa centinaia di trasferimenti di
+servizio a SPURS prima del primo che riguarda un job. Guardavo solo il rumore.
+
+Con un filtro per *indirizzo* invece che per immagine (`SPU_DMA_EAWIN`) il
+quadro cambia del tutto:
+
+```
+[dma-eawin] img=2 pc=0x03300 GET lsa=0x00C00 ea=0x108E0900 size=0x90
+[dma-eawin] img=2 pc=0x03300 GET lsa=0x00C00 ea=0x108F0580 size=0x90
+... otto, uno per job header ...
+```
+
+Il manager **prende davvero i comandi di caricamento** di tutti e otto i job,
+e per ognuno completa il ciclo stall/riprendi e riserva i suoi buffer set:
+
+```
+[mfc-list] STALL  img=2 tag=0 elem@0x014F0 left=1 (SN raised, parked mask=0x1)
+[spu-int]  TAKEN  img=2 events=0x2&0x2 vector->0x00A2C (srr0=0x02E28)
+[mfc-list] RESUME img=2 tag=0 elem@0x014F8 left=1
+[wws-res]  bufferSetArray read jobNum=0 logBufSet=0 ... 15
+```
+
+Otto volte, jobNum 0..7. La pipeline PPU→SPURS→WwsJob funziona molto piu'
+avanti di quanto la 17 dicesse.
+
+### Dov'e' il blocco vero
+
+Al **nono** job la sequenza si rompe: lo STALL c'e', **l'interrupt no**, e
+quindi nemmeno il RESUME.
+
+```
+[mfc-list] STALL img=2 ... loadJobState@12A0=00600001 2B153C80   <- nessun TAKEN
+[mfc-list] STALL img=2 ... loadJobState@12A0=00900001 108E0900   <- nessun TAKEN
+```
+
+Da li' in poi il manager resta fermo nella sua attesa. Il contatore di stato lo
+conferma, e stavolta e' un contatore vero e non un campione:
+
+```
+297 wid=7 halt_pc=0x02D68 loadState=1->1 loadJob=0x0 runJob=0xFFFFFFFF
+ 93 wid=4 halt_pc=0x02D68 loadState=1->1 loadJob=0x0 runJob=0xFFFFFFFF
+```
+
+`loadState` resta 1 (kReadCommands) per sempre, `runJob` non viene mai
+assegnato: **nessun job arriva mai a girare.**
+
+### Come e' fatto il pezzo di codice che aspetta
+
+Vale la pena scriverlo, perche' ci si torna. Nel policy module (LS 0xA00-0x3980):
+
+- **0x2D50-0x2D84** e' il loop di scheduling. Legge `loadState` da LS 0x12A0 e
+  smista: 0 = niente da fare, 2 = interpreta i comandi (salta a 0x2EF8),
+  3 = altro. Con `loadState == 1` cade a 0x2E20, che apre una **finestra di
+  interrupt di una sola istruzione** (`ila $r2,0x2E28 / bie $r2 / ai $r0,$r0,0 /
+  bid $r0`) e torna a 0x2D58. E' li' che gira.
+- **0x3250-0x3324** prende i comandi di caricamento: `lqa $r2, 0x1420` e' il job
+  header a 64 bit (halfword alta della prima parola = dimensione, seconda parola
+  = EA), controlla `16 <= size <= 256` e fa il GET a **LS 0xC00**.
+- **0x1BB0-0x1C1C** e' l'interprete dei comandi: legge quadword da LS 0xC00,
+  avanza di 8 byte, e smista con `((cmd >> 9) & 7) * 4` sulla **tabella a LS
+  0x1590** (8 voci: 0x2418, 0x1C20, **0x1D20** = il caricatore, 0x22B0, 0x2368,
+  **0x23BC** = RunJob, 0x2418, 0x1604). Il salto vero e' il `bi $r6` a 0x2FB4.
+- **0x2468-0x2528** e' la routine di interrupt (vettore a 0xA2C). Legge ch25
+  (`MFC_RdListStallStat`), fa l'ack di ogni bit, e **solo se** `loadState == 1`
+  **e** il bit 0 e' nella maschera scrive `loadState = 2` a LS 0x12A0.
+- **0x15F0-0x1668** e' una **banca di `stopd`**, uno per assert. Il gestore di
+  job di WwsJob e' pieno di controlli e ognuno finisce qui.
+
+### Due cose che non si vedevano, e ora si vedono
+
+1. **`stopd` era muto.** `spu_stop()` non stampa niente e ritorna: un'assert
+   scattata era indistinguibile da un giro andato bene, e il modulo veniva
+   semplicemente rieseguito al tick dopo. Ora il lifter passa l'indirizzo
+   (`spu_stop_at`) e il runtime stampa `[spu-assert] img=2 stopd @0x015F8`, una
+   volta per indirizzo. Quale controllo e' fallito e' meta' della diagnosi.
+2. **Le diagnostiche DMA erano cieche per costruzione.** `SPU_DMA_EAWIN=lo:hi`
+   filtra per indirizzo di memoria principale invece che per immagine, e
+   `SPU_DMATRACE_MAX` alza il tetto di 160 righe che mi aveva fatto sbagliare
+   la conclusione della 17.
 
 ## Sessione 17 — il segnale mancava sul serio, ma non dove lo cercavo
 

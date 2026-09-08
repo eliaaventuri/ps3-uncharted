@@ -112,6 +112,10 @@ void spu_indirect_branch_mt(spu_context* ctx);
  * host SPU thread back to spu_run_with_halt so the job does not spin past the
  * stop. Complements ctx->status; harmless where the runtime handles status. */
 void spu_stop(spu_context* ctx);
+/* Come spu_stop, ma con l'indirizzo dell'istruzione: `stopd` in questo codice
+ * e' l'idioma di assert (una banca di stopd, uno per controllo), e senza
+ * l'indirizzo un'assert scattata e' indistinguibile da un giro andato bene. */
+void spu_stop_at(spu_context* ctx, uint32_t addr);
 /* Lower-level longjmp helper: abort the host SPU thread back to spu_run_with_halt
  * (used for the infinite no-op self-loop / idle halt idiom). */
 void spu_halt(spu_context* ctx);
@@ -644,8 +648,12 @@ class SPULifter:
                     f"ctx->status = SPU_STATUS_STOPPED_BY_HALT; "
                     f"spu_halt(ctx); return; }}")
         if mn == "stopd":
-            return ("ctx->stop_code = 0u; "
-                    "ctx->status = SPU_STATUS_STOPPED_BY_STOP; spu_stop(ctx); return;")
+            # `stopd` is the assert idiom, not an exit: WwsJob's job manager has
+            # a BANK of them (one per check). spu_stop() prints nothing and just
+            # returns, so a tripped assert looked exactly like a good pass and
+            # the module was simply re-run next tick. Hand the address over.
+            return ("ctx->stop_code = 0u; ctx->status = SPU_STATUS_STOPPED_BY_STOP; "
+                    f"spu_stop_at(ctx, 0x{addr:X}u); return;")
 
         # ---- integer arithmetic (register) ----
         rr_bin = {
