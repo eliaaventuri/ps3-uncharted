@@ -305,6 +305,79 @@ risultati in memoria principale.** Non era mai successo in nessuna sessione.
 Riproducibile: **tre corse su tre**, identiche -- 14 comandi, un overlay
 residente, zero microstep, cinque stall e due interrupt per corsa.
 
+## Sessione 18c — il PPU non aspetta piu' la SPU: ora aspetta la RSX
+
+Tre correzioni in fila, e il fronte si e' spostato.
+
+### 1. `SPU_TAILRET` va spento
+
+La sua euristica -- *un trasferimento il cui target coincide con `gpr[0]` E' un
+ritorno* -- interrompe il drain, e il policy module usa r0 anche per i salti
+**calcolati**: la finestra di interrupt
+
+```
+002E1C  ila $r0, 0x2E30
+002E20  ila $r2, 0x2E28
+002E24  bie $r2          ; abilita gli interrupt, salta a 0x2E28
+002E28  ai  $r0, $r0, 0
+002E2C  bid $r0          ; disabilita e salta a r0  <- salto calcolato
+```
+
+e' insieme il punto in cui lo stall-and-notify entra **e** l'arco di ritorno del
+ciclo di polling. L'euristica lo scambiava per un ritorno e abbandonava il ciclo.
+
+Provato anche a prendere l'interrupt **prima** delle scorciatoie (piu' fedele:
+sull'hardware un interrupt abilitato entra fra due istruzioni qualunque,
+ritorno compreso). Non basta -- 14 comandi in due corse su due -- perche' il
+danno non e' solo sull'interrupt. Il riordino resta comunque, perche' e' giusto.
+
+### 2. `SPU_RdMachStat` non e' "la SPU sta girando"
+
+Per il CBEA il bit 0 di quel canale e' lo **stato di abilitazione degli
+interrupt**. Restituivamo `status == RUNNING`. Il gioco ci fa affidamento in
+entrambi i versi:
+
+* la routine di interrupt del policy module (0x246C) asserisce che sia **0**
+  -- passava per caso;
+* i moduli di job asseriscono che sia **1** prima di armare una finestra DMA
+  (`jobmod_008cc900` a 0x6110 e 0x6024) -- falliva.
+
+E falliva in cascata: dopo il primo `stop` lo stato non torna piu' RUNNING, e
+ogni lettura successiva dava 0. Con la correzione (`ctx->int_enable`) le assert
+dei moduli di job spariscono, e sparisce anche la crescita dello stack host che
+quella cascata provocava (`[spu-depth] host_depth=2000`: da 1 a **0** per corsa).
+
+### 3. Il risultato
+
+| | prima della sessione | ora |
+|---|---|---|
+| comandi di caricamento eseguiti | 8, tutti indice 1 | **400** (tetto della sonda) |
+| moduli di job residenti | 0 | **3** |
+| assert scattate | 1-2 per corsa | **0** |
+| stack host esaurito | 1 per corsa | **0** |
+| interrupt di stall-and-notify | 0-3 | **16** |
+| `[HOTREAD] spinning on 0x20000000` | ~90.000 righe per corsa | **0** |
+
+E soprattutto la SPU ora **scrive il flag che il PPU aspettava**:
+
+```
+[dma-eawin] img=2 pc=0x06120 PUT lsa=0x10400 ea=0x20000000 size=0x10
+```
+
+Il ciclo PPU -> SPURS -> WwsJob -> job -> flag -> PPU e' chiuso.
+
+### Il fronte nuovo: la RSX
+
+Il gioco ora si ferma piu' avanti, e lo dice con parole sue:
+
+```
+Rendering is stuck on reference value 76. Starting infinite heartbeat loop.
+```
+
+Aspetta che la RSX raggiunga il valore di riferimento 76
+(`cellGcmSetReferenceCommand` / NV406E_SET_REFERENCE). Da qui si lavora sul
+backend RSX, non piu' sulla SPU.
+
 ### SBLOCCATO sul serio: il ciclo Load -> Run -> Store si chiude
 
 La saltuarieta' aveva una causa, ed era la scorciatoia `SPU_TAILRET`. Il suo
