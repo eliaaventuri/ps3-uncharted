@@ -391,14 +391,49 @@ successivo.
   quelle corse erano su codice che non esisteva. Ora la build passa da uno
   script che fallisce rumorosamente.
 
+### Il deadlock, visto per intero
+
+La scansione dell'anello al momento dello stallo lo mostra senza ambiguita':
+
+```
+[ringscan] put=00011008 fence nell'anello: 79@11000 75@12000 76@13000
+Rendering is stuck on reference value 79
+```
+
+Il fence 79 e' scritto a `0x11000`, cioe' a `put - 8`. Il walker pero' non ci
+arriva: e' fermo dentro il segmento a `0x660930`, dove il PPU ha smesso di
+scrivere a meta' (le sue scritture si vedono una per una con `YDKJ_WWATCH`, e
+finiscono di colpo). Il gioco non riprende a scrivere perche' aspetta la RSX.
+Cane che si morde la coda.
+
+Provate e scartate, in ordine:
+
+* **spazzolare l'anello in cerca di SET_REFERENCE.** Raccoglie fence stantii e
+  spazzatura -- un "fence" 524724 pubblicato fra il 74 e il 78 -- e pubblica
+  fuori ordine, con `ref` che oscilla 75, 74, 75, 74. Faceva passare il gioco
+  circa una volta su quattro, ma **per caso**: pescando il fence atteso in mezzo
+  al resto. Sostituita da un riavvolgimento all'ultima posizione dell'anello,
+  che lascia drenare i fence al walker in ordine. Il titolo arriva cosi' a
+  fence 71-74 invece di 75-93 e non si sblocca mai: preferisco un blocco onesto
+  a una fortuna che nasconde il difetto vero.
+* **`GCM_SEMA_ACQUIRE=1`** (l'ACQUIRE del semaforo che blocca come l'hardware):
+  peggiora, i fence si fermano a 15.
+* **alzare `SPU_HOST_DEPTH_MAX` a 60.000**: nessun effetto, e una corsa bloccata
+  ha `depth=0`. La correlazione fra profondita' dello stack e blocco era una
+  coincidenza.
+
 ### La domanda aperta
 
-**Chi scrive il `JUMP` di coda del segmento, e perche' manca?** Il segmento
-(io 0x660000 / 0x860000, ea 0x21660000 / 0x21860000) e' scritto dal **PPU** --
-zero DMA della SPU in quella finestra, misurato. Il walker ci arriva mentre e'
-ancora a meta' e si ferma sugli zeri. Il prossimo passo e' guardare le scritture
-del guest su quell'indirizzo (`YDKJ_WWATCH`), non aggiungere altre euristiche al
-walker: le ultime tre le ho aggiunte e nessuna ha sbloccato il titolo.
+**Perche' il PPU smette di scrivere il segmento a meta'?** Le sue scritture si
+vedono (`YDKJ_WWATCH=0x21660900`): un ciclo stretto che emette 16 byte per
+giro, dagli stessi quattro indirizzi di ritorno host `0x104724f04 / f14 / f20 /
+f30`, e poi si ferma. Risolvere quei quattro indirizzi alla funzione guest che
+li contiene dice chi emette il buffer e su cosa si mette ad aspettare -- ed e'
+li' che va guardato, non nel walker: di euristiche nel walker ne ho aggiunte
+quattro e nessuna ha sbloccato il titolo.
+
+Le stringhe vicine nel binario dicono cosa aspetta il gioco: `Wait On Rsx`,
+`Wait On Mesh Processing`, `Wait On VSync`, `Out of Command memory`.
 
 ## Sessione 18c — il PPU non aspetta piu' la SPU: ora aspetta la RSX
 
