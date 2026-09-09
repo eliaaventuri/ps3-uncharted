@@ -305,6 +305,95 @@ risultati in memoria principale.** Non era mai successo in nessuna sessione.
 Riproducibile: **tre corse su tre**, identiche -- 14 comandi, un overlay
 residente, zero microstep, cinque stall e due interrupt per corsa.
 
+## Sessione 19 — il segmento tagliato sotto i piedi
+
+Il blocco `Rendering is stuck on reference value N` è risolto: **4 corse su 5
+non si bloccano più**, e i fence drenati per corsa passano da ~75 a ~2900.
+
+### Come è fatta la FIFO di Uncharted
+
+Non è l'anello di libgcm. Il titolo tiene:
+
+- un **anello di 4 slot da 4 KB** a io `0x10000`–`0x14000`. Ogni slot è
+  `[SET_REFERENCE][valore del fence][JUMP -> segmento]`, e `put` viene sempre
+  posato **subito dopo il valore**, cioè a `slot+8`.
+- due **segmenti di comandi da 2 MB** a io `0x660000` e `0x860000`, usati a
+  turno. Il segmento raggiunto dallo slot *k* finisce con un JUMP verso lo slot
+  *k+1*.
+
+Quindi ogni movimento di `put` fa consumare alla RSX un segmento e un fence. Il
+contesto gcm del titolo sta a EA `0x1068B1A4` (begin/end/current/callback a
++0/+4/+8/+0xC) e il callback a +0xC **non è un recycle**: è una `printf` di
+errore. Il recycle non esiste; il titolo non ne ha bisogno.
+
+### Il difetto
+
+Con una traccia unica che mette in ordine `put`, i fence negli slot, i JUMP di
+coda e gli intervalli di scrittura dell'emettitore (`GCM_SEQ=1`), la sequenza
+di un frame normale è:
+
+```
+LEGGE ctrl+8 (=75)
+EMIT   [21660000 .. 216608D4]  (2264 byte)
+SLOT   [21012008] = 20660000        slot2 -> segmento A
+JUMP   [216608D8] = 20013000        coda del segmento -> slot3
+SLOT   [21013004] = fence
+PUT    = 00013008
+```
+
+e quella del frame che blocca è:
+
+```
+EMIT   [21660000 .. 21660054]  (88 byte)
+JUMP   [21660058] = 20013000        coda a 0x58
+SLOT   [21013004] = fence
+EMIT   [21660058 .. 216604C4]  (1136 byte)   <- SOPRA il JUMP di coda
+PUT    = 00013008
+```
+
+Il titolo chiude il segmento con un JUMP **provvisorio**, scrive il fence, e
+poi ci accoda sopra altri comandi partendo esattamente da quel JUMP — che
+sparisce — e solo dopo muove `put`. Quando la passata entra nel segmento (cosa
+che può fare solo quando `put` si è mosso, come la RSX vera) l'uscita non c'è
+più: si cammina fino alla testa di scrittura e si resta lì. Il titolo aspetta
+il fence che ha appena accodato e non lo vede mai.
+
+### La correzione
+
+Tre pezzi, tutti attivi per default in `run.sh`:
+
+1. **`GCM_DRAIN_ON_PUT`** — il drain avviene sulla scrittura di `put`, che è
+   quando la RSX vera comincia a consumare. Misurato: `get` raggiunge `put` a
+   ogni frame e `ref` avanza 1:1.
+2. **`GCM_DRAIN_ONLY_PUT`** — niente drain a orologio. Un drain a 4 ms può
+   entrare in un segmento che il titolo sta ancora riempiendo.
+3. **`GCM_STRAND_FIX`** — quando la passata si arena su un segmento senza
+   uscita, il fence atteso sta **sempre due parole prima di `put`**: se lì c'è
+   davvero un'intestazione `SET_REFERENCE`, il JUMP mancante puntava a quello e
+   si riprende da lì. Stessa regola nella risincronizzazione, che ora
+   **continua** la passata invece di uscirne — uscendo, quel fence si sarebbe
+   letto solo al prossimo movimento di `put`, che non arriva mai perché il
+   titolo sta aspettando proprio quello.
+
+Si perdono i comandi del segmento oltre il punto in cui ci si è arenati. Sono
+già irraggiungibili, ed è esattamente ciò che la RSX vera avrebbe consumato
+prima che il titolo li sovrascrivesse.
+
+### Strumenti nuovi
+
+- **`YDKJ_VWATCH=<lo>:<hi>`** — guarda il **valore**, non l'indirizzo. Il
+  contesto gcm del titolo non si trova per indirizzo: si trova perché qualcuno
+  gli scrive dentro un puntatore al proprio command buffer.
+- **`YDKJ_WWATCH_LEN`** — la finestra della watch non è più fissa a 0x40.
+- **`GCM_SEQ=1`** — `put`, fence, JUMP di coda, intervalli dell'emettitore e
+  letture di `ctrl+8`, in un unico flusso, con il thread che scrive.
+
+### Cosa resta
+
+Una corsa su cinque si ferma ancora, ma **non per la FIFO**: il log dice
+`[spu_workload] task 0 (taskset 0x2A86F380) sleeping Ns in WAIT_SIGNAL`. È un
+task SPU che non riceve il segnale, a valle di `cellSpurs SendSignal`.
+
 ## Sessione 18d — e ora non aspetta piu' nemmeno la RSX
 
 Il gioco si fermava su `Rendering is stuck on reference value 76`. Tre difetti
