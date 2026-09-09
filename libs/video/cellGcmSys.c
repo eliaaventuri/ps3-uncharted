@@ -1080,8 +1080,18 @@ static void gcm_fifo_resync_why(const char* why, u32* getoff, u32 put)
      * DENTRO l'anello. I fence li drena cosi' il walker stesso, uno per uno e
      * nell'ordine giusto, esattamente come farebbe l'hardware. Se non c'e'
      * anello arretrato da recuperare, si va a `put` come prima. */
-    if (s_last_ring_off && s_last_ring_off < put) *getoff = s_last_ring_off;
-    else                                          *getoff = put;
+    /* Prima di tutto: se a `put`-8 c'e' un SET_REFERENCE, quello e' il fence che
+     * il titolo sta aspettando in questo istante, e riprendere da li' lo
+     * pubblica nell'ordine giusto. E' lo stesso ragionamento del recupero da
+     * segmento senza uscita: l'anello e' [SET_REFERENCE][valore][JUMP], e `put`
+     * viene posato subito dopo il valore. Riavvolgere piu' indietro (a
+     * s_last_ring_off) attraversa il riempimento a zero fra due slot e la
+     * passata si ferma li' senza pubblicare niente. */
+    { u32 fe = put >= 8 ? gcm_io2ea(put - 8) : 0;
+      u32 fw = fe ? vm_read32(fe) : 0;
+      if (fe && (fw >> 29) == 0 && (fw & 0x1FFCu) == 0x0050u)      *getoff = put - 8;
+      else if (s_last_ring_off && s_last_ring_off < put)           *getoff = s_last_ring_off;
+      else                                                         *getoff = put; }
 
     if (n <= 8)
         fprintf(stderr, "0x%08X (put=0x%08X)\n", *getoff, put);
@@ -1445,15 +1455,19 @@ static void gcm_rsx_process_fifo_unlocked(void)
                       u32 fe = gcm_io2ea(put - 8);
                       u32 fw = fe ? vm_read32(fe) : 0;
                       if (fe && (fw >> 29) == 0 && (fw & 0x1FFCu) == 0x0050u) {
-                          static u32 last_put = 0xFFFFFFFFu;
-                          if (put != last_put) {
-                              last_put = put;
-                              fprintf(stderr, "[cellGcmSys] segmento senza uscita a 0x%08X: "
-                                      "riprendo dal SET_REFERENCE a 0x%08X (put=0x%08X)\n",
-                                      s_fifo_getoff, put - 8, put);
-                              s_fifo_getoff = put - 8;
-                              continue;
-                          }
+                          /* Niente guardia "una volta per `put`": il recupero
+                           * termina sempre da solo -- riprende dall'intestazione,
+                           * ne consuma le due parole e arriva a `put`, dove il
+                           * ciclo esce. Con la guardia, un secondo arenamento
+                           * sullo stesso `put` (per esempio dopo un JUMP a un
+                           * offset non mappato) restava senza uscita. */
+                          { static unsigned nlog = 0;
+                            if (nlog++ < 20)
+                                fprintf(stderr, "[cellGcmSys] segmento senza uscita a 0x%08X: "
+                                        "riprendo dal SET_REFERENCE a 0x%08X (put=0x%08X)\n",
+                                        s_fifo_getoff, put - 8, put); }
+                          s_fifo_getoff = put - 8;
+                          continue;
                       }
                   } }
                 static int _n = 0; static u32 _last = 0xFFFFFFFFu;
@@ -1578,7 +1592,14 @@ static void gcm_rsx_process_fifo_unlocked(void)
                                       (io == put) ? "  <- put" : "");
                           } } }
                   } } }
-              if (!gcm_io2ea(tgt)) { gcm_fifo_bad_branch("JUMP", tgt, w); gcm_fifo_dump_around(s_fifo_getoff); gcm_fifo_resync_why("unmapped-JUMP", &s_fifo_getoff, put); break; }
+              if (!gcm_io2ea(tgt)) { gcm_fifo_bad_branch("JUMP", tgt, w); gcm_fifo_dump_around(s_fifo_getoff); gcm_fifo_resync_why("unmapped-JUMP", &s_fifo_getoff, put);
+                    /* `continue`, non `break`: la risincronizzazione ci ha
+                     * rimessi DENTRO l'anello, e il fence che il titolo
+                     * aspetta e' a due parole da qui. Uscendo dalla passata
+                     * lo si leggerebbe solo al prossimo movimento di `put` --
+                     * che pero' non arriva, perche' il titolo sta aspettando
+                     * proprio quel fence. */
+                    continue; }
               { unsigned h = (tgt >> 2) & 255u;
                 if (s_seen_gen_of[h] == s_seen_gen && s_seen_tgt[h] == tgt) {
                     static int _n = 0; static u32 _last = 0xFFFFFFFFu;
@@ -1611,7 +1632,14 @@ static void gcm_rsx_process_fifo_unlocked(void)
         }
         if ((w & 3) == 2) {                    /* CALL: offset | 2 */
             { u32 tgt = w & 0x1FFFFFFCu;
-              if (!gcm_io2ea(tgt)) { gcm_fifo_bad_branch("CALL", tgt, w); gcm_fifo_resync_why("unmapped-CALL", &s_fifo_getoff, put); break; }
+              if (!gcm_io2ea(tgt)) { gcm_fifo_bad_branch("CALL", tgt, w); gcm_fifo_resync_why("unmapped-CALL", &s_fifo_getoff, put);
+                    /* `continue`, non `break`: la risincronizzazione ci ha
+                     * rimessi DENTRO l'anello, e il fence che il titolo
+                     * aspetta e' a due parole da qui. Uscendo dalla passata
+                     * lo si leggerebbe solo al prossimo movimento di `put` --
+                     * che pero' non arriva, perche' il titolo sta aspettando
+                     * proprio quel fence. */
+                    continue; }
               s_fifo_calloff = s_fifo_getoff + 4;
               s_fifo_getoff  = tgt; }
             continue;
