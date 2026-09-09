@@ -367,9 +367,38 @@ tre si fermano a fence 77-81. Cosa NON e' la causa, misurato:
   finestra e viene scartato. Solo il valore precedente va scartato.
 
 Quello che si sa: nelle corse bloccate il walker si ferma dentro un segmento
-il cui `JUMP` di coda non e' stato scritto, e il gioco aspetta un fence che sta
-oltre. Il prossimo passo e' confrontare una corsa riuscita con una fallita
-sugli stessi indirizzi, non aggiungere altre euristiche.
+il cui `JUMP` di coda non e' stato scritto, e il gioco aspetta il fence
+successivo.
+
+### Cosa e' venuto fuori continuando
+
+* **La sequenza dei fence pubblicati era sporca.** Lo spazzolamento di recupero
+  ripescava fence STANTII rimasti nell'anello oltre `put` e li ripubblicava: una
+  `SET_REFERENCE 1` del primo fotogramma finiva fra la 73 e la 74, mandando
+  `ref` all'indietro sotto gli occhi di chi aspetta per uguaglianza. Ora durante
+  un recupero passano solo valori piu' nuovi del piu' alto gia' drenato, e la
+  sequenza e' strettamente monotona.
+* **L'anello del titolo non e' quello del contesto libgcm.** Il contesto dice
+  `begin=0x21000000 end=0x21010000` (io 0..0x10000); i fence stanno a io
+  0x10000..0x13000. Il gioco si gestisce una coda propria oltre quella di
+  libgcm. Ricavare l'inizio dell'anello dal contesto dava io 0, e la spazzolata
+  partiva da li' raccogliendo qualunque cosa somigliasse a un fence in tutta la
+  memoria bassa -- il che, per caso, ogni tanto pescava quello giusto e faceva
+  passare il gioco. I confini si ricavano ora da dove `put` e' stato visto.
+* **Una lezione di metodo, pagata.** `ninja -C build | tail -2` restituisce
+  l'esito di `tail`, non di `ninja`: per diverse misure ho creduto di provare
+  una correzione mentre eseguivo il binario precedente, e le conclusioni di
+  quelle corse erano su codice che non esisteva. Ora la build passa da uno
+  script che fallisce rumorosamente.
+
+### La domanda aperta
+
+**Chi scrive il `JUMP` di coda del segmento, e perche' manca?** Il segmento
+(io 0x660000 / 0x860000, ea 0x21660000 / 0x21860000) e' scritto dal **PPU** --
+zero DMA della SPU in quella finestra, misurato. Il walker ci arriva mentre e'
+ancora a meta' e si ferma sugli zeri. Il prossimo passo e' guardare le scritture
+del guest su quell'indirizzo (`YDKJ_WWATCH`), non aggiungere altre euristiche al
+walker: le ultime tre le ho aggiunte e nessuna ha sbloccato il titolo.
 
 ## Sessione 18c — il PPU non aspetta piu' la SPU: ora aspetta la RSX
 
