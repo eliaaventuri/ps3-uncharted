@@ -1081,6 +1081,18 @@ void vm_write32(uint64_t a, uint32_t v) { barrier_watch_hit((uint32_t)a, v, 4, _
                   ea, v, ra, ppu_prof_resolve_host(ra)); }
 #endif
       } } }
+
+    /* YDKJ_VWATCH=<lo>:<hi> -- guarda il VALORE, non l'indirizzo. Serve quando si
+     * cerca CHI tiene un puntatore: qui il contesto gcm del gioco, che si scopre
+     * solo dal fatto che qualcuno gli scrive dentro un puntatore al proprio
+     * command buffer (0x2186xxxx). L'indirizzo scritto e' l'incognita. */
+    { static int64_t lo=-2, hi=0; if (lo==-2) { const char* e=getenv("YDKJ_VWATCH");
+        if (e && *e) { lo=(int64_t)strtoul(e,0,0); const char* c=strchr(e,':'); hi=c?(int64_t)strtoul(c+1,0,0):lo+1; }
+        else lo=-1; }
+      if (lo>=0 && v>=(uint32_t)lo && v<(uint32_t)hi) { static int _vn=0; if (_vn++<200) {
+        void* ra = __builtin_return_address(0);
+        fprintf(stderr,"[VWATCH] write32 [0x%08X] = 0x%08X  guest-fn=0x%08X\n",
+                (uint32_t)a, v, ppu_prof_resolve_host(ra)); } } }
 #ifdef _WIN32
     /* FLOW_WVAL=<hex>: catch the instruction that STORES this value to a non-rodata
      * dest (e.g. a metaclass list node corrupted with a format-string pointer). */
