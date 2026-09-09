@@ -1,49 +1,44 @@
-# TASK SPECIFICATION: SPU-FLAG-01 — chi scrive il flag a 0x20000000
+# TASK SPECIFICATION: SPU-FLAG-03 — cosa fa la SPU dopo l'ultimo lavoro finito
 
 ## 1. OBIETTIVO
-Estrarre dal codice SPU liftato la funzione che contiene l'indirizzo `0x06120`
-e riportare **testualmente** il codice attorno, più i punti da cui ci si arriva.
-Nient'altro. Sola lettura.
+Dire, con righe di log copiate testualmente, **che cosa succede sul lato SPU**
+fra l'ultimo lavoro completato e la fine del log. Sola lettura di un file di
+log già prodotto: **non lanciare il gioco, non compilare, non modificare nulla.**
 
 ## 2. CONTESTO
-Il runtime registra questo DMA:
+Il file è `/tmp/stallo.log` (~127.000 righe). Fatti già stabiliti:
 
-    [dma-eawin] img=2 pc=0x06120 PUT lsa=0x10400 ea=0x20000000 size=0x10
-
-cioè: a `pc=0x06120` la SPU trasferisce 16 byte dalla propria local store
-all'indirizzo `0x20000000` della memoria principale. Il PPU aspetta il bit 0 di
-quella parola, quindi quel DMA è la fine di un lavoro.
-
-Il file da leggere è **uno solo**:
-`/Users/elia/Documents/Coding/uncharted-data/spu_lifted/spu_0000_at_00845000/spu_recomp.c`
-
-Nel codice liftato le funzioni si chiamano `spu_func_XXXXXXXX` (X = esadecimale
-dell'indirizzo) e i blocchi hanno etichette del tipo `loc_XXXXX` o commenti con
-l'indirizzo. L'indirizzo cercato è `0x6120` / `0x06120` / `6120`.
+* Il PPU "arma" un lavoro azzerando la parola a `0x20000000`; la SPU la
+  riscrive a `0x00000001` quando ha finito.
+* In questa corsa: **114 armamenti** e **57 completamenti** (due armamenti per
+  lavoro, è normale).
+* L'ultimo **completamento** è alla riga **12980**.
+* L'ultimo **armamento** è alla riga **12999**, cioè dopo: l'ultimo lavoro è
+  stato chiesto e non è mai tornato.
+* Dalla riga ~13000 in poi il PPU gira a vuoto: 107.615 righe `[HOTREAD]
+  spinning on 0x20000000`.
 
 ## 3. VINCOLI
-* **NON modificare nessun file.** Sola lettura.
-* Non compilare, non lanciare il gioco.
-* Non leggere altri file oltre a quello indicato (e alla sua intestazione `.h`
-  se serve per capire i nomi).
-* Se il file è troppo grande da leggere tutto, usa `grep -n` per trovare le
-  righe e poi leggi solo gli intervalli utili.
+* **Nessuna modifica a nessun file.** Nessuna compilazione. Non lanciare il gioco.
+* Il log è enorme: usa `grep -n`, `sed -n 'A,Bp'`, `grep -c`. **Non leggerlo tutto.**
+* Ignora completamente le righe `[HOTREAD]`, `[WAIT]` e `[SIGNAL]`: sono rumore.
 
 ## 4. CRITERI DI SUCCESSO
-`tasks/RESULT.md` contiene, nella sezione "EVIDENZE RACCOLTE":
+`tasks/RESULT.md`, sezione "EVIDENZE RACCOLTE", contiene:
 
-1. **Nome della funzione** che contiene `0x6120`, e la riga del file dove
-   comincia.
-2. Le **40 righe** di codice liftato attorno a `0x6120` (copiate testualmente).
-3. L'elenco dei **salti che arrivano** a quel blocco: cioè ogni riga del file
-   che contiene `6120` come destinazione (`goto loc_...6120`, o simile), con il
-   numero di riga.
-4. La **condizione immediatamente precedente**: l'`if` o il confronto che decide
-   se si arriva a quel blocco oppure no, copiato testualmente.
-
-Se una di queste quattro cose non è nel file, scrivi `NON TROVATO` e la ragione,
-invece di indovinare.
+1. **Le 40 righe** del log fra 12960 e 13060 **escluse** `[HOTREAD]`, `[WAIT]`,
+   `[SIGNAL]` — copiate testualmente. Comando suggerito:
+   `sed -n '12960,13060p' /tmp/stallo.log | grep -avE '^\[HOTREAD|^\[WAIT|^\[SIGNAL'`
+2. **Il conteggio, dopo la riga 13000**, di ciascuno di questi marcatori (uno
+   `grep -c` per ciascuno, riportando il numero anche se è zero):
+   `spu-park`, `WAIT_SIGNAL#`, `SendSignal`, `wws-cmd`, `spu-ovl`, `spu-assert`,
+   `mfc-list`, `dma-eawin`, `cellSpurs`
+   Comando: `tail -n +13000 /tmp/stallo.log | grep -ac '<marcatore>'`
+3. Le **ultime 20 righe distinte** del log escluse `[HOTREAD]`, `[WAIT]`,
+   `[SIGNAL]`, copiate testualmente. Comando:
+   `grep -avE '^\[HOTREAD|^\[WAIT|^\[SIGNAL' /tmp/stallo.log | tail -20`
+4. Una frase secca: **dopo la riga 13000 la SPU fa ancora qualcosa, sì o no?**
 
 ## 5. STOP CONDITIONS
-* Qualsiasi modifica a un file: fermarsi.
-* Se `0x6120` non compare nel file, riportare `BLOCKED` con l'output del grep.
+* Se `/tmp/stallo.log` non esiste o è vuoto: `BLOCKED`.
+* Qualsiasi modifica a un file del repository: fermarsi.
