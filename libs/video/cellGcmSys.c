@@ -1072,16 +1072,25 @@ static void gcm_fifo_resync_why(const char* why, u32* getoff, u32 put)
      * 0x10000 con put=0x10008: il gioco l'aspettava e non e' mai arrivata.
      * Perdere un DISEGNO su una risincronizzazione costa un fotogramma;
      * perdere un FENCE blocca il titolo. */
-    /* L'inizio dell'anello DEVE essere noto: senza, il tratto "che ha fatto il
-     * giro" partirebbe da IO 0 e la spazzolata raccoglierebbe qualunque parola
-     * somigli a un SET_REFERENCE in tutta la memoria bassa -- fence stantii
-     * compresi, che ripubblicati mandano `ref` all'indietro. Se non si riesce a
-     * ricavarlo, quel tratto non si spazzola affatto. */
-    u32 ring_begin = 0xFFFFFFFFu;
-    if (s_gcm_context_ea) {
-        u32 b = gcm_ea2io(vm_read32(s_gcm_context_ea));
-        if (b != 0xFFFFFFFFu) ring_begin = b;
-    }
+    /* L'anello NON e' quello del contesto libgcm. Misurato: il contesto dice
+     * begin=0x21000000 end=0x21010000, cioe' io 0..0x10000, mentre i fence che
+     * contano stanno a io 0x10000..0x13000 -- il titolo si gestisce una coda
+     * propria oltre quella di libgcm, e `put`/`get` sono i registri veri.
+     * I confini si ricavano quindi da dove `put` e' stato visto, non dal
+     * contesto: e' l'unica fonte che dice davvero dove il gioco scrive. */
+    static u32 s_put_lo = 0xFFFFFFFFu, s_put_hi = 0;
+    if (put < s_put_lo) s_put_lo = put;
+    if (put > s_put_hi) s_put_hi = put;
+    u32 ring_begin = (s_put_lo == 0xFFFFFFFFu) ? 0xFFFFFFFFu : (s_put_lo & ~0xFFFu);
+    { static int _c = 0;
+      if (_c++ < 3)
+          fprintf(stderr, "[cellGcmSys] ctx=0x%08X begin=0x%08X end=0x%08X cur=0x%08X"
+                  " -> ring_begin(io)=0x%08X  last_ring_off=0x%08X\n",
+                  s_gcm_context_ea,
+                  s_gcm_context_ea ? vm_read32(s_gcm_context_ea) : 0,
+                  s_gcm_context_ea ? vm_read32(s_gcm_context_ea + 4) : 0,
+                  s_gcm_context_ea ? vm_read32(s_gcm_context_ea + 8) : 0,
+                  ring_begin, s_last_ring_off); }
     { static int _w = 0;
       if (ring_begin == 0xFFFFFFFFu && _w++ < 4)
           fprintf(stderr, "[cellGcmSys] resync: inizio anello ignoto "
