@@ -398,7 +398,40 @@ IGC), le voci (829 `Registering VOX`), i sottotitoli e la telecamera di
 `movie1`, e le icone dell'HUD (`Loading HUD icon 'assault-rifle-a'`,
 `'bullets'`). Niente di tutto questo era mai comparso.
 
-### Cosa resta
+### Il fronte nuovo: dopo il caricamento
+
+Il titolo non si blocca più sulla FIFO, ma dopo la fase di caricamento si ferma
+su un'attesa. Misurato (corsa da 200 s, senza contesa sulla macchina):
+
+- La FIFO **continua a drenare fino all'ultima riga di log**: 6.050 fence in
+  200 secondi, cioè ~30 al secondo. Il gioco disegna, non è morto.
+- Il thread principale del PPU però gira per 149.240 righe consecutive sullo
+  stesso punto: `func_00566108`, chiamata da `func_005324E8` con
+  `lr=0x00532620`. Il ciclo aspetta il **bit 0 della parola a `0x20000000`**,
+  presa da `[oggetto+0x320]`. La stessa funzione, subito dopo, aspetta una
+  seconda lista di completamenti da `[oggetto+0x314]` e poi libera un buffer:
+  è una sincronizzazione di fine fotogramma.
+- La SPU **sa** scrivere quel flag: `img=2 pc=0x06120 PUT lsa=0x10400
+  ea=0x20000000 size=0x10`, con dati `00000001 00000000`. Lo fa alcune decine
+  di volte e poi smette.
+- Il task 0 del taskset `0x2A86F380` (immagine SPU **1**, non 2) si parcheggia
+  sempre nello stesso punto: `pc=0x00A70`, l'intercettazione della syscall del
+  taskset, con oggetto d'attesa nullo.
+- Le `SendSignal` che lo risvegliano **non le chiama il gioco**: le chiama la
+  nostra HLE di `_cellSpursLFQueuePushBody` (NID `0x8A85674D`), cioè il PPU
+  accoda un lavoro in una coda lock-free SPURS da `func_0072EB28` e la push
+  sveglia il consumatore. 462 volte per corsa, poi basta.
+
+Quindi ci sono **due meccanismi distinti** e non vanno confusi: la coda
+lock-free servita dall'immagine 1, e il lavoro dell'immagine 2 che scrive il
+flag a `0x20000000`. Il PPU aspetta il secondo.
+
+Da notare, come avvertimento: sotto contesa (con il worker locale che occupa la
+GPU) il titolo si ferma **in un punto diverso** — `HOTREAD8 spinning on
+0x0FEFCB30 val=0x05 guest-fn=0x001AD590`. Il punto d'arresto non è unico, e
+misurarlo con la macchina occupata porta fuori strada.
+
+### Cosa resta della FIFO
 
 Una corsa su cinque si ferma ancora. **Non è il task SPU fermo in
 `WAIT_SIGNAL`**: quel messaggio compare identico (16 volte, fino a 15 s) nelle
