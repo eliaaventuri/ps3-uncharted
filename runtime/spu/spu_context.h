@@ -690,6 +690,31 @@ void (*spu_take_interrupt(spu_context* ctx,
 
 /* Drain the pending trampoline chain: run each queued transfer target until
  * none remain. The one central hook site for the faithful execution model. */
+/* SPU_PCWATCH=<pc esadecimale>: a ogni passaggio da quel blocco stampa la
+ * parola a stack+0xC0. Serve a leggere un bivio del job module dall'esterno,
+ * senza toccare il codice generato.
+ *
+ * LIMITE MISURATO (09/09/2026): vede solo i blocchi raggiunti dal TRAMPOLINO.
+ * Nel codice liftato una chiamata diventa una chiamata C diretta
+ * (`func(ctx); SPU_DRAIN(ctx);`), e la funzione chiamata non passa mai di qui:
+ * provato su 0x6120, che di sicuro esegue (il suo DMA si vede nel log), e i
+ * passaggi contati sono zero. Per quei blocchi serve un altro aggancio. */
+static inline void spu_pcwatch(spu_context* ctx)
+{
+    static long w = -1;
+    if (w < 0) { const char* e = getenv("SPU_PCWATCH"); w = e ? (long)strtoul(e, 0, 16) : 0; }
+    if (!w) return;
+    if (((uint32_t)ctx->pc & SPU_LS_MASK) != (uint32_t)w) return;
+    static unsigned n = 0;
+    if (n++ >= 4000) return;
+    uint32_t sp = ctx->gpr[1]._u32[0] & SPU_LS_MASK;
+    uint32_t at = (sp + 0xC0) & SPU_LS_MASK;
+    uint32_t v  = ((uint32_t)ctx->ls[at] << 24) | ((uint32_t)ctx->ls[at+1] << 16)
+                | ((uint32_t)ctx->ls[at+2] << 8) |  (uint32_t)ctx->ls[at+3];
+    fprintf(stderr, "[spu-pc] img=%d pc=0x%05X sp=0x%05X [sp+0xC0]=0x%08X\n",
+            ctx->image_id, (uint32_t)w, sp, v);
+}
+
 #define SPU_DRAIN(ctx) do {                                    \
         spu_depth_guard(ctx);                                  \
         while (g_spu_trampoline_fn) {                           \
@@ -731,6 +756,7 @@ void (*spu_take_interrupt(spu_context* ctx,
                 break;                                                     \
             }                                                              \
             }                                                              \
+            spu_pcwatch(ctx);                                   \
             void (*_tf)(spu_context*) = g_spu_trampoline_fn;    \
             g_spu_trampoline_fn = 0;                            \
             yz_lockstep_tick(ctx);                             \
