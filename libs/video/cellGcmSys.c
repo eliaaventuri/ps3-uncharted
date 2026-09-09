@@ -1050,16 +1050,48 @@ static void gcm_ref_push_at(u32 v, u32 getoff);
  *
  * Dropping DRAWS on a resync is survivable: a frame is lost. Dropping a FENCE
  * is not, it deadlocks the title. Sweep the skipped range first. */
+static u32 gcm_ea2io(u32 ea);
 static void gcm_fifo_resync_why(const char* why, u32* getoff, u32 put)
 {
     static int n = 0;
     if (n++ < 8)
         fprintf(stderr, "[cellGcmSys] FIFO resync (%s) 0x%08X -> put 0x%08X\n",
                 why, *getoff, put);
-    u32 from = (*getoff <= put) ? *getoff : s_last_ring_off;
-    if (from < put) {
-        unsigned rescued = 0;
-        for (u32 io = from; io + 8 <= put; io += 4) {
+    /* Il tratto saltato puo' aver fatto il GIRO del ring: quando il walker si
+     * era fermato oltre `put` (dentro un segmento, o piu' avanti nell'anello),
+     * la parte saltata non e' [from, put) ma [from, fine) piu' [inizio, put).
+     * Spazzolare solo la prima meta' perdeva i fence scritti all'inizio
+     * dell'anello -- ed e' esattamente cosi' che si e' persa la fence 0x49 a
+     * 0x10000 con put=0x10008: il gioco l'aspettava e non e' mai arrivata.
+     * Perdere un DISEGNO su una risincronizzazione costa un fotogramma;
+     * perdere un FENCE blocca il titolo. */
+    u32 ring_begin = 0;
+    if (s_gcm_context_ea) {
+        u32 b = gcm_ea2io(vm_read32(s_gcm_context_ea));
+        if (b != 0xFFFFFFFFu) ring_begin = b;
+    }
+    /* Una sola spazzolata per ogni valore di `put`: il watchdog di stuck-get
+     * risincronizza ogni poche passate, e rispazzolare lo stesso tratto
+     * ripubblicava gli stessi fence all'infinito (24 milioni di push in due
+     * minuti). Finche' `put` non si muove non c'e' niente di nuovo da salvare. */
+    static u32 s_last_swept_put = 0xFFFFFFFFu;
+    unsigned rescued = 0;
+    if (put == s_last_swept_put) { *getoff = put; return; }
+    s_last_swept_put = put;
+    u32 span_a_from = (*getoff <= put) ? *getoff : s_last_ring_off;
+    u32 spans[2][2] = { { span_a_from, put }, { 0, 0 } };
+    if (span_a_from >= put) {          /* il tratto ha fatto il giro */
+        spans[0][0] = span_a_from; spans[0][1] = 0;   /* [from, fine ring): la fine
+                                                       * non la conosciamo, ma i
+                                                       * fence oltre `put` non
+                                                       * servono: bastano quelli
+                                                       * dall'inizio a `put`. */
+        spans[1][0] = ring_begin;  spans[1][1] = put;
+    }
+    for (int sp = 0; sp < 2; sp++) {
+        u32 a = spans[sp][0], b = spans[sp][1];
+        if (b == 0 || a >= b) continue;
+        for (u32 io = a; io + 8 <= b; io += 4) {
             u32 ea = gcm_io2ea(io); if (!ea) continue;
             u32 w = vm_read32(ea);
             if ((w >> 29) != 0 || (w & 0x1FFCu) != 0x0050u) continue;
@@ -1067,10 +1099,9 @@ static void gcm_fifo_resync_why(const char* why, u32* getoff, u32 put)
             gcm_ref_push_at(vm_read32(dea), io);
             rescued++;
         }
-        if (rescued) { static int m = 0; if (m++ < 8)
-            fprintf(stderr, "[cellGcmSys] resync rescued %u fence(s) from"
-                    " 0x%08X..0x%08X\n", rescued, from, put); }
     }
+    if (rescued) { static int m = 0; if (m++ < 8)
+        fprintf(stderr, "[cellGcmSys] resync recuperati %u fence\n", rescued); }
     *getoff = put;
 }
 
@@ -1115,6 +1146,12 @@ static void gcm_ref_push_at(u32 v, u32 getoff)
 {
     { static int _d = -1; if (_d < 0) _d = getenv("GCM_REFLOG") ? 1 : 0;
       if (_d) fprintf(stderr, "[refq] drained fence 0x%X at getoff=%08X\n", v, getoff); }
+    /* Lo stesso valore due volte di fila non aggiunge informazione a chi
+     * aspetta per uguaglianza, e riempie la coda impedendo ai fence successivi
+     * di uscire. */
+    static u32 s_last_pushed = 0xFFFFFFFFu;
+    if (v == s_last_pushed) return;
+    s_last_pushed = v;
     u32 t = s_ref_qtail;
     if (t - s_ref_qhead >= GCM_REF_QLEN) {   /* overflow: drop oldest (keeps liveness) */
         s_ref_qhead++;
@@ -1218,6 +1255,17 @@ static void gcm_rsx_process_fifo_unlocked(void)
               _n = 0; _t0 = now;
           }
       } }
+    /* Offset gia' visitati IN QUESTA passata. Un ciclo di JUMP (segmento ->
+     * ring -> stesso segmento) fa girare il walker all'infinito senza mai
+     * arrivare a `put`, ridrenando ogni giro gli stessi fence: `ref` resta
+     * inchiodato e chi aspetta il fence successivo non si sveglia piu'.
+     * Misurato: 38.863 giri in due minuti sullo stesso arco, e 8.887 copie
+     * dello stesso fence nel log. Non si puo' decidere dal contenuto se un
+     * salto sia lecito -- si puo' pero' dire che tornare due volte sullo stesso
+     * indirizzo dentro una singola passata non porta da nessuna parte. */
+    static u32 s_seen_tgt[256]; static u32 s_seen_gen_of[256]; static u32 s_seen_gen = 0;
+    s_seen_gen++;
+
     static rsx_state s_state;
     static int  s_inited = 0;
     extern u32 g_rsx_last_reference;
@@ -1311,6 +1359,17 @@ static void gcm_rsx_process_fifo_unlocked(void)
                     fprintf(stderr, "[cellGcmSys] FIFO: zeri a 0x%08X (put=0x%08X)"
                             " -- buffer non ancora scritto, la passata si ferma qui\n",
                             s_fifo_getoff, put);
+                    /* Le parole intorno al punto in cui ci si ferma: dicono se
+                     * il JUMP di coda del segmento manca davvero o se il
+                     * walker e' semplicemente disallineato (un conteggio
+                     * sbagliato qualche comando prima lo porta a leggere in
+                     * mezzo a un argomento). */
+                    for (u32 o = (s_fifo_getoff >= 0x80) ? s_fifo_getoff - 0x80 : 0;
+                         o <= s_fifo_getoff + 0x40; o += 4) {
+                        u32 oe = gcm_io2ea(o); if (!oe) continue;
+                        fprintf(stderr, "   io=%08X w=%08X%s\n", o, vm_read32(oe),
+                                (o == s_fifo_getoff) ? "  <- fermo qui" : "");
+                    }
                 }
                 break;
             }
@@ -1388,6 +1447,15 @@ static void gcm_rsx_process_fifo_unlocked(void)
                           } } }
                   } } }
               if (!gcm_io2ea(tgt)) { gcm_fifo_bad_branch("JUMP", tgt, w); gcm_fifo_dump_around(s_fifo_getoff); gcm_fifo_resync_why("unmapped-JUMP", &s_fifo_getoff, put); break; }
+              { unsigned h = (tgt >> 2) & 255u;
+                if (s_seen_gen_of[h] == s_seen_gen && s_seen_tgt[h] == tgt) {
+                    static int _n = 0; static u32 _last = 0xFFFFFFFFu;
+                    if (tgt != _last && _n++ < 8) { _last = tgt;
+                        fprintf(stderr, "[cellGcmSys] FIFO: gia' passato da 0x%08X in "
+                                "questa passata (put=0x%08X) -- ciclo, mi fermo\n", tgt, put); }
+                    break;
+                }
+                s_seen_gen_of[h] = s_seen_gen; s_seen_tgt[h] = tgt; }
               /* A JUMP to its own address is the "park the RSX here" idiom:
                * the title leaves it at the write head so the GPU stops if it
                * catches up, and overwrites it when the next segment is
