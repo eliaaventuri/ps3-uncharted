@@ -615,13 +615,46 @@ sblocca il PPU. E' esattamente il ciclo aperto gia' annotato nel runtime
 (`SPURS_EF_SPU_REPLY` in `spu_channels.c`): "il task guest dovrebbe porre il
 proprio flag SPU->PPU a fine ciclo, e non lo fa mai".
 
+#### Il vero inizio del guasto: la SPU smette di leggere la coda
+
+Guardando i trasferimenti su tutto il blocco di strutture
+(`SPU_DMA_EAWIN=0x2A870C00:0x2A871000`) si vede che la SPU **legge davvero** gli
+slot della coda: `img=1 pc=0x09900 GET ea=0x2A870D80..0x2A870EE0 size=0x20`, 12
+slot da 32 byte. Il consumatore funziona.
+
+Ma smette. L'ultimo pop e' alla riga 9211, e lo spin del PPU comincia solo alla
+11334 — duemila righe dopo. Da li' in poi il quadro e' questo, ripetuto:
+
+```
+[dma-eawin] img=1 pc=0x09900 GET ea=0x2A870E60      <- ULTIMO pop
+[spu-park]
+[cellSpurs] SendSignal(...) lr=0x0072EC00           <- il PPU accoda ancora
+[spu_workload] signal task 0                        <- la sveglia arriva
+[spu-park]                                          <- e non legge la coda
+[cellSpurs] SendSignal(...) lr=0x0072EC00
+[spu_workload] signal task 0
+[spu-park]
+...
+```
+
+**Il PPU continua ad accodare e a svegliare; la SPU si sveglia e non legge piu'
+niente.** Lo slot `0x2A870E60` e' `base + 7*32`, cioe' la posizione 7 — la
+stessa che la traccia della push riporta come ultima (`push pos=7
+slot=0x2A870E60`), e allo spin i puntatori sono `pop1 == push1 == 8`.
+
 #### Il prossimo passo
 
-Trovare, nel task SPU, il punto in cui dovrebbe porre il flag a `0x2A870C80`, e
-perche' non ci arriva. Attenzione: `SPU_PCWATCH` **non serve** per questo (vede
-solo i blocchi raggiunti per trasferimento, non quelli chiamati direttamente —
-limite misurato). Serve un aggancio diverso, per esempio sul canale MFC quando
-l'indirizzo di destinazione cade nel blocco `0x2A870C00`-`0x2A871000`. 
+Confrontare il puntatore di push che pubblica la nostra HLE con quello che la
+SPU legge davvero dalla struttura guest. Il sospetto e' un disallineamento fra
+i due dopo la posizione 7: il produttore crede di aver pubblicato, il
+consumatore vede la coda vuota e si riparcheggia. Da guardare:
+`lfq_complete_push_pointer` in `libs/sync/cellSyncLFQueue.c` e quale campo
+dell'header (`LFQ_PUSH1` a +0x08 o `LFQ_PUSH2` a +0x30) legge il codice SPU a
+`spu_func_00009DA0` (immagine 1), che e' l'helper del pop chiamato da
+`spu_func_000098F0` con ritorno a `0x9900`.
+
+Nota: il flag d'evento a `0x2A870C80` non viene posto **perche' il lavoro non
+viene mai processato**, non viceversa. La causa sta qui, un gradino piu' sotto. 
 
 ### Cosa resta della FIFO
 
