@@ -1,6 +1,6 @@
 # Stato del progetto
 
-Ultimo aggiornamento: **8 settembre 2026** — sessione 18.
+Ultimo aggiornamento: **9 settembre 2026** — sessione 18d.
 
 ## Dove siamo
 
@@ -304,6 +304,53 @@ La lista dei comandi ora viene percorsa fino in fondo — sei coppie
 risultati in memoria principale.** Non era mai successo in nessuna sessione.
 Riproducibile: **tre corse su tre**, identiche -- 14 comandi, un overlay
 residente, zero microstep, cinque stall e due interrupt per corsa.
+
+## Sessione 18d — e ora non aspetta piu' nemmeno la RSX
+
+Il gioco si fermava su `Rendering is stuck on reference value 76`. Tre difetti
+in fila nel walker della FIFO, tutti trovati misurando.
+
+### 1. Una sequenza di zeri non e' un flusso di comandi
+
+Una parola a zero veniva trattata come metodo 0 con conteggio 0, cioe' un NOP
+da 4 byte. In un buffer non ancora riempito il walker avanzava cosi' nel vuoto,
+e siccome quel vuoto sta **fuori dal ring** il controllo "fermati a `put`" non
+scattava mai: usciva dal segmento, camminava per megabyte, finiva sulla coda di
+un altro segmento e da li' tornava nel ring. Il risultato era un ciclo che
+ridrenava lo stesso fence **38.863 volte in due minuti**, tenendo `ref`
+inchiodato mentre il gioco aspettava il successivo.
+
+Quattro zeri di fila ora fermano la passata **senza far avanzare `get`**: la
+passata dopo rilegge le stesse parole, e se restano zero mentre `put` si e'
+mosso ci pensa il watchdog di stuck-get. Da 38.863 giri a 1 sola fermata, e il
+log di una corsa da 95.185 a 16.472 righe.
+
+### 2. Una risincronizzazione non deve perdere un fence
+
+Con il walker fermo dentro un segmento, il watchdog risincronizza a `put`. Il
+tratto saltato pero' puo' aver fatto il **giro dell'anello**: non e'
+`[from, put)` ma `[from, fine)` piu' `[inizio, put)`. Lo spazzolamento di
+recupero guardava solo la prima meta', e cosi' spariva il fence scritto
+all'inizio dell'anello -- la 0x49 a `0x10000` con `put=0x10008`, cioe'
+esattamente quella che il gioco aspettava. Perdere un disegno su una
+risincronizzazione costa un fotogramma; perdere un fence blocca il titolo.
+
+### 3. Lo spazzolamento non deve diventare esso stesso il problema
+
+Coprire entrambi i tratti, da solo, ha fatto **24 milioni** di ripubblicazioni
+in due minuti: il watchdog risincronizza ogni poche passate e rispazzolava
+sempre lo stesso tratto. Ora la spazzolata e' una sola per ogni valore di
+`put`, e `gcm_ref_push_at` rifiuta due valori uguali di fila.
+
+### Risultato
+
+| | prima | dopo |
+|---|---|---|
+| fence drenati in due minuti | fino a **0x4C** (76) | fino a **0xE5C** (3676) |
+| `Rendering is stuck` | sempre | **mai** |
+
+Il fronte si sposta ancora: adesso l'ultima cosa che si vede e' un task SPURS
+che dorme in `WAIT_SIGNAL`, e la RSX disegna ancora solo `CLEAR_SURFACE`.
 
 ## Sessione 18c — il PPU non aspetta piu' la SPU: ora aspetta la RSX
 
