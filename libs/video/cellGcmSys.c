@@ -1050,6 +1050,13 @@ static void gcm_ref_push_at(u32 v, u32 getoff);
  *
  * Dropping DRAWS on a resync is survivable: a frame is lost. Dropping a FENCE
  * is not, it deadlocks the title. Sweep the skipped range first. */
+/* Il valore piu' alto drenato dal percorso normale. Serve allo spazzolamento
+ * di recupero, che altrimenti ripesca fence STANTII rimasti nell'anello oltre
+ * `put`: misurato, una SET_REFERENCE 1 del primo fotogramma pubblicata fra la
+ * 73 e la 74, mentre il gioco aspettava la 75 -- che non e' mai arrivata. */
+static u32 s_ref_high = 0;
+static int s_ref_in_rescue = 0;
+
 static u32 gcm_ea2io(u32 ea);
 static void gcm_fifo_resync_why(const char* why, u32* getoff, u32 put)
 {
@@ -1065,11 +1072,21 @@ static void gcm_fifo_resync_why(const char* why, u32* getoff, u32 put)
      * 0x10000 con put=0x10008: il gioco l'aspettava e non e' mai arrivata.
      * Perdere un DISEGNO su una risincronizzazione costa un fotogramma;
      * perdere un FENCE blocca il titolo. */
-    u32 ring_begin = 0;
+    /* L'inizio dell'anello DEVE essere noto: senza, il tratto "che ha fatto il
+     * giro" partirebbe da IO 0 e la spazzolata raccoglierebbe qualunque parola
+     * somigli a un SET_REFERENCE in tutta la memoria bassa -- fence stantii
+     * compresi, che ripubblicati mandano `ref` all'indietro. Se non si riesce a
+     * ricavarlo, quel tratto non si spazzola affatto. */
+    u32 ring_begin = 0xFFFFFFFFu;
     if (s_gcm_context_ea) {
         u32 b = gcm_ea2io(vm_read32(s_gcm_context_ea));
         if (b != 0xFFFFFFFFu) ring_begin = b;
     }
+    { static int _w = 0;
+      if (ring_begin == 0xFFFFFFFFu && _w++ < 4)
+          fprintf(stderr, "[cellGcmSys] resync: inizio anello ignoto "
+                  "(ctx=0x%08X) -- niente spazzolata del tratto avvolto\n",
+                  s_gcm_context_ea); }
     /* Una sola spazzolata per ogni valore di `put`: il watchdog di stuck-get
      * risincronizza ogni poche passate, e rispazzolare lo stesso tratto
      * ripubblicava gli stessi fence all'infinito (24 milioni di push in due
@@ -1086,7 +1103,7 @@ static void gcm_fifo_resync_why(const char* why, u32* getoff, u32 put)
                                                        * fence oltre `put` non
                                                        * servono: bastano quelli
                                                        * dall'inizio a `put`. */
-        spans[1][0] = ring_begin;  spans[1][1] = put;
+        spans[1][0] = ring_begin;  spans[1][1] = (ring_begin == 0xFFFFFFFFu) ? 0 : put;
     }
     s_ref_in_rescue = 1;
     for (int sp = 0; sp < 2; sp++) {
@@ -1102,6 +1119,20 @@ static void gcm_fifo_resync_why(const char* why, u32* getoff, u32 put)
         }
     }
     s_ref_in_rescue = 0;
+    /* Tutti i SET_REFERENCE presenti nell'anello, con il loro offset: dice se
+     * il fence che il gioco aspetta sia stato scritto e dove, oppure se non ci
+     * sia proprio. Senza questo si puo' solo supporre. */
+    { static int _n = 0;
+      if (getenv("GCM_RINGSCAN") && _n++ < 4 && ring_begin) {
+          char b[900]; int q = snprintf(b, sizeof b, "[ringscan] put=%08X fence nell'anello:", put);
+          for (u32 io = ring_begin; io < ring_begin + 0x4000 && q < (int)sizeof b - 32; io += 4) {
+              u32 e = gcm_io2ea(io); if (!e) continue;
+              u32 w = vm_read32(e);
+              if ((w >> 29) != 0 || (w & 0x1FFCu) != 0x0050u) continue;
+              u32 de = gcm_io2ea(io + 4); if (!de) continue;
+              q += snprintf(b + q, sizeof(b) - q, " %u@%05X", vm_read32(de), io);
+          }
+          snprintf(b + q, sizeof(b) - q, "\n"); fputs(b, stderr); } }
     if (rescued) { static int m = 0; if (m++ < 8)
         fprintf(stderr, "[cellGcmSys] resync recuperati %u fence\n", rescued); }
     *getoff = put;
@@ -1143,13 +1174,6 @@ static void gcm_fifo_dump_around(u32 getoff)
     }
 }
 
-
-/* Il valore piu' alto drenato dal percorso normale. Serve allo spazzolamento
- * di recupero, che altrimenti ripesca fence STANTII rimasti nell'anello oltre
- * `put`: misurato, una SET_REFERENCE 1 del primo fotogramma pubblicata fra la
- * 73 e la 74, mentre il gioco aspettava la 75 -- che non e' mai arrivata. */
-static u32 s_ref_high = 0;
-static int s_ref_in_rescue = 0;
 
 static void gcm_ref_push_at(u32 v, u32 getoff)
 {
