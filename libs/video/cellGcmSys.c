@@ -1088,6 +1088,7 @@ static void gcm_fifo_resync_why(const char* why, u32* getoff, u32 put)
                                                        * dall'inizio a `put`. */
         spans[1][0] = ring_begin;  spans[1][1] = put;
     }
+    s_ref_in_rescue = 1;
     for (int sp = 0; sp < 2; sp++) {
         u32 a = spans[sp][0], b = spans[sp][1];
         if (b == 0 || a >= b) continue;
@@ -1100,6 +1101,7 @@ static void gcm_fifo_resync_why(const char* why, u32* getoff, u32 put)
             rescued++;
         }
     }
+    s_ref_in_rescue = 0;
     if (rescued) { static int m = 0; if (m++ < 8)
         fprintf(stderr, "[cellGcmSys] resync recuperati %u fence\n", rescued); }
     *getoff = put;
@@ -1142,6 +1144,13 @@ static void gcm_fifo_dump_around(u32 getoff)
 }
 
 
+/* Il valore piu' alto drenato dal percorso normale. Serve allo spazzolamento
+ * di recupero, che altrimenti ripesca fence STANTII rimasti nell'anello oltre
+ * `put`: misurato, una SET_REFERENCE 1 del primo fotogramma pubblicata fra la
+ * 73 e la 74, mentre il gioco aspettava la 75 -- che non e' mai arrivata. */
+static u32 s_ref_high = 0;
+static int s_ref_in_rescue = 0;
+
 static void gcm_ref_push_at(u32 v, u32 getoff)
 {
     { static int _d = -1; if (_d < 0) _d = getenv("GCM_REFLOG") ? 1 : 0;
@@ -1160,6 +1169,13 @@ static void gcm_ref_push_at(u32 v, u32 getoff)
     { static u32 s_last_pushed = 0xFFFFFFFFu;
       if (v == s_last_pushed) return;
       s_last_pushed = v; }
+    /* Durante un recupero si accettano solo fence PIU' NUOVI di quelli gia'
+     * drenati: l'anello contiene ancora le parole dei fotogrammi passati, e
+     * ripubblicarle manda indietro `ref` sotto gli occhi di chi aspetta per
+     * uguaglianza. Sul percorso normale invece si passa tutto -- se il titolo
+     * azzera il contatore, quello e' un fence vero. */
+    if (s_ref_in_rescue) { if (v <= s_ref_high) return; }
+    else if (v > s_ref_high) s_ref_high = v;
     u32 t = s_ref_qtail;
     if (t - s_ref_qhead >= GCM_REF_QLEN) {   /* overflow: drop oldest (keeps liveness) */
         s_ref_qhead++;
@@ -1178,7 +1194,15 @@ static void gcm_ref_publish_one(void)
 {
     u32 h = s_ref_qhead;
     if (h == s_ref_qtail) return;
-    vm_write32(GCM_CONTROL_GUEST_ADDR + 8, s_ref_q[h % GCM_REF_QLEN]);
+    u32 pv = s_ref_q[h % GCM_REF_QLEN];
+    vm_write32(GCM_CONTROL_GUEST_ADDR + 8, pv);
+    { static int _d = -1; if (_d < 0) _d = getenv("GCM_REFLOG") ? 1 : 0;
+      static unsigned _n = 0;
+      /* Drenare un fence e PUBBLICARLO sono due cose diverse: chi aspetta per
+       * uguaglianza vede solo la seconda. Senza questa riga non si puo' dire se
+       * il valore che il gioco attende sia mai arrivato al registro. */
+      if (_d && _n++ < 20000)
+          fprintf(stderr, "[refpub] ref = 0x%X (%u)\n", pv, pv); }
     s_ref_qhead = h + 1;
     g_gcm_ref_pub_count++;
 }
