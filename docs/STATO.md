@@ -1,6 +1,6 @@
 # Stato del progetto
 
-Ultimo aggiornamento: **9 settembre 2026** — sessione 18d.
+Ultimo aggiornamento: **9 settembre 2026** — sessione 19.
 
 ## Dove siamo
 
@@ -10,6 +10,20 @@ pacchetti dei livelli, spinge job nella propria coda lock-free, ogni push svegli
 il task SPU che li consuma, e arriva a eseguire il proprio codice di HUD. Il
 percorso completo — ELF decifrato → lift → compilazione nativa ARM64 →
 esecuzione — funziona.
+
+**Dalla sessione 19 il titolo disegna in continuo.** Il blocco storico
+`Rendering is stuck on reference value N` è risolto: i fotogrammi di comandi RSX
+drenati per corsa passano da ~75 a **~6.000 in 200 secondi (≈30 al secondo)**, e
+in una corsa da 600 secondi non si è mai fermato. Superata quella soglia, il
+gioco carica **contenuto vero** che non aveva mai raggiunto: pacchetti di livello
+(`PackageMgr::RequestLevel [particle-ingame]`), script particellari, 642
+cinematiche in-game, 829 voci, sottotitoli, e le icone dell'HUD (`assault-rifle-a`,
+`bullets`, `treasure`).
+
+**Il prossimo passo** è l'attesa che resta dopo il caricamento: il thread
+principale del PPU gira a vuoto aspettando il bit 0 della parola a `0x20000000`,
+che una SPU dovrebbe scrivere e a un certo punto smette di scrivere. Dettagli e
+numeri nella sezione "Il fronte nuovo: dopo il caricamento".
 
 Quanto arriva a fare, dal log:
 
