@@ -95,6 +95,13 @@ Nota di realtà: il modello locale processa ~90 token al secondo di prompt, e il
 prompt di sistema di opencode è ~9.000 token — quindi **un paio di minuti per
 turno**. Va bene per mappature e lavori ripetitivi, non per iterazioni rapide.
 
+**Regola operativa: non lanciare mai il gioco mentre il worker locale gira.**
+Il modello da 32B e il backend Metal del port si contendono la stessa GPU
+unificata, e il server MLX muore con
+`[METAL] Command buffer execution failed: Insufficient Memory`. Misurato il
+09/09/2026: server crashato a metà task. O si delega la lettura di codice al
+worker, o si misura il gioco — mai insieme.
+
 ### Flusso Operativo Obbligatorio
 
 1. **Definisci l'obiettivo**: Scrivi un task circoscritto in `tasks/TASK.md` (ispirandoti a `tasks/TASK_TEMPLATE.md`).
