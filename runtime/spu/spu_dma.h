@@ -216,7 +216,7 @@ static inline int mfc_do_transfer(spu_context* spu, uint32_t lsa, uint64_t ea,
                       else { s_lo = 0; s_hi = 0; } }
       if (s_hi && (uint32_t)ea < (uint32_t)s_hi && (uint32_t)ea + size > (uint32_t)s_lo) {
           static int _n = 0;
-          if (_n++ < 200)
+          if (_n++ < 100000)
               fprintf(stderr, "[dma-eawin] img=%d pc=0x%05X %s lsa=0x%05X ea=0x%08X size=0x%X\n",
                       spu->image_id, (uint32_t)spu->pc & SPU_LS_MASK,
                       mfc_is_get(cmd) ? "GET" : mfc_is_put(cmd) ? "PUT" : "cmd",
@@ -225,13 +225,13 @@ static inline int mfc_do_transfer(spu_context* spu, uint32_t lsa, uint64_t ea,
            * chiamante non si trova staticamente. Il registro di collegamento
            * della SPU (gpr[0], slot preferito) e' l'indirizzo di ritorno, cioe'
            * chi ha chiesto il trasferimento. */
-          if (_n <= 200)
+          if (_n <= 100000)
               fprintf(stderr, "            ritorno a 0x%05X  (r7=0x%08X r8=0x%08X r9=0x%08X)\n",
                       spu->gpr[0]._u32[0] & SPU_LS_MASK,
                       spu->gpr[7]._u32[0], spu->gpr[8]._u32[0], spu->gpr[9]._u32[0]);
           /* Il PPU aspetta un BIT dentro la parola trasferita: sapere che il
            * DMA e' partito non basta, serve il valore che porta. */
-          if (_n <= 200 && mfc_is_put(cmd)) {
+          if (_n <= 100000 && mfc_is_put(cmd)) {
               const unsigned char* _p = &spu->ls[lsa & SPU_LS_MASK];
               fprintf(stderr, "            dati: %02X%02X%02X%02X %02X%02X%02X%02X\n",
                       _p[0], _p[1], _p[2], _p[3], _p[4], _p[5], _p[6], _p[7]);

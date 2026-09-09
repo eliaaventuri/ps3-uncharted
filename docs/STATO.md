@@ -615,57 +615,37 @@ sblocca il PPU. E' esattamente il ciclo aperto gia' annotato nel runtime
 (`SPURS_EF_SPU_REPLY` in `spu_channels.c`): "il task guest dovrebbe porre il
 proprio flag SPU->PPU a fine ciclo, e non lo fa mai".
 
-#### Il vero inizio del guasto: la SPU smette di leggere la coda
+#### RETTIFICA: la SPU legge tutto, il tetto del log ingannava
 
-Guardando i trasferimenti su tutto il blocco di strutture
-(`SPU_DMA_EAWIN=0x2A870C00:0x2A871000`) si vede che la SPU **legge davvero** gli
-slot della coda: `img=1 pc=0x09900 GET ea=0x2A870D80..0x2A870EE0 size=0x20`, 12
-slot da 32 byte. Il consumatore funziona.
+Una prima lettura diceva che la SPU smetteva di leggere la coda duemila righe
+prima dello stallo. **Era falso**: la finestra `SPU_DMA_EAWIN` stampava al
+massimo 200 righe (`if (_n++ < 200)`), e quelle 200 finivano a meta' corsa. Il
+tetto e' stato alzato a 100.000 e la misura rifatta:
 
-Ma smette. L'ultimo pop e' alla riga 9211, e lo spin del PPU comincia solo alla
-11334 — duemila righe dopo. Da li' in poi il quadro e' questo, ripetuto:
+- **512 trasferimenti letti dalla coda, esattamente quanti i 512 push.**
+- L'ultimo pop e' alla riga 13616, lo spin del PPU comincia alla 14281: 665
+  righe dopo, non duemila prima.
 
-```
-[dma-eawin] img=1 pc=0x09900 GET ea=0x2A870E60      <- ULTIMO pop
-[spu-park]
-[cellSpurs] SendSignal(...) lr=0x0072EC00           <- il PPU accoda ancora
-[spu_workload] signal task 0                        <- la sveglia arriva
-[spu-park]                                          <- e non legge la coda
-[cellSpurs] SendSignal(...) lr=0x0072EC00
-[spu_workload] signal task 0
-[spu-park]
-...
-```
+Quindi **la SPU consuma tutto quello che le viene accodato, fino all'ultimo
+elemento**. Il consumatore funziona. Lezione: prima di concludere "X smette di
+fare Y" da un log, controllare che la stampa di X non sia tappata.
 
-**Il PPU continua ad accodare e a svegliare; la SPU si sveglia e non legge piu'
-niente.** Lo slot `0x2A870E60` e' `base + 7*32`, cioe' la posizione 7 — la
-stessa che la traccia della push riporta come ultima (`push pos=7
-slot=0x2A870E60`), e allo spin i puntatori sono `pop1 == push1 == 8`.
+E i puntatori dell'header lo confermano: a ogni push `[ea+0x00]` (pop) e
+`[ea+0x08]` (push) sono uguali, cioe' la SPU ha gia' consumato. Ne' Clear ne'
+una pop lato PPU vengono mai chiamate (misurato: zero e zero), quindi a muovere
+il puntatore di pop e' la SPU stessa, come dev'essere.
 
 #### Il prossimo passo
 
-Confrontare il puntatore di push che pubblica la nostra HLE con quello che la
-SPU legge davvero dalla struttura guest. Il sospetto e' un disallineamento fra
-i due dopo la posizione 7: il produttore crede di aver pubblicato, il
-consumatore vede la coda vuota e si riparcheggia. Da guardare:
-`lfq_complete_push_pointer` in `libs/sync/cellSyncLFQueue.c` e quale campo
-dell'header (`LFQ_PUSH1` a +0x08 o `LFQ_PUSH2` a +0x30) legge il codice SPU a
-`spu_func_00009DA0` (immagine 1), che e' l'helper del pop chiamato da
-`spu_func_000098F0` con ritorno a `0x9900`.
+Resta quello di prima, e ora e' l'unico: la SPU processa l'ultimo elemento e
+**non pone l'event flag a `0x2A870C80`** che sblocca il PPU. Zero chiamate a
+`cellSpursEventFlagSet`, zero scritture della SPU in quella struttura. Serve
+trovare, nel task SPU, dove dovrebbe porlo.
 
-Nota: il flag d'evento a `0x2A870C80` non viene posto **perche' il lavoro non
-viene mai processato**, non viceversa. La causa sta qui, un gradino piu' sotto. 
-
-### Cosa resta della FIFO
-
-Una corsa su cinque si ferma ancora. **Non è il task SPU fermo in
-`WAIT_SIGNAL`**: quel messaggio compare identico (16 volte, fino a 15 s) nelle
-corse buone e in quella bloccata, quindi è rumore preesistente e non la causa.
-Nella corsa bloccata il walker pubblica 138 fence per arrivare solo al 121 —
-cioè pubblica **fuori ordine** — e poi si ferma. Il prossimo passo è capire
-perché: il sospetto è che il recupero salti a `put`-8 quando il walker è
-indietro di più di un giro dell'anello, saltando i fence intermedi che il
-titolo aspetta per uguaglianza.
+Attenzione, due strumenti che **non** servono per questo, entrambi verificati:
+`SPU_PCWATCH` vede solo i blocchi raggiunti per trasferimento (le funzioni
+chiamate direttamente non ci passano), e `LBP_WS_DRAIN` fabbrica la ripresa e
+manda il task fuori strada.
 
 ## Sessione 18d — e ora non aspetta piu' nemmeno la RSX
 

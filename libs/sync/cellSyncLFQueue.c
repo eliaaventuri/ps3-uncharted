@@ -360,8 +360,19 @@ s32 cellSyncLFQueuePushSignal(CellSyncLFQueue* queue, const void* data,
     memcpy(vm_ptr8(slot), vm_ptr8(src), size);
 
     if (lfq_trace())
-        fprintf(stderr, "[cellSync] LFQueue 0x%08X push pos=%d slot=0x%08X size=%u\n",
-                ea, pos, slot, size);
+        /* I campi dell'header servono tutti: se il consumatore smette di
+         * leggere mentre il produttore continua a spingere, la differenza si
+         * vede qui e in nessun altro posto. */
+        fprintf(stderr, "[cellSync] LFQueue 0x%08X push pos=%d slot=0x%08X size=%u "
+                "| pop1=%u push1=%u h1=%u h4=%u h5=%u h6=0x%04X pack=0x%04X\n",
+                ea, pos, slot, size,
+                (unsigned)(u16)vm_read16(ea + LFQ_POP1),
+                (unsigned)(u16)vm_read16(ea + LFQ_PUSH1),
+                (unsigned)(u16)vm_read16(ea + LFQ_H1),
+                (unsigned)(u16)vm_read16(ea + LFQ_H4),
+                (unsigned)(u16)vm_read16(ea + LFQ_H5),
+                (unsigned)(u16)vm_read16(ea + LFQ_H6),
+                (unsigned)(u16)vm_read16(ea + LFQ_PUSH2));
 
     return lfq_complete_push_pointer(ea, pos, send);
 }
@@ -459,6 +470,9 @@ static s32 lfq_complete_pop_pointer(u32 ea, s32 pointer,
         vm_write16(ea + LFQ_POP2, newpack);
 
         if (var6 != LFQ_NO_SIGNAL) {
+            { static int _n = 0; if (_n++ < 20)
+                fprintf(stderr, "[cellSync] pop lato PPU sulla coda 0x%08X -> h1=%u\n",
+                        ea, (unsigned)var3); }
             vm_write16(ea + LFQ_H1, (u16)var3);
             vm_write16(ea + LFQ_H2, (u16)var5);
             u32 sigea = (u32)vm_read64(ea + LFQ_EASIGNAL);
@@ -582,6 +596,11 @@ s32 cellSyncLFQueueClear(CellSyncLFQueue* queue)
         return CELL_SYNC_ERROR_BUSY;
     }
 
+    /* Questa porta il puntatore di pop su quello di push: se viene chiamata
+     * mentre ci sono elementi non consumati, li butta via. */
+    { static int _n = 0; if (_n++ < 40 || (_n % 200) == 0)
+        fprintf(stderr, "[cellSync] Clear#%d coda 0x%08X: h1 %u -> %u\n",
+                _n, ea, (unsigned)h1, (unsigned)h5); }
     vm_write16(ea + LFQ_H1, h5);
     vm_write16(ea + LFQ_H2, h6);
     vm_write16(ea + LFQ_H3, h7);
