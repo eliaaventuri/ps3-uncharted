@@ -1801,6 +1801,13 @@ s32 cellSpursEventFlagWait(CellSpursEventFlag* eventFlag, u16* bits,
 
     u16 pattern = vm_read16(bits_ea);
 
+    /* L'indirizzo del flag serve per andare a vedere se la SPU ci scrive mai:
+     * il PPU aspetta qui e nessuno chiama mai cellSpursEventFlagSet. */
+    { static int _n = 0; if (_n++ < 8)
+        fprintf(stderr, "[cellSpurs] EventFlagWait#%d flagEA=0x%08X pattern=0x%04X "
+                "events=0x%04X\n", _n, ea, (unsigned)pattern,
+                vm_read16(ea + EF_EVENTS)); }
+
     ef_lock(sync);
 
     /* Block until the requested bit pattern is satisfied in the GUEST struct

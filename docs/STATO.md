@@ -585,11 +585,43 @@ e' cosi', il lavoro residuo di N non e' nella coda (che allo stallo e' vuota,
 rimettere in esecuzione il task senza fabbricarne la ripresa — cosa che
 `LBP_WS_DRAIN` fa male, come misurato sopra.
 
+#### LA CAUSA: un event flag che nessuno pone
+
+Il PPU non aspetta la parola a `0x20000000`: aspetta un **event flag SPURS**.
+L'ultimo import prima dello spin e' `cellSpursEventFlagWait`, e la nostra
+implementazione stampa su chi aspetta:
+
+```
+[cellSpurs] EventFlagWait#1 flagEA=0x2A870C80 pattern=0x0001 events=0x0000
+```
+
+Aspetta il bit 0 del flag a `0x2A870C80` — che sta 0x80 byte prima della coda
+lock-free (`0x2A870D00`), cioe' nello stesso blocco di strutture.
+
+Due misure, entrambe a zero:
+
+- **`cellSpursEventFlagSet` non viene chiamata mai.** La funzione stampa a ogni
+  chiamata (prime 40, poi una ogni 1000) e nel log non compare nemmeno una volta.
+- **La SPU non scrive mai in quella struttura.** Con
+  `SPU_DMA_EAWIN=0x2A870C80:0x2A870D00`: zero trasferimenti.
+
+E non e' un problema di risveglio della nostra HLE: `cellSpursEventFlagWait` e'
+a polling e **rilegge la struttura guest** a ogni giro, quindi anche una
+scrittura diretta della SPU la vedrebbe. Semplicemente non c'e'.
+
+Quindi: la SPU fa il lavoro (57 completamenti scritti a `0x20000000` per corsa,
+cicli da 3-8 ms), ma **non arriva mai al codice che pone l'event flag** che
+sblocca il PPU. E' esattamente il ciclo aperto gia' annotato nel runtime
+(`SPURS_EF_SPU_REPLY` in `spu_channels.c`): "il task guest dovrebbe porre il
+proprio flag SPU->PPU a fine ciclo, e non lo fa mai".
+
 #### Il prossimo passo
 
-Capire cosa fa la SPU nei 4 ms dell'ultimo ciclo: quale ramo prende a
-`0x48C8` e perche' `stack+0xC0` non e' zero. Serve una traccia dei blocchi
-eseguiti dal task fra la sveglia e il parcheggio, limitata all'ultimo ciclo. 
+Trovare, nel task SPU, il punto in cui dovrebbe porre il flag a `0x2A870C80`, e
+perche' non ci arriva. Attenzione: `SPU_PCWATCH` **non serve** per questo (vede
+solo i blocchi raggiunti per trasferimento, non quelli chiamati direttamente —
+limite misurato). Serve un aggancio diverso, per esempio sul canale MFC quando
+l'indirizzo di destinazione cade nel blocco `0x2A870C00`-`0x2A871000`. 
 
 ### Cosa resta della FIFO
 
