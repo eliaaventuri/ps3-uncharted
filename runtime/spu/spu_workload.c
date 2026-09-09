@@ -878,7 +878,7 @@ void spu_taskset_signal_task(uint32_t taskset_ea, uint32_t taskId)
     pthread_cond_broadcast(&s_sig_cv);
     pthread_mutex_unlock(&s_sig_lock);
 #endif
-    { static int _n = 0; if (_n++ < 24)
+    { static int _n = 0; if (_n++ < 100000)
         fprintf(stderr, "[spu_workload] signal task %u (taskset 0x%08X)\n",
                 taskId, taskset_ea); fflush(stderr); }
 }

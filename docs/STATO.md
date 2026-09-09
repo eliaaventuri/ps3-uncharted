@@ -445,6 +445,68 @@ GPU) il titolo si ferma **in un punto diverso** — `HOTREAD8 spinning on
 0x0FEFCB30 val=0x05 guest-fn=0x001AD590`. Il punto d'arresto non è unico, e
 misurarlo con la macchina occupata porta fuori strada.
 
+#### La catena di un fotogramma, e dove si spezza
+
+Misurato su una corsa da 150 s (`/tmp/stallo.log`, 127.133 righe). Il ciclo
+normale, sempre uguale, è:
+
+```
+[cellKb] SetReadMode / SetCodeType            inizio fotogramma
+[WWATCH] 0x20000000 = 0   (func_00566980)     arma il flag
+[WWATCH] 0x20000000 = 0   (func_00566350)     arma il flag (secondo)
+[evt] port_send(port=1) -> queue id=1
+[evt] q=1 receive RETURNED to tid=2           il Job Manager riceve
+[evt] port_send(port=2) -> queue id=2
+[spurs-pm] poll #1 (r3=0x1) -> continue       gira il policy module
+[dma-eawin] img=2 pc=0x06120 PUT ea=0x20000000  dati: 00000001   la SPU finisce
+```
+
+L'ultimo giro è identico **fino a `port_send(port=2)` compreso**, e poi non
+succede più niente: il policy module non gira (ultimo `poll` alla riga 12979,
+ultimo `port_send` alla 13004) e il completamento non arriva mai.
+
+I numeri:
+
+- lavori armati 114, completati 57 — esattamente due armamenti per lavoro;
+  l'ultimo armamento (riga 12999) è **dopo** l'ultimo completamento (12980).
+- **Dopo la riga 13000 la SPU non fa assolutamente più nulla**: zero occorrenze
+  di `spu-park`, `WAIT_SIGNAL#`, `SendSignal`, `wws-cmd`, `spu-ovl`,
+  `spu-assert`, `mfc-list`, `dma-eawin`, `cellSpurs`.
+- Il thread `tid=2` (Job Manager Event Handler) finisce fermo in
+  `event_queue_receive(q=1)` da `lr=0x0073E800`, con la coda **vuota**
+  (`qcount now 0` in tutte e 56 le ricezioni).
+- La coda 2 non la riceve **nessuno**: 56 invii, 0 ricezioni. È così da sempre,
+  anche nei giri che funzionano, quindi non è lei il motore.
+
+#### Non è un risveglio perso
+
+Alzando i tetti delle stampe (`spu-park` era tappato a 400, `signal task` a 24)
+si vede che segnali e parcheggi si **alternano uno a uno**: 321 segnali, 322
+parcheggi. Il task viene svegliato, lavora, si riparcheggia; l'ultima volta
+nessuno lo sveglia più. Le sveglie arrivano dalla nostra HLE di
+`_cellSpursLFQueuePushBody`, cioè dal PPU — che a quel punto sta già aspettando.
+
+È uno stallo simmetrico: **il PPU non accoda più finché il lavoro non finisce,
+la SPU non fa niente finché non le si accoda qualcosa.**
+
+#### Ipotesi respinta: `LBP_WS_DRAIN`
+
+Nel runtime c'è un interruttore diagnostico che, dopo N secondi senza segnale,
+fa tornare il task come se il kernel l'avesse ripreso "senza lavoro pendente".
+Provato con `LBP_WS_DRAIN=2`: **peggiora**. Il task riprende con lo stato non
+pronto e va fuori strada — `[mfc] REJECTED malformed transfer: ea=0x111DFE01`
+ripetuto, poi `[spu-depth] lifted call recursion, halting the SPU` a profondità
+2000. La corsa si ferma prima di quella senza (8 lavori armati contro 114).
+Fabbricare la ripresa non è la strada.
+
+#### Il prossimo passo
+
+Il PPU arma il flag e poi aspetta, **senza accodare il lavoro**. Serve sapere
+che cosa fa fra le due scritture di azzeramento e l'inizio dello spin: quale
+chiamata avrebbe dovuto mandare il lavoro alla SPU e non l'ha fatto. Si traccia
+con una watch sulle funzioni guest chiamate da `func_005324E8` fra
+`func_00566980` e l'ingresso in `func_00566108`.
+
 ### Cosa resta della FIFO
 
 Una corsa su cinque si ferma ancora. **Non è il task SPU fermo in
