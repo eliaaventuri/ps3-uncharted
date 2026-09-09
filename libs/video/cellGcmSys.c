@@ -408,6 +408,12 @@ s32 cellGcmInit(u32 cmdSize, u32 ioSize, u32 ioAddress)
     vm_write32(GCM_CONTROL_GUEST_ADDR + 0, 0);
     vm_write32(GCM_CONTROL_GUEST_ADDR + 4, 0);
     vm_write32(GCM_CONTROL_GUEST_ADDR + 8, 0);
+    { extern uint32_t g_gcm_put_watch_addr;
+      static int on = -1;
+      if (on < 0) { const char* e = getenv("GCM_DRAIN_ON_PUT"); on = (e && *e && *e != '0') ? 1 : 0; }
+      if (on) { g_gcm_put_watch_addr = GCM_CONTROL_GUEST_ADDR + 0;
+                fprintf(stderr, "[cellGcmSys] drain sincrono su `put` armato a 0x%08X\n",
+                        g_gcm_put_watch_addr); } }
 
     s_gcm_initialized = 1;
     return CELL_OK;
@@ -1023,7 +1029,7 @@ static void gcm_fifo_bad_branch(const char* kind, u32 target, u32 word)
  * the wrong count is in here. */
 /* Last words the walker actually consumed, so a bad branch can show the decode
  * chain that led there rather than raw memory around it. */
-#define GCM_TRACE_N 64
+#define GCM_TRACE_N 1024
 static u32 s_tr_off[GCM_TRACE_N], s_tr_w[GCM_TRACE_N];
 static u32 s_tr_i = 0;
 /* Quando il rilevatore di ciclo scatta, stampa i passi SUCCESSIVI cosi' come
@@ -1244,11 +1250,56 @@ void cellGcm_ref_on_poll(void)
         SetEvent(s_gcm_kick_ev);       /* dry: ask the present thread to walk */
 }
 
+static int s_in_put_hook = 0;
+/* Ultimo JUMP preso: da li' comincia il segmento in cui si sta camminando. */
+static u32 s_last_jump_tgt = 0;
+
 void cellGcm_rsx_process_fifo(void)
 {
+    /* GCM_DRAIN_ONLY_PUT=1: nessun drain a timer. La RSX vera avanza solo
+     * quando `put` si muove; un drain a orologio puo' entrare in un segmento
+     * che il titolo sta ancora riempiendo, camminare oltre il JUMP di coda del
+     * giro precedente (nel frattempo sovrascritto) e restare senza uscita. */
+    { static int only = -1;
+      if (only < 0) { const char* e = getenv("GCM_DRAIN_ONLY_PUT"); only = (e && *e && *e != '0') ? 1 : 0; }
+      if (only && !s_in_put_hook) return; }
     AcquireSRWLockExclusive(&s_gcm_fifo_lock);
     gcm_rsx_process_fifo_unlocked();
     ReleaseSRWLockExclusive(&s_gcm_fifo_lock);
+}
+
+/* Drain SINCRONO alla scrittura di `put`.
+ *
+ * La RSX vera comincia a consumare nell'istante in cui `put` si muove. Noi
+ * drenavamo su un timer (~4 ms), e in quella finestra il titolo -- che dopo
+ * aver mosso `put` riempie SUBITO il segmento successivo, legittimamente,
+ * perche' sul ferro la RSX quel segmento l'ha gia' lasciato -- sovrascriveva
+ * il segmento in cui il walker stava ancora camminando, JUMP di coda compreso.
+ * Da li' il walker non ha piu' un'uscita, `ref` si ferma un fence prima di
+ * quello atteso, e il titolo aspetta per sempre ("Rendering is stuck on
+ * reference value N").
+ *
+ * ppu_loader chiama questa alla scrittura di 0x...2000 (il registro `put`).
+ * La guardia di rientranza serve perche' il walker stesso scrive in memoria
+ * guest (i fence), e quelle scritture ripassano dallo stesso hook. */
+uint32_t g_gcm_put_watch_addr = 0;
+
+void cellGcm_on_put_write(void)
+{
+    static int in = 0;
+    if (in) return;
+    in = 1;
+    s_in_put_hook = 1;
+    cellGcm_rsx_process_fifo();
+    { u32 put_now = vm_read32(GCM_CONTROL_GUEST_ADDR + 0);
+      if (s_fifo_getoff != put_now) {
+          static unsigned n = 0;
+          if (n++ < 12)
+              fprintf(stderr, "[putdrain] NON arrivato a put: get=%08X put=%08X ref=%u\n",
+                      s_fifo_getoff, put_now, vm_read32(GCM_CONTROL_GUEST_ADDR + 8));
+      } }
+    s_in_put_hook = 0;
+    in = 0;
 }
 
 static void gcm_rsx_process_fifo_unlocked(void)
@@ -1319,6 +1370,9 @@ static void gcm_rsx_process_fifo_unlocked(void)
         fprintf(stderr, "[SCANREF] %u SET_REFERENCE in 0..%08X\n", found, put);
       } }
     int budget = 0x100000;                    /* words per tick cap */
+    /* Da dove e' partita QUESTA passata: dopo un park la passata seguente
+     * riparte da dentro il segmento e non vede piu' l'uscita. */
+    u32 pass_start = s_fifo_getoff;
     while (s_fifo_getoff != put && budget-- > 0) {
         u32 ea = gcm_io2ea(s_fifo_getoff);
         if (!ea) {
@@ -1362,12 +1416,81 @@ static void gcm_rsx_process_fifo_unlocked(void)
                 z++; probe_io += 4;
             }
             if (z >= 4) {
+                /* Segmento tagliato sotto i piedi.
+                 *
+                 * Misurato (GCM_SEQ): il titolo chiude il segmento con un JUMP
+                 * "provvisorio" verso lo slot successivo, scrive il fence nello
+                 * slot, e POI accoda altri comandi PARTENDO DA QUEL JUMP -- che
+                 * quindi sparisce -- e solo dopo muove `put`. Quando la passata
+                 * entra nel segmento (cosa che puo' fare solo quando `put` si e'
+                 * mosso, come la RSX vera) l'uscita non c'e' piu': si cammina
+                 * fino alla testa di scrittura e si resta li' per sempre. Il
+                 * titolo aspetta il fence che ha appena accodato e non lo vede
+                 * mai: "Rendering is stuck on reference value N".
+                 *
+                 * Quel fence pero' sappiamo esattamente dov'e': l'anello e' fatto
+                 * di [SET_REFERENCE][valore][JUMP -> segmento] e `put` viene
+                 * sempre posato subito dopo il valore. Se a `put`-8 c'e' davvero
+                 * un'intestazione SET_REFERENCE, il JUMP di coda mancante puntava
+                 * li': ci si rimette in pari da quel punto. Si perdono i comandi
+                 * del segmento oltre il punto in cui ci si e' arenati -- ma sono
+                 * gia' irraggiungibili, ed e' esattamente cio' che la RSX vera
+                 * avrebbe gia' consumato prima che il titolo li sovrascrivesse.
+                 *
+                 * Una volta per valore di `put`: se non basta, il problema e'
+                 * un altro e ripetere maschererebbe la diagnosi. */
+                { static int fix = -1;
+                  if (fix < 0) { const char* e = getenv("GCM_STRAND_FIX"); fix = (e && *e == '0') ? 0 : 1; }
+                  if (fix && put >= 8 && s_fifo_getoff != put) {
+                      u32 fe = gcm_io2ea(put - 8);
+                      u32 fw = fe ? vm_read32(fe) : 0;
+                      if (fe && (fw >> 29) == 0 && (fw & 0x1FFCu) == 0x0050u) {
+                          static u32 last_put = 0xFFFFFFFFu;
+                          if (put != last_put) {
+                              last_put = put;
+                              fprintf(stderr, "[cellGcmSys] segmento senza uscita a 0x%08X: "
+                                      "riprendo dal SET_REFERENCE a 0x%08X (put=0x%08X)\n",
+                                      s_fifo_getoff, put - 8, put);
+                              s_fifo_getoff = put - 8;
+                              continue;
+                          }
+                      }
+                  } }
                 static int _n = 0; static u32 _last = 0xFFFFFFFFu;
                 if (s_fifo_getoff != _last && _n++ < 8) {
                     _last = s_fifo_getoff;
-                    fprintf(stderr, "[cellGcmSys] FIFO: zeri a 0x%08X (put=0x%08X)"
-                            " -- buffer non ancora scritto, la passata si ferma qui\n",
-                            s_fifo_getoff, put);
+                    fprintf(stderr, "[cellGcmSys] FIFO: zeri a 0x%08X (put=0x%08X, passata partita "
+                            "da 0x%08X) -- buffer non ancora scritto, la passata "
+                            "si ferma qui\n",
+                            s_fifo_getoff, put, pass_start);
+                    /* Il titolo tiene un anello di 4 slot da 4 KB: ogni slot e'
+                     * [SET_REFERENCE fence][JUMP -> segmento], e il segmento
+                     * torna nello slot successivo. Quando la passata si ferma
+                     * serve sapere a che punto e' il protocollo: quale fence c'e'
+                     * in ogni slot, quale abbiamo pubblicato, e dove punta il
+                     * JUMP di uscita di ciascuno slot. */
+                    /* Cosa ha CONSUMATO il walker per arrivare qui: se al posto
+                     * del JUMP di coda ha letto un comando, quel comando c'era
+                     * gia' quando ci e' passato -- e allora il JUMP e' stato
+                     * sovrascritto prima, non dopo. */
+                    gcm_fifo_dump_chain();
+                    if (s_last_jump_tgt) {
+                        fprintf(stderr, "   [inizio segmento 0x%08X]\n", s_last_jump_tgt);
+                        for (u32 o = s_last_jump_tgt; o < s_last_jump_tgt + 0x80; o += 4) {
+                            u32 e = gcm_io2ea(o); if (!e) continue;
+                            u32 w2 = vm_read32(e);
+                            fprintf(stderr, "   io=%08X w=%08X  type=%u method=0x%04X count=%u\n",
+                                    o, w2, w2 >> 29, w2 & 0x1FFCu, (w2 >> 18) & 0x7FFu);
+                        }
+                    }
+                    { fprintf(stderr, "   [slot] ref pubblicato=%u  put=%08X\n",
+                              vm_read32(GCM_CONTROL_GUEST_ADDR + 8), put);
+                      for (u32 sl = 0x10000; sl < 0x14000; sl += 0x1000) {
+                          u32 e0 = gcm_io2ea(sl), e1 = gcm_io2ea(sl + 4), e2 = gcm_io2ea(sl + 8);
+                          fprintf(stderr, "   [slot] io=%08X hdr=%08X fence=%u jump=%08X\n",
+                                  sl, e0 ? vm_read32(e0) : 0, e1 ? vm_read32(e1) : 0,
+                                  e2 ? vm_read32(e2) : 0);
+                      } }
                     /* Le parole intorno al punto in cui ci si ferma: dicono se
                      * il JUMP di coda del segmento manca davvero o se il
                      * walker e' semplicemente disallineato (un conteggio
@@ -1482,6 +1605,7 @@ static void gcm_rsx_process_fifo_unlocked(void)
                                               gcm_fifo_resync_why("jump-park", &s_fifo_getoff, put); }
                   break;
               }
+              s_last_jump_tgt = tgt;
               s_fifo_getoff = tgt; }
             continue;
         }

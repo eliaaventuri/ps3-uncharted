@@ -1,0 +1,1 @@
+/Users/elia/local-ai-worker/scripts/run_worker.sh

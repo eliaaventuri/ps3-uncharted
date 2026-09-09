@@ -47,3 +47,36 @@ La CI completa che facciamo girare in locale è `.github/workflows/macos.yml`:
 - `upstream` = sp00nznet/ps3recomp. Risincronizzarsi periodicamente: il progetto
   committa spesso e i nostri file si sporcano in fretta.
 - Il nostro lavoro sta sul branch `macos`.
+
+
+## Politica di Delega Aggressiva ("Delegation-First" per Massimo Risparmio Token)
+
+Il ruolo di Opus è di **Senior Architect / Orchestratore**: i tuoi token devono essere preservati esclusivamente per la visione strategica, l'architettura e le decisioni semantiche.
+È **vietato sprecare token di Opus** in attività che i worker subordinati possono svolgere:
+* NON fare grep estese o ricerche massive attraverso l'intero albero del repository.
+* NON leggere per intero file di log lunghi, dump di memoria o trace Metal.
+* NON fare cicli iterativi di compilazione per tentativi ed errori nel contesto di Opus.
+* NON eseguire test o verifiche ripetitive se delegabili.
+
+### Matrice di Delega (Chi fa cosa)
+
+1. **Gemini 3.6 Flash (`./run_worker.sh --gemini tasks/TASK.md`)** [Cloud Ultra-Veloce]:
+   - Esplorazione codice, grep su larga scala, ricerca pattern in guest/host.
+   - Analisi di grandi log di errore, crash dump, disassemblati e trace.
+   - Mappatura preliminare di funzioni e dipendenze.
+
+2. **Qwen 32B Locale (`./run_worker.sh --local tasks/TASK.md`)** [Offline Costo Zero]:
+   - Cicli continui di compilazione `cmake --build build`.
+   - Modifiche chirurgiche a stub, header o funzioni circoscritte.
+   - Esecuzione continua di `.venv/bin/python tools/check_ppu_scaffold.py` fino al verde.
+   - Ogni operazione ripetitiva che altrimenti consumerebbe token o chiamate API.
+
+### Flusso Operativo Obbligatorio
+
+1. **Definisci l'obiettivo**: Scrivi un task circoscritto in `tasks/TASK.md` (ispirandoti a `tasks/TASK_TEMPLATE.md`).
+2. **Delega l'esecuzione**: Lancia `./run_worker.sh --gemini` o `./run_worker.sh --local`.
+   *(Il worker crea in automatico un checkpoint Git di sicurezza e opera in modo reversibile).*
+3. **Leggi solo il responso sintetico**: Leggi **esclusivamente** `tasks/RESULT.md`.
+   - Se `SUCCESS`: accetta il lavoro e passa all'obiettivo successivo.
+   - Se `REGRESSION`: il worker ha già lo stato precedente ripristinato; correggi l'ipotesi e riprova.
+   - Se `NEEDS_OPUS_DECISION`: intervieni per sbloccare la decisione di alto livello.

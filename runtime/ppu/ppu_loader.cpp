@@ -682,7 +682,37 @@ uint16_t vm_read16(uint64_t a) { if (vm_oob((uint32_t)a,2)) return 0; vm_hotmap(
     { static PPU_THREAD_LOCAL uint32_t last=0xFFFFFFFFu; static PPU_THREAD_LOCAL uint32_t n=0;
       if ((uint32_t)a==last) { if (++n==200000) { fprintf(stderr, "[HOTREAD16] spinning on 0x%08X\n", (uint32_t)a); n=0; } } else { last=(uint32_t)a; n=0; } }
     return __builtin_bswap16(v); }
+/* Identificatore compatto del thread host: serve solo a distinguere chi scrive
+ * cosa nella traccia GCM_SEQ. */
+static unsigned seq_tid(void)
+{
+    static _Thread_local unsigned id = 0;
+    static unsigned next = 1;
+    if (!id) id = __atomic_fetch_add(&next, 1u, __ATOMIC_RELAXED);
+    return id;
+}
+
+extern "C" uint32_t g_gcm_put_watch_addr;
+
 uint32_t vm_read32(uint64_t a) { if (vm_oob((uint32_t)a,4)) return 0;
+    /* GCM_SEQ: la lettura del registro `ref` e' il punto in cui il titolo
+     * comincia ad aspettare un fence. Va nello stesso flusso delle scritture,
+     * perche' la domanda e' se aspetta PRIMA o DOPO aver riscritto il segmento. */
+    { static int seq = -1;
+      if (seq < 0) { const char* e = getenv("GCM_SEQ"); seq = (e && *e && *e != '0') ? 1 : 0; }
+      if (seq && g_gcm_put_watch_addr && (uint32_t)a >= g_gcm_put_watch_addr && (uint32_t)a < g_gcm_put_watch_addr + 0x10) {
+          static uint32_t last_val = 0xFFFFFFFFu; static unsigned spins = 0; static int n = 0;
+          uint32_t cur; memcpy(&cur, vm_base + (uint32_t)a, 4);
+          cur = __builtin_bswap32(cur);
+          if (cur != last_val) { last_val = cur; spins = 0;
+              if (n++ < 400)
+                  fprintf(stderr, "[SEQ] LEGGE ctrl+%u (=%u)  fn=0x%08X t%u\n",
+                          (unsigned)((uint32_t)a - g_gcm_put_watch_addr), cur,
+                          ppu_prof_resolve_host(__builtin_return_address(0)), seq_tid());
+          } else if (++spins % 200000u == 0u && n++ < 400) {
+              fprintf(stderr, "[SEQ] ASPETTA ctrl+%u fermo a %u da %u letture\n",
+                      (unsigned)((uint32_t)a - g_gcm_put_watch_addr), cur, spins);
+          } } }
     /* RD_FORCE_ADDR=<hex>: force reads of one address to RD_FORCE_VAL (default 0)
      * -- diagnostic to break a completion spin and see whether the game proceeds.
      * (From eeff394; dropped by the runtime/spu consolidation, restored here.) */
@@ -828,6 +858,14 @@ uint32_t vm_read32(uint64_t a) { if (vm_oob((uint32_t)a,4)) return 0;
       else { last=(uint32_t)a; n=0; } }
     return __builtin_bswap32(v); }
 uint64_t vm_read64(uint64_t a) { if (vm_oob((uint32_t)a,8)) return 0; vm_hotmap((uint32_t)a,8); uint64_t v; memcpy(&v, vm_base + (uint32_t)a, 8);
+    { static int seq = -1;
+      if (seq < 0) { const char* e = getenv("GCM_SEQ"); seq = (e && *e && *e != '0') ? 1 : 0; }
+      if (seq && g_gcm_put_watch_addr && (uint32_t)a >= g_gcm_put_watch_addr && (uint32_t)a < g_gcm_put_watch_addr + 0x10) {
+          static uint32_t last_fn = 0; static int n = 0;
+          uint32_t fn = ppu_prof_resolve_host(__builtin_return_address(0));
+          if (fn != last_fn && n++ < 400) { last_fn = fn;
+              fprintf(stderr, "[SEQ] LEGGE64 ctrl+%u  fn=0x%08X\n",
+                      (unsigned)((uint32_t)a - g_gcm_put_watch_addr), fn); } } }
 #ifdef VM_SAMPLE_READS
     { static uint64_t c=0; if ((++c % 2000000ull)==0) fprintf(stderr, "[sample] read64 0x%08X\n", (uint32_t)a); }
 #endif
@@ -988,6 +1026,15 @@ static inline void barrier_watch_hit(uint32_t a, uint32_t v, int width, void* ra
                     a - b, v, width, ppu_prof_resolve_host(ra));
     }
 }
+/* Finestra della watch: 0x40 byte bastano per una struttura, non per un
+ * pezzo di command buffer. YDKJ_WWATCH_LEN la allarga. */
+static uint32_t ydkj_wwatch_len(void)
+{
+    static int32_t n = -1;
+    if (n < 0) { const char* e = getenv("YDKJ_WWATCH_LEN"); n = (e && *e) ? (int32_t)strtoul(e,0,0) : 0x40; }
+    return (uint32_t)n;
+}
+
 void vm_write8 (uint64_t a, uint8_t  v) { barrier_watch_hit((uint32_t)a, v, 1, __builtin_return_address(0)); if (vm_oob((uint32_t)a,1)) return;
 #ifdef _WIN32
     /* FLOW_TRUNC=<hex>: catch the byte-write that clobbers the word currently
@@ -1040,9 +1087,12 @@ void vm_write8 (uint64_t a, uint8_t  v) { barrier_watch_hit((uint32_t)a, v, 1, _
     vm_base[(uint32_t)a] = v; }
 void vm_write16(uint64_t a, uint16_t v) { barrier_watch_hit((uint32_t)a, v, 2, __builtin_return_address(0)); if (vm_oob((uint32_t)a,2)) return;
     { static int64_t w=-2; if (w==-2) { const char* e=getenv("YDKJ_WWATCH"); w = e?(int64_t)strtoul(e,0,0):-1; }
-      if (w>=0) { uint32_t ea=(uint32_t)a; if (ea>=(uint32_t)w && ea<(uint32_t)w+0x40)
+      if (w>=0) { uint32_t ea=(uint32_t)a; if (ea>=(uint32_t)w && ea<(uint32_t)w+ydkj_wwatch_len())
         fprintf(stderr,"[WWATCH] write16 0x%08X = 0x%04X  ra=%p\n", ea, v, __builtin_return_address(0)); } }
     v = __builtin_bswap16(v); memcpy(vm_base + (uint32_t)a, &v, 2); }
+extern "C" uint32_t g_gcm_put_watch_addr;
+extern "C" void cellGcm_on_put_write(void);
+
 void vm_write32(uint64_t a, uint32_t v) { barrier_watch_hit((uint32_t)a, v, 4, __builtin_return_address(0)); if (vm_oob((uint32_t)a,4)) return;
 #ifdef _WIN32
     /* PT restore: a full-word store of a valid pointer (high byte set) to a
@@ -1050,7 +1100,7 @@ void vm_write32(uint64_t a, uint32_t v) { barrier_watch_hit((uint32_t)a, v, 4, _
     if (g_pt_val>=0 && (v>>24)!=0) pt_restore((uint32_t)a);
 #endif
     { static int64_t w=-2; if (w==-2) { const char* e=getenv("YDKJ_WWATCH"); w = e?(int64_t)strtoul(e,0,0):-1; }
-      if (w>=0) { uint32_t ea=(uint32_t)a; if (ea>=(uint32_t)w && ea<(uint32_t)w+0x40) {
+      if (w>=0) { uint32_t ea=(uint32_t)a; if (ea>=(uint32_t)w && ea<(uint32_t)w+ydkj_wwatch_len()) {
 #ifdef _WIN32
         /* Full host backtrace, not just ra: lifted `bl` is a plain C call, so the
          * host stack walks through every lifted caller INCLUDING vtable dispatch
@@ -1089,7 +1139,7 @@ void vm_write32(uint64_t a, uint32_t v) { barrier_watch_hit((uint32_t)a, v, 4, _
     { static int64_t lo=-2, hi=0; if (lo==-2) { const char* e=getenv("YDKJ_VWATCH");
         if (e && *e) { lo=(int64_t)strtoul(e,0,0); const char* c=strchr(e,':'); hi=c?(int64_t)strtoul(c+1,0,0):lo+1; }
         else lo=-1; }
-      if (lo>=0 && v>=(uint32_t)lo && v<(uint32_t)hi) { static int _vn=0; if (_vn++<200) {
+      if (lo>=0 && v>=(uint32_t)lo && v<(uint32_t)hi) { static int _vn=0; if (_vn++<200000) {
         void* ra = __builtin_return_address(0);
         fprintf(stderr,"[VWATCH] write32 [0x%08X] = 0x%08X  guest-fn=0x%08X\n",
                 (uint32_t)a, v, ppu_prof_resolve_host(ra)); } } }
@@ -1165,7 +1215,46 @@ void vm_write32(uint64_t a, uint32_t v) { barrier_watch_hit((uint32_t)a, v, 4, _
         for(int i=0;i<fr;i++) p+=snprintf(ln+p,sizeof(ln)-p," %llX",(unsigned long long)((char*)bt[i]-mb));
         fprintf(stderr,"%s\n",ln); } } }
 #endif
-    v = __builtin_bswap32(v); memcpy(vm_base + (uint32_t)a, &v, 4); }
+    v = __builtin_bswap32(v); memcpy(vm_base + (uint32_t)a, &v, 4);
+    /* La RSX vera comincia a consumare nell'istante in cui `put` si muove.
+     * Drenare su un timer lascia una finestra in cui il titolo riempie il
+     * segmento successivo mentre il walker e' ancora dentro il precedente --
+     * e gli porta via il JUMP di uscita. Vedi cellGcm_on_put_write. */
+    /* GCM_SEQ=1: l'ORDINE con cui il titolo compone un frame -- `put`, i fence
+     * negli slot dell'anello, i JUMP di coda dei segmenti -- in un unico flusso.
+     * Tre watch separate non bastano: la domanda e' quale scrittura viene prima. */
+    { static int seq = -1;
+      if (seq < 0) { const char* e = getenv("GCM_SEQ"); seq = (e && *e && *e != '0') ? 1 : 0; }
+      /* NB: a questo punto `v` e' gia' in big-endian (lo scambio avviene sopra),
+       * quindi va riletto in ordine host prima di confrontarlo. */
+      if (seq) { uint32_t ea = (uint32_t)a; uint32_t gv = __builtin_bswap32(v); static int n = 0;
+        /* Le scritture dell'emettitore sono decine di migliaia: si stampa
+         * l'INTERVALLO di ogni raffica, non ogni parola. Cosi' si vede se una
+         * raffica cade dopo il JUMP di coda -- cioe' se il titolo riscrive il
+         * segmento che la RSX deve ancora attraversare. */
+        static uint32_t run_lo = 0, run_hi = 0; static int run_open = 0;
+        int is_seg = (ea >= 0x21660000u && ea < 0x21A60000u);
+        if (is_seg) { if (!run_open) { run_open = 1; run_lo = run_hi = ea; }
+                      if (ea < run_lo) run_lo = ea; if (ea > run_hi) run_hi = ea; }
+        else if (run_open && ((g_gcm_put_watch_addr && ea == g_gcm_put_watch_addr) ||
+                              (ea >= 0x21010000u && ea < 0x21014000u))) {
+            run_open = 0;
+            if (n++ < 4000)
+                fprintf(stderr, "[SEQ] EMIT   [%08X .. %08X]  (%u byte) t%u\n",
+                        run_lo, run_hi, (unsigned)(run_hi - run_lo + 4), seq_tid());
+        }
+        if (n < 4000) {
+          if (g_gcm_put_watch_addr && ea == g_gcm_put_watch_addr) {
+              fprintf(stderr, "[SEQ] PUT      = %08X   t%u\n", gv, seq_tid()); n++;
+          } else if (ea >= 0x21010000u && ea < 0x21014000u) {
+              fprintf(stderr, "[SEQ] SLOT  [%08X] = %08X   fn=0x%08X t%u\n",
+                      ea, gv, ppu_prof_resolve_host(__builtin_return_address(0)), seq_tid()); n++;
+          } else if (ea >= 0x21660000u && ea < 0x21A60000u &&
+                     (gv >> 28) == 2u && (gv & 0x1FFFFFFCu) < 0x14000u) {
+              fprintf(stderr, "[SEQ] JUMP  [%08X] = %08X   fn=0x%08X t%u\n",
+                      ea, gv, ppu_prof_resolve_host(__builtin_return_address(0)), seq_tid()); n++;
+          } } } }
+    if (g_gcm_put_watch_addr && (uint32_t)a == g_gcm_put_watch_addr) cellGcm_on_put_write(); }
 void vm_write64(uint64_t a, uint64_t v) {
     /* A 64-bit std used to be invisible to LBP_WW / LBP_WV: only write8/16/32
      * fed the watch, so "nothing writes this field" was a routine false
@@ -1177,7 +1266,7 @@ void vm_write64(uint64_t a, uint64_t v) {
     barrier_watch_hit((uint32_t)a + 4, (uint32_t)v,         8, __builtin_return_address(0));
     if (vm_oob((uint32_t)a,8)) return;
     { static int64_t w=-2; if (w==-2) { const char* e=getenv("YDKJ_WWATCH"); w = e?(int64_t)strtoul(e,0,0):-1; }
-      if (w>=0) { uint32_t ea=(uint32_t)a; if (ea>=(uint32_t)w && ea<(uint32_t)w+0x40) {
+      if (w>=0) { uint32_t ea=(uint32_t)a; if (ea>=(uint32_t)w && ea<(uint32_t)w+ydkj_wwatch_len()) {
         void* ra=__builtin_return_address(0); char* mb=(char*)GetModuleHandleA(NULL);
         fprintf(stderr,"[WWATCH] write64 0x%08X = 0x%016llX  ra_rva=0x%llX guest-fn=0x%08X\n", ea, (unsigned long long)v, (unsigned long long)((char*)ra-mb), ppu_prof_resolve_host(ra)); } } }
     /* FLOW_WVAL (64-bit): catch a 64-bit store whose HIGH or LOW 32-bit half equals
