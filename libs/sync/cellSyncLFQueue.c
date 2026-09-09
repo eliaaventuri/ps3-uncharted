@@ -315,6 +315,29 @@ static s32 lfq_complete_push_pointer(u32 ea, s32 pointer,
     }
 }
 
+/* Ultima coda su cui si e' spinto: serve a fotografarne i puntatori quando il
+ * PPU si mette ad aspettare, per dire se un elemento e' rimasto dentro senza
+ * che il consumatore SPU lo prendesse. */
+static u32 s_lfq_ultima;
+
+void cellSync_lfq_dump_ultima(void)
+{
+    u32 ea = s_lfq_ultima;
+    if (!ea) { fprintf(stderr, "[cellSync] nessuna coda usata\n"); return; }
+    fprintf(stderr,
+            "[cellSync] coda 0x%08X  pop1=%u push1=%u  push2=%u pop2=%u  "
+            "hs1=%u  depth=%d size=%u\n",
+            ea,
+            (unsigned)(u16)vm_read16(ea + LFQ_POP1),
+            (unsigned)(u16)vm_read16(ea + LFQ_PUSH1),
+            (unsigned)(u16)vm_read16(ea + LFQ_PUSH2),
+            (unsigned)(u16)vm_read16(ea + LFQ_POP2),
+            (unsigned)(u16)vm_read16(ea + LFQ_HS1),
+            (int)vm_read32(ea + LFQ_DEPTH),
+            (unsigned)vm_read32(ea + LFQ_SIZE));
+    fflush(stderr);
+}
+
 s32 cellSyncLFQueuePushSignal(CellSyncLFQueue* queue, const void* data,
                               u32 isBlocking, CellSyncLFQueueSendSignal send)
 {
@@ -322,6 +345,8 @@ s32 cellSyncLFQueuePushSignal(CellSyncLFQueue* queue, const void* data,
     u32 src = EA_OF(data);
     if (!ea || !src) return CELL_SYNC_ERROR_NULL_POINTER;
     if ((ea & 127u) || (src & 15u)) return CELL_SYNC_ERROR_ALIGN;
+
+    s_lfq_ultima = ea;
 
     s32 pos = 0;
     s32 res = lfq_get_push_pointer(ea, &pos, isBlocking);

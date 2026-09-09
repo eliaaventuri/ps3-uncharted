@@ -499,13 +499,54 @@ ripetuto, poi `[spu-depth] lifted call recursion, halting the SPU` a profondità
 2000. La corsa si ferma prima di quella senza (8 lavori armati contro 114).
 Fabbricare la ripresa non è la strada.
 
+#### Il PPU il lavoro lo accoda eccome
+
+Un anello dei 96 import piu' recenti (`ppu_hle_dump_ring`, stampato una sola
+volta quando lo spin viene riconosciuto) dice esattamente cosa fa il PPU prima
+di fermarsi:
+
+```
+cellSpursEventFlagClear     lr=0x0009ED34
+_cellSpursLFQueuePushBody   lr=0x0072EC00
+cellSpursEventFlagWait      lr=0x0009F2A0
+```
+
+Azzera un event flag SPURS, **accoda il lavoro**, e aspetta quell'event flag.
+Quindi l'ipotesi precedente ("arma e aspetta senza accodare") e' sbagliata.
+
+E la push funziona davvero: con `PS3_LFQ_TRACE=1` si vedono 512 push per corsa,
+i dati copiati negli slot (`push pos=7 slot=0x2A870E60 size=32`) e la sveglia
+mandata al taskset (`sveglio arg=0 su eaSignal=0x2A86F380`).
+
+#### Il consumatore prende il lavoro e non lo finisce
+
+L'ordine alla fine e' inequivocabile:
+
+```
+SendSignal(taskset=0x2A86F380 id=0) lr=0x0072EC00     la push sveglia
+[spu_workload] signal task 0                          il segnale arriva
+[spu-park] img=1 pc=0x00A70 task=0                    il task si RIPARCHEGGIA
+```
+
+...e la fotografia della coda nell'istante dello spin dice che **la coda e'
+vuota**:
+
+```
+[cellSync] coda 0x2A870D00  pop1=8 push1=8  depth=12 size=32
+```
+
+`pop1 == push1`: tutto quello che e' stato spinto e' stato anche tolto. La SPU
+ha preso il lavoro e non l'ha portato a termine -- il completamento a
+`0x20000000` non arriva e l'event flag non viene mai posto.
+
 #### Il prossimo passo
 
-Il PPU arma il flag e poi aspetta, **senza accodare il lavoro**. Serve sapere
-che cosa fa fra le due scritture di azzeramento e l'inizio dello spin: quale
-chiamata avrebbe dovuto mandare il lavoro alla SPU e non l'ha fatto. Si traccia
-con una watch sulle funzioni guest chiamate da `func_005324E8` fra
-`func_00566980` e l'ingresso in `func_00566108`.
+Capire cosa succede **dentro** il job module fra "lavoro preso" e il DMA di
+completamento. L'indirizzo del DMA e' noto: `pc=0x06120` dentro
+`spu_jobs/lifted/jobmod_008cc900_8acfddb1519c/spu_recomp.c`, funzione
+`jobmod_008cc900_8acfddb1519c_spu_func_00006120` (riga 2593), che e' solo un
+"metti 16 byte all'indirizzo in r9". Serve il chiamante che imposta
+`r9=0x20000000` e la condizione che lo raggiunge.
 
 ### Cosa resta della FIFO
 

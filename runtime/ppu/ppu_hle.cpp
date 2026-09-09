@@ -162,6 +162,39 @@ static void ps3_hle_unresolved(uint32_t nid, ppu_context* ctx)
 
 extern "C" void ppu_prof_stamp(void* ctx, unsigned lr);
 extern "C" uint32_t ppu_prof_resolve_host(void* ra);
+/* Anello degli ultimi import chiamati.
+ *
+ * La domanda e' "che cosa fa il PPU fra l'armamento del flag e l'attesa, e
+ * quale chiamata avrebbe dovuto mandare il lavoro alla SPU". PS3_HLE_TRACE
+ * mostra le PRIME N chiamate del boot: qui servono le ULTIME prima dello
+ * stallo, e le si stampa quando lo spin viene riconosciuto. */
+#define HLE_RING_N 96
+static uint32_t g_hle_ring_nid[HLE_RING_N];
+static uint32_t g_hle_ring_lr[HLE_RING_N];
+static unsigned g_hle_ring_i = 0;
+
+static const char* hle_nome(uint32_t nid)
+{
+    if (!g_hle_inited) return "?";
+    for (uint32_t i = 0; i < g_hle_nids.count; i++)
+        if (g_hle_nids.entries[i].nid == nid)
+            return g_hle_nids.entries[i].name ? g_hle_nids.entries[i].name : "?";
+    return "(non registrato)";
+}
+
+extern "C" void ppu_hle_dump_ring(void)
+{
+    fprintf(stderr, "[hle-ring] ultimi import chiamati, dal piu' vecchio:\n");
+    for (unsigned k = 0; k < HLE_RING_N; k++) {
+        unsigned j = (g_hle_ring_i + k) % HLE_RING_N;
+        if (!g_hle_ring_nid[j]) continue;
+        fprintf(stderr, "[hle-ring]   nid=0x%08X  lr=0x%08X  %s\n",
+                g_hle_ring_nid[j], g_hle_ring_lr[j],
+                hle_nome(g_hle_ring_nid[j]));
+    }
+    fflush(stderr);
+}
+
 extern "C" void ps3_hle_call(uint32_t nid, ppu_context* ctx)
 {
     /* Preserve the caller TOC (r2) across the HLE call. ELFv1 makes r2 caller-saved
@@ -215,6 +248,10 @@ extern "C" void ps3_hle_call(uint32_t nid, ppu_context* ctx)
 
     /* Boot trace: log the first N HLE calls (PS3_HLE_TRACE=N). Invaluable for
      * new-SDK bring-up (e.g. PSL1GHT) where the failure is "nothing happens". */
+    { unsigned j = g_hle_ring_i % HLE_RING_N;
+      g_hle_ring_nid[j] = nid; g_hle_ring_lr[j] = (uint32_t)ctx->lr;
+      g_hle_ring_i = (g_hle_ring_i + 1) % HLE_RING_N; }
+
     static int s_trace = -2;
     if (s_trace == -2) { const char* e = getenv("PS3_HLE_TRACE"); s_trace = e ? atoi(e) : 0; }
     if (s_trace > 0) {

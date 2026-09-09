@@ -693,6 +693,8 @@ static unsigned seq_tid(void)
 }
 
 extern "C" uint32_t g_gcm_put_watch_addr;
+void ppu_hle_dump_ring(void);   /* ppu_hle.cpp: ultimi import chiamati */
+void cellSync_lfq_dump_ultima(void);  /* cellSyncLFQueue.c: puntatori della coda */
 
 uint32_t vm_read32(uint64_t a) { if (vm_oob((uint32_t)a,4)) return 0;
     /* GCM_SEQ: la lettura del registro `ref` e' il punto in cui il titolo
@@ -839,7 +841,14 @@ uint32_t vm_read32(uint64_t a) { if (vm_oob((uint32_t)a,4)) return 0;
               }
               fprintf(stderr, "[HOTREAD] GCM control spin: put=0x%08X get=0x%08X "
                       "ref=0x%08X (addr 0x%08X)\n", pu, ge, rf, (uint32_t)a);
-          } else fprintf(stderr, "[HOTREAD] spinning on 0x%08X (=0x%08X) guest cia=0x%08X lr=0x%08X\n", (uint32_t)a, __builtin_bswap32(v),
+          } else { /* Alla PRIMA volta che si riconosce uno spin, stampare gli
+                     * ultimi import chiamati dice che cosa il PPU ha fatto
+                     * prima di mettersi ad aspettare -- e quale chiamata
+                     * avrebbe dovuto mandare il lavoro e non c'e'. */
+                    { static int _once = 0;
+                      if (!_once) { _once = 1; ppu_hle_dump_ring();
+                                    cellSync_lfq_dump_ultima(); } }
+                    fprintf(stderr, "[HOTREAD] spinning on 0x%08X (=0x%08X) guest cia=0x%08X lr=0x%08X\n", (uint32_t)a, __builtin_bswap32(v),
           g_active_ctx?(uint32_t)g_active_ctx->cia:0, g_active_ctx?(uint32_t)g_active_ctx->lr:0); n=0;
 #ifdef _WIN32
         /* YDKJ_SPINBT=<addr>: one-shot host backtrace when the read32 hot spin
@@ -854,6 +863,7 @@ uint32_t vm_read32(uint64_t a) { if (vm_oob((uint32_t)a,4)) return 0;
             for(int i=0;i<fr;i++) p+=snprintf(line+p,sizeof(line)-p," %llX",(unsigned long long)((char*)bt[i]-mb));
             fprintf(stderr,"%s\n",line); fflush(stderr); } } }
 #endif
+          }
       } }
       else { last=(uint32_t)a; n=0; } }
     return __builtin_bswap32(v); }
