@@ -221,6 +221,14 @@ static inline int mfc_do_transfer(spu_context* spu, uint32_t lsa, uint64_t ea,
                       spu->image_id, (uint32_t)spu->pc & SPU_LS_MASK,
                       mfc_is_get(cmd) ? "GET" : mfc_is_put(cmd) ? "PUT" : "cmd",
                       lsa, (uint32_t)ea, size);
+          /* A 0x6120 (il "manda 16 byte") si arriva con un salto indiretto: il
+           * chiamante non si trova staticamente. Il registro di collegamento
+           * della SPU (gpr[0], slot preferito) e' l'indirizzo di ritorno, cioe'
+           * chi ha chiesto il trasferimento. */
+          if (_n <= 200)
+              fprintf(stderr, "            ritorno a 0x%05X  (r7=0x%08X r8=0x%08X r9=0x%08X)\n",
+                      spu->gpr[0]._u32[0] & SPU_LS_MASK,
+                      spu->gpr[7]._u32[0], spu->gpr[8]._u32[0], spu->gpr[9]._u32[0]);
           /* Il PPU aspetta un BIT dentro la parola trasferita: sapere che il
            * DMA e' partito non basta, serve il valore che porta. */
           if (_n <= 200 && mfc_is_put(cmd)) {

@@ -539,14 +539,57 @@ vuota**:
 ha preso il lavoro e non l'ha portato a termine -- il completamento a
 `0x20000000` non arriva e l'event flag non viene mai posto.
 
+#### Il DMA di completamento: chi lo chiama e sotto quale condizione
+
+A `0x6120` non ci arriva nessun salto statico (`grep` nel job module trova solo
+la definizione e la tabella): ci si arriva con un salto **indiretto**. Il
+registro di collegamento della SPU, stampato al momento del trasferimento, dice
+il chiamante:
+
+```
+[dma-eawin] img=2 pc=0x06120 PUT lsa=0x10400 ea=0x20000000 size=0x10
+            ritorno a 0x048D8  (r7=0x00010400 r8=0x0000001F r9=0x20000000)
+```
+
+`0x48D8` e' il ritorno dalla chiamata a `spu_func_00005F88` fatta da
+`spu_func_000048D0`, e ci si arriva solo per questo bivio:
+
+```c
+void ..._spu_func_000048C8(spu_context* ctx) {
+        ctx->gpr[4] = spu_ls_read128(ctx, ctx->gpr[1]._u32[0] + 0xC0);
+        if (ctx->gpr[4]._u32[0] != 0) { ... 0x4CD8 ... }   // NON completa
+        { ... 0x48D0 ... }                                 // completa
+}
+```
+
+cioe' il completamento avviene solo se la parola a `stack+0xC0` e' zero.
+
+#### Il punto esatto dello stallo
+
+Il task SPU **non si sveglia e riparcheggia a vuoto**: il campo `ran=` degli
+ingressi in `WAIT_SIGNAL` dice che ogni ciclo gira davvero, fra 3 e 8 ms, e
+l'ultimo (`WAIT_SIGNAL#200`) gira 4 ms come tutti gli altri. E su 200 cicli
+solo 57 producono un completamento: **la maggior parte dei cicli non completa
+niente, ed e' normale.**
+
+Quindi la sequenza finale e': il PPU accoda il lavoro N e aspetta; la SPU viene
+svegliata, gira 4 ms, non completa N, si riparcheggia; e nessuno la sveglia piu'
+perche' l'unica cosa che la sveglia e' una nuova push del PPU — che sta
+aspettando N.
+
+**L'ipotesi architetturale** (da verificare, non ancora dimostrata): sul ferro
+vero il kernel SPURS rimette in esecuzione il task finche' il workload ha
+lavoro, mentre da noi il task dorme finche' non arriva un segnale esplicito. Se
+e' cosi', il lavoro residuo di N non e' nella coda (che allo stallo e' vuota,
+`pop1 == push1 == 8`) ma nello stato interno del job, e serve un criterio per
+rimettere in esecuzione il task senza fabbricarne la ripresa — cosa che
+`LBP_WS_DRAIN` fa male, come misurato sopra.
+
 #### Il prossimo passo
 
-Capire cosa succede **dentro** il job module fra "lavoro preso" e il DMA di
-completamento. L'indirizzo del DMA e' noto: `pc=0x06120` dentro
-`spu_jobs/lifted/jobmod_008cc900_8acfddb1519c/spu_recomp.c`, funzione
-`jobmod_008cc900_8acfddb1519c_spu_func_00006120` (riga 2593), che e' solo un
-"metti 16 byte all'indirizzo in r9". Serve il chiamante che imposta
-`r9=0x20000000` e la condizione che lo raggiunge.
+Capire cosa fa la SPU nei 4 ms dell'ultimo ciclo: quale ramo prende a
+`0x48C8` e perche' `stack+0xC0` non e' zero. Serve una traccia dei blocchi
+eseguiti dal task fra la sveglia e il parcheggio, limitata all'ultimo ciclo. 
 
 ### Cosa resta della FIFO
 
