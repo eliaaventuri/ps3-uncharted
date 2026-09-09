@@ -1073,7 +1073,12 @@ void vm_write32(uint64_t a, uint32_t v) { barrier_watch_hit((uint32_t)a, v, 4, _
         }
         fprintf(stderr,"%s\n",ln); }
 #else
-        fprintf(stderr,"[WWATCH] write32 0x%08X = 0x%08X  ra=%p\n", ea, v, __builtin_return_address(0));
+        /* L'indirizzo host da solo non dice niente: quello che serve e' la
+         * FUNZIONE GUEST che sta scrivendo. ppu_prof_resolve_host la ricava
+         * gia' -- il ramo a 64 bit la usava, questo no. */
+        { void* ra = __builtin_return_address(0);
+          fprintf(stderr,"[WWATCH] write32 0x%08X = 0x%08X  ra=%p guest-fn=0x%08X\n",
+                  ea, v, ra, ppu_prof_resolve_host(ra)); }
 #endif
       } } }
 #ifdef _WIN32
