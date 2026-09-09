@@ -344,13 +344,32 @@ sempre lo stesso tratto. Ora la spazzolata e' una sola per ogni valore di
 
 ### Risultato
 
-| | prima | dopo |
+| | prima | dopo (corsa riuscita) |
 |---|---|---|
-| fence drenati in due minuti | fino a **0x4C** (76) | fino a **0xE5C** (3676) |
-| `Rendering is stuck` | sempre | **mai** |
+| fence drenati in due minuti | fino a **76** | fino a **3060-3676** |
+| `Rendering is stuck` | sempre | **assente** |
 
-Il fronte si sposta ancora: adesso l'ultima cosa che si vede e' un task SPURS
-che dorme in `WAIT_SIGNAL`, e la RSX disegna ancora solo `CLEAR_SURFACE`.
+### Ma e' una corsa su quattro
+
+Onesta': con l'albero attuale il blocco si supera **1 volta su 4**. Le altre
+tre si fermano a fence 77-81. Cosa NON e' la causa, misurato:
+
+* **non e' la profondita' dello stack SPU.** Sembrava esserlo -- le corse
+  bloccate avevano `[spu-depth] host_depth=2000` e quella riuscita no -- ma
+  alzando il tetto a 60.000 il gioco resta fermo lo stesso (fence 78), e una
+  corsa bloccata ha `depth=0`. Era una coincidenza. L'annidamento e' comunque
+  un difetto vero: e' infinito, non profondo, e resta da capire.
+* **non e' il semaforo della RSX.** `GCM_SEMA_ACQUIRE=1` (l'ACQUIRE che blocca
+  come l'hardware) peggiora: i fence si fermano a 15. Il semaforo blocca e
+  niente lo sblocca.
+* **non e' il dedupe dei fence.** Una finestra di 64 valori blocca il gioco in
+  tre corse su tre: quando il ring rigira, il fence atteso e' gia' nella
+  finestra e viene scartato. Solo il valore precedente va scartato.
+
+Quello che si sa: nelle corse bloccate il walker si ferma dentro un segmento
+il cui `JUMP` di coda non e' stato scritto, e il gioco aspetta un fence che sta
+oltre. Il prossimo passo e' confrontare una corsa riuscita con una fallita
+sugli stessi indirizzi, non aggiungere altre euristiche.
 
 ## Sessione 18c — il PPU non aspetta piu' la SPU: ora aspetta la RSX
 
