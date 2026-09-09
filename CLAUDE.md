@@ -71,6 +71,30 @@ Il ruolo di Opus è di **Senior Architect / Orchestratore**: i tuoi token devono
    - Esecuzione continua di `.venv/bin/python tools/check_ppu_scaffold.py` fino al verde.
    - Ogni operazione ripetitiva che altrimenti consumerebbe token o chiamate API.
 
+### Come è messo il worker (riparato il 09/09/2026)
+
+Tre cose erano rotte e ora funzionano; se un giorno smette, si guarda qui.
+
+1. `~/local-ai-worker/opencode.json` dichiarava il provider locale con
+   `"npm": "@opencode-ai/plugin"`, che non è un pacchetto di provider: opencode
+   rispondeva `Failed to initialize provider: local-mlx`. Ora è
+   `@ai-sdk/openai-compatible`.
+2. Quel file sta nella cartella del worker, ma opencode legge la configurazione
+   dalla **cartella di lavoro** e da `~/.config/opencode/`. Il provider è stato
+   copiato anche nella configurazione globale, così `--local` funziona lanciato
+   da dentro il repo.
+3. `run_worker.sh` è un symlink: `BASH_SOURCE` restava il percorso del link e
+   `git_checkpoint.sh` non si trovava. Ora il link viene risolto.
+4. **`scripts/tool_shim.py`** (porta 8081) è nuovo. Qwen2.5-Coder scrive le
+   chiamate agli strumenti come JSON nudo, mentre `mlx_lm` ne riconosce una solo
+   se è avvolta nei tag `<tool_call>`: senza adattatore il modello *stampava* le
+   chiamate invece di eseguirle. Lo shim le converte (e gestisce lo streaming).
+   Parte e si ferma insieme al server, e la configurazione punta a 8081.
+
+Nota di realtà: il modello locale processa ~90 token al secondo di prompt, e il
+prompt di sistema di opencode è ~9.000 token — quindi **un paio di minuti per
+turno**. Va bene per mappature e lavori ripetitivi, non per iterazioni rapide.
+
 ### Flusso Operativo Obbligatorio
 
 1. **Definisci l'obiettivo**: Scrivi un task circoscritto in `tasks/TASK.md` (ispirandoti a `tasks/TASK_TEMPLATE.md`).
