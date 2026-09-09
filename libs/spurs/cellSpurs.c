@@ -1051,7 +1051,11 @@ s32 cellSpursSendSignal(CellSpursTaskset* taskset, CellSpursTaskId taskId)
      * waiter (spu_taskset_wait_signal) keys on the guest EA + taskId. */
     uint32_t taskset_ea = (uint32_t)(uintptr_t)taskset;
 
-    printf("[cellSpurs] SendSignal(taskset=0x%08X id=%u)\n", taskset_ea, taskId);
+    /* CHI la chiama: il sospetto e' che sia lo stesso thread PPU che poi si
+     * blocca ad aspettare il flag della SPU -- cioe' un ciclo. */
+    { extern unsigned int ppu_active_lr(void);
+      printf("[cellSpurs] SendSignal(taskset=0x%08X id=%u) lr=0x%08X\n",
+             taskset_ea, taskId, ppu_active_lr()); }
 
     /* Deliver the signal for real: set the task's bit in the guest taskset's
      * SIGNALLED bitset and wake its blocked host thread. (Was a documented

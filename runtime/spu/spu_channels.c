@@ -1159,6 +1159,12 @@ void spu_spurs_taskset_syscall(spu_context* ctx)   /* non-static: also called by
             }
             yz_lockstep_block_begin(ctx);
             spu_taskset_parked_add(ts, tid, wobj);
+            /* Da DOVE si ferma: se il task si parcheggia sempre dallo stesso
+             * punto, la differenza fra un giro che finisce il lavoro e uno che
+             * si blocca sta nei dati, non nel percorso. */
+            { static int _n = 0; if (_n++ < 400)
+                fprintf(stderr, "[spu-park] img=%d pc=0x%05X task=%u wobj=0x%08X\n",
+                        ctx->image_id, (uint32_t)ctx->pc & SPU_LS_MASK, tid, wobj); }
             spu_taskset_wait_signal(ts, tid);
             spu_taskset_parked_del(ts, tid);
             yz_lockstep_block_end(ctx);
