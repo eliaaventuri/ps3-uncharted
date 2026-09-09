@@ -1,61 +1,49 @@
-# TASK SPECIFICATION: RSX19-SPU-FLAG — la stretta di mano PPU/SPU sul flag a 0x20000000
+# TASK SPECIFICATION: SPU-FLAG-01 — chi scrive il flag a 0x20000000
 
 ## 1. OBIETTIVO
-Mappare, **senza modificare codice**, il protocollo con cui il PPU e la SPU si
-scambiano il "lavoro finito" attraverso la parola a EA `0x20000000`, e dire
-esattamente **quale condizione** deve verificarsi perché la SPU scriva quella
-parola. Il risultato va in `tasks/RESULT.md`.
+Estrarre dal codice SPU liftato la funzione che contiene l'indirizzo `0x06120`
+e riportare **testualmente** il codice attorno, più i punti da cui ci si arriva.
+Nient'altro. Sola lettura.
 
-## 2. CONTESTO & IPOTESI
+## 2. CONTESTO
+Il runtime registra questo DMA:
 
-Il port è arrivato a girare in continuo (~30 fotogrammi al secondo di comandi
-RSX drenati) ma il thread principale del PPU resta fermo per sempre in uno spin.
+    [dma-eawin] img=2 pc=0x06120 PUT lsa=0x10400 ea=0x20000000 size=0x10
 
-Fatti misurati (non ipotesi):
+cioè: a `pc=0x06120` la SPU trasferisce 16 byte dalla propria local store
+all'indirizzo `0x20000000` della memoria principale. Il PPU aspetta il bit 0 di
+quella parola, quindi quel DMA è la fine di un lavoro.
 
-- Il PPU gira in `func_00566108` (file generato `recomp/ppu_recomp_003.cpp` in
-  `~/Documents/Coding/uncharted-data`), chiamato da `func_005324E8` con
-  `lr=0x00532620`. Il ciclo è a `loc_00566120`: legge `r11 = [r3+0x320]`
-  (che vale `0x20000000`) e ripete finché il bit 0 della parola a quell'indirizzo
-  è zero. 149.240 righe di log consecutive su questo spin.
-- La SPU **sa** scrivere quel flag: `img=2 pc=0x06120 PUT lsa=0x10400
-  ea=0x20000000 size=0x10`, con dati `00000001 00000000`. Succede ~56 volte e
-  poi smette.
-- Il task SPU 0 del taskset `0x2A86F380` entra in `WAIT_SIGNAL` esattamente 200
-  volte (gira ~5 ms per giro) e alla 200ª resta parcheggiato per sempre.
-- `cellSpursSendSignal(taskset=0x2A86F380, id=0)` viene chiamata 463 volte e poi
-  smette: chi la chiama è (probabilmente) proprio il thread PPU bloccato.
-- Le funzioni PPU `func_00566350` e `func_00566980` scrivono **zero** a
-  `0x20000000` (cioè azzerano il flag prima di chiedere il lavoro).
+Il file da leggere è **uno solo**:
+`/Users/elia/Documents/Coding/uncharted-data/spu_lifted/spu_0000_at_00845000/spu_recomp.c`
 
-Ipotesi da verificare o smentire: il PPU azzera il flag, chiede il lavoro alla
-SPU, e aspetta. La SPU, al 200º giro, invece di fare il lavoro e scrivere il
-flag, si mette in attesa di un segnale che solo quel PPU manderebbe.
+Nel codice liftato le funzioni si chiamano `spu_func_XXXXXXXX` (X = esadecimale
+dell'indirizzo) e i blocchi hanno etichette del tipo `loc_XXXXX` o commenti con
+l'indirizzo. L'indirizzo cercato è `0x6120` / `0x06120` / `6120`.
 
-## 3. VINCOLI & REGOLE DI INGAGGIAMENTO
-- **NON modificare nessun file.** Questo è un task di sola lettura e relazione.
-- File da leggere (generati, quindi **vietato toccarli**):
-  `~/Documents/Coding/uncharted-data/recomp/ppu_recomp_003.cpp`,
-  `~/Documents/Coding/uncharted-data/spu_lifted/` e `spu_pm/`.
-- File del runtime da leggere: `runtime/spu/spu_workload.c`,
-  `runtime/spu/spu_channels.c`, `libs/spurs/cellSpurs.c`.
-- Non lanciare il gioco, non compilare.
+## 3. VINCOLI
+* **NON modificare nessun file.** Sola lettura.
+* Non compilare, non lanciare il gioco.
+* Non leggere altri file oltre a quello indicato (e alla sua intestazione `.h`
+  se serve per capire i nomi).
+* Se il file è troppo grande da leggere tutto, usa `grep -n` per trovare le
+  righe e poi leggi solo gli intervalli utili.
 
 ## 4. CRITERI DI SUCCESSO
-`tasks/RESULT.md` risponde a queste quattro domande, ciascuna con il
-riferimento al file e alla riga da cui viene la risposta:
+`tasks/RESULT.md` contiene, nella sezione "EVIDENZE RACCOLTE":
 
-1. Che cos'è l'oggetto passato in `r3` a `func_00566108` (quello con il
-   puntatore a `+0x320` e i campi `+0x314`, `+0x318`, `+0x31C`)? Chi lo crea?
-2. Chi chiama `cellSpursSendSignal` per il taskset `0x2A86F380` — quale funzione
-   PPU, e da quale catena di chiamate?
-3. Nel codice SPU liftato dell'immagine 2, qual è la funzione che contiene
-   `pc=0x06120` (il DMA che scrive il flag), e qual è la condizione che la
-   raggiunge invece di andare in `WAIT_SIGNAL`?
-4. Elenca le scritture a `0x20000000` (o all'oggetto `+0x320`) fatte dal PPU e
-   di' in che ordine avvengono rispetto alla `SendSignal`.
+1. **Nome della funzione** che contiene `0x6120`, e la riga del file dove
+   comincia.
+2. Le **40 righe** di codice liftato attorno a `0x6120` (copiate testualmente).
+3. L'elenco dei **salti che arrivano** a quel blocco: cioè ogni riga del file
+   che contiene `6120` come destinazione (`goto loc_...6120`, o simile), con il
+   numero di riga.
+4. La **condizione immediatamente precedente**: l'`if` o il confronto che decide
+   se si arriva a quel blocco oppure no, copiato testualmente.
+
+Se una di queste quattro cose non è nel file, scrivi `NON TROVATO` e la ragione,
+invece di indovinare.
 
 ## 5. STOP CONDITIONS
-- Se una delle quattro domande non è rispondibile dai file, scrivilo
-  esplicitamente invece di indovinare: "NON DETERMINABILE" più il motivo.
-- Nessuna modifica al codice, in nessun caso.
+* Qualsiasi modifica a un file: fermarsi.
+* Se `0x6120` non compare nel file, riportare `BLOCKED` con l'output del grep.
