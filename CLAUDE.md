@@ -95,6 +95,15 @@ Nota di realtà: il modello locale processa ~90 token al secondo di prompt, e il
 prompt di sistema di opencode è ~9.000 token — quindi **un paio di minuti per
 turno**. Va bene per mappature e lavori ripetitivi, non per iterazioni rapide.
 
+5. **Limiti alla cache dei prompt** (in `scripts/start_server.sh`). Senza,
+   `mlx_lm` tiene una cache KV per ogni ramo di conversazione e non la butta
+   mai: misurato `Prompt Cache: 4 sequences, 10.02 GB` sopra ai ~18 GB dei pesi,
+   con la memoria della macchina all'80%. Ora `--prompt-cache-size 1` e
+   `--prompt-cache-bytes 3221225472` (3 GB): una sola conversazione in cache,
+   che basta a riusare il prompt di sistema. Dopo la modifica: 93% di memoria
+   libera. Si possono cambiare con le variabili `PROMPT_CACHE_SIZE` e
+   `PROMPT_CACHE_BYTES`.
+
 **Regola operativa: non lanciare mai il gioco mentre il worker locale gira.**
 Il modello da 32B e il backend Metal del port si contendono la stessa GPU
 unificata, e il server MLX muore con
