@@ -1462,7 +1462,7 @@ static void gcm_rsx_process_fifo_unlocked(void)
                            * sullo stesso `put` (per esempio dopo un JUMP a un
                            * offset non mappato) restava senza uscita. */
                           { static unsigned nlog = 0;
-                            if (nlog++ < 20)
+                            if (nlog++ < 100000)
                                 fprintf(stderr, "[cellGcmSys] segmento senza uscita a 0x%08X: "
                                         "riprendo dal SET_REFERENCE a 0x%08X (put=0x%08X)\n",
                                         s_fifo_getoff, put - 8, put); }

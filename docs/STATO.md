@@ -388,11 +388,26 @@ prima che il titolo li sovrascrivesse.
 - **`GCM_SEQ=1`** — `put`, fence, JUMP di coda, intervalli dell'emettitore e
   letture di `ctrl+8`, in un unico flusso, con il thread che scrive.
 
+### Dove arriva ora il titolo
+
+In una corsa da 300 secondi senza blocchi il gioco supera la fase in cui era
+fermo da sempre e comincia a caricare **contenuto vero**: pacchetti di livello
+(`PackageMgr::RequestLevel [particle-ingame]`, `[main/pak19/post]`), script
+particellari, le cinematiche in-game (`igc-manager.cpp`, 642 registrazioni
+IGC), le voci (829 `Registering VOX`), i sottotitoli e la telecamera di
+`movie1`, e le icone dell'HUD (`Loading HUD icon 'assault-rifle-a'`,
+`'bullets'`). Niente di tutto questo era mai comparso.
+
 ### Cosa resta
 
-Una corsa su cinque si ferma ancora, ma **non per la FIFO**: il log dice
-`[spu_workload] task 0 (taskset 0x2A86F380) sleeping Ns in WAIT_SIGNAL`. È un
-task SPU che non riceve il segnale, a valle di `cellSpurs SendSignal`.
+Una corsa su cinque si ferma ancora. **Non è il task SPU fermo in
+`WAIT_SIGNAL`**: quel messaggio compare identico (16 volte, fino a 15 s) nelle
+corse buone e in quella bloccata, quindi è rumore preesistente e non la causa.
+Nella corsa bloccata il walker pubblica 138 fence per arrivare solo al 121 —
+cioè pubblica **fuori ordine** — e poi si ferma. Il prossimo passo è capire
+perché: il sospetto è che il recupero salti a `put`-8 quando il walker è
+indietro di più di un giro dell'anello, saltando i fence intermedi che il
+titolo aspetta per uguaglianza.
 
 ## Sessione 18d — e ora non aspetta piu' nemmeno la RSX
 
