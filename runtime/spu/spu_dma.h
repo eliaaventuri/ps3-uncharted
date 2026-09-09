@@ -221,6 +221,13 @@ static inline int mfc_do_transfer(spu_context* spu, uint32_t lsa, uint64_t ea,
                       spu->image_id, (uint32_t)spu->pc & SPU_LS_MASK,
                       mfc_is_get(cmd) ? "GET" : mfc_is_put(cmd) ? "PUT" : "cmd",
                       lsa, (uint32_t)ea, size);
+          /* Il PPU aspetta un BIT dentro la parola trasferita: sapere che il
+           * DMA e' partito non basta, serve il valore che porta. */
+          if (_n <= 200 && mfc_is_put(cmd)) {
+              const unsigned char* _p = &spu->ls[lsa & SPU_LS_MASK];
+              fprintf(stderr, "            dati: %02X%02X%02X%02X %02X%02X%02X%02X\n",
+                      _p[0], _p[1], _p[2], _p[3], _p[4], _p[5], _p[6], _p[7]);
+          }
       } }
     /* SPU_DMA_DUMP_EA=<hex>: il contenuto di ogni GET che parte da quell'EA.
      * Il dump generico si ferma a 64 byte, e le strutture che contano qui non
