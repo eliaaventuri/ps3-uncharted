@@ -1062,89 +1062,23 @@ static void gcm_fifo_resync_why(const char* why, u32* getoff, u32 put)
 {
     static int n = 0;
     if (n++ < 8)
-        fprintf(stderr, "[cellGcmSys] FIFO resync (%s) 0x%08X -> put 0x%08X\n",
-                why, *getoff, put);
-    /* Il tratto saltato puo' aver fatto il GIRO del ring: quando il walker si
-     * era fermato oltre `put` (dentro un segmento, o piu' avanti nell'anello),
-     * la parte saltata non e' [from, put) ma [from, fine) piu' [inizio, put).
-     * Spazzolare solo la prima meta' perdeva i fence scritti all'inizio
-     * dell'anello -- ed e' esattamente cosi' che si e' persa la fence 0x49 a
-     * 0x10000 con put=0x10008: il gioco l'aspettava e non e' mai arrivata.
-     * Perdere un DISEGNO su una risincronizzazione costa un fotogramma;
-     * perdere un FENCE blocca il titolo. */
-    /* L'anello NON e' quello del contesto libgcm. Misurato: il contesto dice
-     * begin=0x21000000 end=0x21010000, cioe' io 0..0x10000, mentre i fence che
-     * contano stanno a io 0x10000..0x13000 -- il titolo si gestisce una coda
-     * propria oltre quella di libgcm, e `put`/`get` sono i registri veri.
-     * I confini si ricavano quindi da dove `put` e' stato visto, non dal
-     * contesto: e' l'unica fonte che dice davvero dove il gioco scrive. */
-    static u32 s_put_lo = 0xFFFFFFFFu, s_put_hi = 0;
-    if (put < s_put_lo) s_put_lo = put;
-    if (put > s_put_hi) s_put_hi = put;
-    u32 ring_begin = (s_put_lo == 0xFFFFFFFFu) ? 0xFFFFFFFFu : (s_put_lo & ~0xFFFu);
-    { static int _c = 0;
-      if (_c++ < 3)
-          fprintf(stderr, "[cellGcmSys] ctx=0x%08X begin=0x%08X end=0x%08X cur=0x%08X"
-                  " -> ring_begin(io)=0x%08X  last_ring_off=0x%08X\n",
-                  s_gcm_context_ea,
-                  s_gcm_context_ea ? vm_read32(s_gcm_context_ea) : 0,
-                  s_gcm_context_ea ? vm_read32(s_gcm_context_ea + 4) : 0,
-                  s_gcm_context_ea ? vm_read32(s_gcm_context_ea + 8) : 0,
-                  ring_begin, s_last_ring_off); }
-    { static int _w = 0;
-      if (ring_begin == 0xFFFFFFFFu && _w++ < 4)
-          fprintf(stderr, "[cellGcmSys] resync: inizio anello ignoto "
-                  "(ctx=0x%08X) -- niente spazzolata del tratto avvolto\n",
-                  s_gcm_context_ea); }
-    /* Una sola spazzolata per ogni valore di `put`: il watchdog di stuck-get
-     * risincronizza ogni poche passate, e rispazzolare lo stesso tratto
-     * ripubblicava gli stessi fence all'infinito (24 milioni di push in due
-     * minuti). Finche' `put` non si muove non c'e' niente di nuovo da salvare. */
-    static u32 s_last_swept_put = 0xFFFFFFFFu;
-    unsigned rescued = 0;
-    if (put == s_last_swept_put) { *getoff = put; return; }
-    s_last_swept_put = put;
-    u32 span_a_from = (*getoff <= put) ? *getoff : s_last_ring_off;
-    u32 spans[2][2] = { { span_a_from, put }, { 0, 0 } };
-    if (span_a_from >= put) {          /* il tratto ha fatto il giro */
-        spans[0][0] = span_a_from; spans[0][1] = 0;   /* [from, fine ring): la fine
-                                                       * non la conosciamo, ma i
-                                                       * fence oltre `put` non
-                                                       * servono: bastano quelli
-                                                       * dall'inizio a `put`. */
-        spans[1][0] = ring_begin;  spans[1][1] = (ring_begin == 0xFFFFFFFFu) ? 0 : put;
-    }
-    s_ref_in_rescue = 1;
-    for (int sp = 0; sp < 2; sp++) {
-        u32 a = spans[sp][0], b = spans[sp][1];
-        if (b == 0 || a >= b) continue;
-        for (u32 io = a; io + 8 <= b; io += 4) {
-            u32 ea = gcm_io2ea(io); if (!ea) continue;
-            u32 w = vm_read32(ea);
-            if ((w >> 29) != 0 || (w & 0x1FFCu) != 0x0050u) continue;
-            u32 dea = gcm_io2ea(io + 4); if (!dea) continue;
-            gcm_ref_push_at(vm_read32(dea), io);
-            rescued++;
-        }
-    }
-    s_ref_in_rescue = 0;
-    /* Tutti i SET_REFERENCE presenti nell'anello, con il loro offset: dice se
-     * il fence che il gioco aspetta sia stato scritto e dove, oppure se non ci
-     * sia proprio. Senza questo si puo' solo supporre. */
-    { static int _n = 0;
-      if (getenv("GCM_RINGSCAN") && _n++ < 4 && ring_begin) {
-          char b[900]; int q = snprintf(b, sizeof b, "[ringscan] put=%08X fence nell'anello:", put);
-          for (u32 io = ring_begin; io < ring_begin + 0x4000 && q < (int)sizeof b - 32; io += 4) {
-              u32 e = gcm_io2ea(io); if (!e) continue;
-              u32 w = vm_read32(e);
-              if ((w >> 29) != 0 || (w & 0x1FFCu) != 0x0050u) continue;
-              u32 de = gcm_io2ea(io + 4); if (!de) continue;
-              q += snprintf(b + q, sizeof(b) - q, " %u@%05X", vm_read32(de), io);
-          }
-          snprintf(b + q, sizeof(b) - q, "\n"); fputs(b, stderr); } }
-    if (rescued) { static int m = 0; if (m++ < 8)
-        fprintf(stderr, "[cellGcmSys] resync recuperati %u fence\n", rescued); }
-    *getoff = put;
+        fprintf(stderr, "[cellGcmSys] FIFO resync (%s) 0x%08X -> ", why, *getoff);
+
+    /* Niente scansione cieca dell'anello alla ricerca di parole che somigliano
+     * a un SET_REFERENCE. L'ho provata: raccoglie anche fence stantii e vera
+     * spazzatura (misurato, un "fence" 524724 pubblicato fra il 74 e il 78) e
+     * pubblica fuori ordine, che per chi aspetta per uguaglianza e' peggio del
+     * non pubblicare.
+     *
+     * Al posto suo, si RIAVVOLGE all'ultima posizione che il walker occupava
+     * DENTRO l'anello. I fence li drena cosi' il walker stesso, uno per uno e
+     * nell'ordine giusto, esattamente come farebbe l'hardware. Se non c'e'
+     * anello arretrato da recuperare, si va a `put` come prima. */
+    if (s_last_ring_off && s_last_ring_off < put) *getoff = s_last_ring_off;
+    else                                          *getoff = put;
+
+    if (n <= 8)
+        fprintf(stderr, "0x%08X (put=0x%08X)\n", *getoff, put);
 }
 
 /* Come gcm_fifo_dump_around ma senza il gate su GCM_RECDBG: chi la chiama ha
@@ -1184,6 +1118,16 @@ static void gcm_fifo_dump_around(u32 getoff)
 }
 
 
+/* Un fence DRENATO e uno PUBBLICATO sono cose diverse, e in mezzo ci sono due
+ * filtri. Quando il gioco aspetta un valore che non arriva, la domanda e'
+ * sempre "e' stato scartato, e da quale dei due?". */
+#define GCM_REFDROP(v_, why_) do { \
+    static int _dn = -1; if (_dn < 0) _dn = getenv("GCM_REFLOG") ? 1 : 0; \
+    static unsigned _dc = 0; \
+    if (_dn && _dc++ < 200) \
+        fprintf(stderr, "[refdrop] %u scartato: %s\n", (v_), (why_)); \
+} while (0)
+
 static void gcm_ref_push_at(u32 v, u32 getoff)
 {
     { static int _d = -1; if (_d < 0) _d = getenv("GCM_REFLOG") ? 1 : 0;
@@ -1200,14 +1144,14 @@ static void gcm_ref_push_at(u32 v, u32 getoff)
      * gioco resta fermo in tre corse su tre, perche' quando il ring rigira il
      * fence che serve e' gia' dentro la finestra e viene scartato. */
     { static u32 s_last_pushed = 0xFFFFFFFFu;
-      if (v == s_last_pushed) return;
+      if (v == s_last_pushed) { GCM_REFDROP(v, "uguale al precedente"); return; }
       s_last_pushed = v; }
     /* Durante un recupero si accettano solo fence PIU' NUOVI di quelli gia'
      * drenati: l'anello contiene ancora le parole dei fotogrammi passati, e
      * ripubblicarle manda indietro `ref` sotto gli occhi di chi aspetta per
      * uguaglianza. Sul percorso normale invece si passa tutto -- se il titolo
      * azzera il contatore, quello e' un fence vero. */
-    if (s_ref_in_rescue) { if (v <= s_ref_high) return; }
+    if (s_ref_in_rescue) { if (v <= s_ref_high) { GCM_REFDROP(v, "stantio nel recupero"); return; } }
     else if (v > s_ref_high) s_ref_high = v;
     u32 t = s_ref_qtail;
     if (t - s_ref_qhead >= GCM_REF_QLEN) {   /* overflow: drop oldest (keeps liveness) */
