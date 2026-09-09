@@ -1145,13 +1145,21 @@ static void gcm_fifo_dump_around(u32 getoff)
 static void gcm_ref_push_at(u32 v, u32 getoff)
 {
     { static int _d = -1; if (_d < 0) _d = getenv("GCM_REFLOG") ? 1 : 0;
-      if (_d) fprintf(stderr, "[refq] drained fence 0x%X at getoff=%08X\n", v, getoff); }
-    /* Lo stesso valore due volte di fila non aggiunge informazione a chi
-     * aspetta per uguaglianza, e riempie la coda impedendo ai fence successivi
-     * di uscire. */
-    static u32 s_last_pushed = 0xFFFFFFFFu;
-    if (v == s_last_pushed) return;
-    s_last_pushed = v;
+      static unsigned _n = 0;
+      if (_d && _n++ < 20000)
+          fprintf(stderr, "[refq] drained fence 0x%X at getoff=%08X\n", v, getoff); }
+    /* Un valore gia' pubblicato di recente non aggiunge informazione a chi
+     * aspetta per uguaglianza, e riempie la coda impedendo ai fence NUOVI di
+     * uscire. Guardare solo il valore precedente non basta: quando il walker
+     * rigira sull'anello ripassa sui quattro fence in sequenza, e nessuno dei
+     * due consecutivi coincide -- misurato, 43 milioni di push in due minuti
+     * con `ref` inchiodato. Serve una finestra. */
+    /* Solo il valore precedente, non una finestra: con una finestra di 64 il
+     * gioco resta fermo in tre corse su tre, perche' quando il ring rigira il
+     * fence che serve e' gia' dentro la finestra e viene scartato. */
+    { static u32 s_last_pushed = 0xFFFFFFFFu;
+      if (v == s_last_pushed) return;
+      s_last_pushed = v; }
     u32 t = s_ref_qtail;
     if (t - s_ref_qhead >= GCM_REF_QLEN) {   /* overflow: drop oldest (keeps liveness) */
         s_ref_qhead++;
