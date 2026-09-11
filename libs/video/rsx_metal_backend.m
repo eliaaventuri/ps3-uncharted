@@ -93,6 +93,7 @@ typedef struct {
     u32 offset, format, image_rect;   /* what is currently resident */
 } MtlTexUnit;
 static MtlTexUnit s_tex[RSX_MAX_TEXTURES];
+static id<MTLTexture> tex_with_remap(id<MTLTexture> t, u32 remap);   /* piu' sotto */
 
 static MtlVertex* s_verts;
 static u32        s_vert_count;
@@ -470,6 +471,45 @@ static void vp_end_draw(MtlDraw* d)
     s_cur_mask = 0;
 }
 
+/* RSX_VP_DBG=<n>: i primi n draw con VP del guest: programma, attributi
+ * dei primi due vertici e le costanti che il programma legge (c0..3,
+ * c256..259, c467). Per capire se la trasformazione ha i numeri giusti.
+ * RSX_VP_DBG_FP=<hex> filtra per fragment program; con PS3_TTY_BT parte
+ * dall'hit. Ritorna 1 se il draw va stampato (record_draw aggiunge indici e
+ * byte grezzi). */
+static int vpdbg_common(const MtlDraw* d, const rsx_state* st, u32 prim, u32 wrote, const char* via)
+{
+    static int s_vd = -2; static int s_vn = 0; static int s_gate = -1;
+    extern int g_hle_trace_armed;
+    if (s_vd == -2) { const char* e = getenv("RSX_VP_DBG"); s_vd = e ? atoi(e) : 0; }
+    if (s_gate < 0) s_gate = getenv("PS3_TTY_BT") ? 1 : 0;
+    static long s_fpf = -2; if (s_fpf == -2) { const char* e = getenv("RSX_VP_DBG_FP"); s_fpf = e ? (long)strtoul(e, 0, 16) : -1; }
+    if (!(d->vp >= 0 && s_vn < s_vd && (!s_gate || g_hle_trace_armed) && (s_fpf < 0 || (long)d->fp_addr == s_fpf))) return 0;
+    s_vn++;
+    fprintf(stderr, "[vpdbg] %s draw#%u vp=%08X mask=%04X prim=%u count=%u surf=%08X fp=%08X blend=%d\n",
+            via, s_draw_count - 1, s_vps[d->vp].hash, s_vps[d->vp].mask, prim, wrote, d->surf, d->fp_addr, d->blend_enable);
+    const float* base_f = s_vpd + d->vbase / 4; u32 na = d->vstride / 16;
+    for (u32 v = 0; v < 4 && v < wrote; v++) {
+        fprintf(stderr, "[vpdbg]   v%u:", v);
+        u32 rank = 0;
+        for (int a = 0; a < 16; a++) { if (!(s_vps[d->vp].mask & (1u << a))) continue;
+            const float* f = base_f + v * na * 4 + rank * 4; rank++;
+            fprintf(stderr, " a%d=(%.3f %.3f %.3f %.3f)", a, f[0], f[1], f[2], f[3]); }
+        fprintf(stderr, "\n"); }
+    const float* cb = (const float*)(s_cbs + d->cblock * MTL_CB_BYTES);
+    static const int slots[] = { 0, 1, 2, 3, 256, 257, 258, 259, 467 };
+    for (unsigned k = 0; k < sizeof slots / sizeof slots[0]; k++) { const float* c = cb + slots[k] * 4;
+        fprintf(stderr, "[vpdbg]   c%d=(%.4f %.4f %.4f %.4f)%s", slots[k], c[0], c[1], c[2], c[3], (k % 3 == 2) ? "\n" : ""); }
+    fprintf(stderr, "[vpdbg]   posscale=(%.3f %.3f %.3f) posoffset=(%.3f %.3f %.3f) vp_scale=(%.1f %.1f %.3f) vp_off=(%.1f %.1f %.3f)\n",
+            cb[512*4], cb[512*4+1], cb[512*4+2], cb[513*4], cb[513*4+1], cb[513*4+2],
+            st->viewport_scale[0], st->viewport_scale[1], st->viewport_scale[2],
+            st->viewport_offset[0], st->viewport_offset[1], st->viewport_offset[2]);
+    for (u32 t = 0; t < RSX_MAX_TEXTURES; t++) if (d->tex[t])
+        fprintf(stderr, "[vpdbg]   tex%u: %lux%lu off=%08X fmt=%08X ctrl0=%08X ctrl1(remap)=%08X\n", t, (unsigned long)d->tex[t].width,
+                (unsigned long)d->tex[t].height, st->textures[t].offset, st->textures[t].format, st->textures[t].control0, st->textures[t].control1);
+    return 1;
+}
+
 static void record_draw(const rsx_state* st, u32 prim, u32 base, u32 count,
                         IndexResolver resolve)
 {
@@ -487,54 +527,6 @@ static void record_draw(const rsx_state* st, u32 prim, u32 base, u32 count,
     *d = tmp;
     d->base  = first_vert;
     d->count = wrote;
-    /* RSX_VP_DBG=<n>: i primi n draw con VP del guest: programma, attributi
-     * dei primi due vertici e le costanti che il programma legge (c0..3,
-     * c256..259, c467). Per capire se la trasformazione ha i numeri giusti. */
-    { static int s_vd = -2; static int s_vn = 0; static int s_gate = -1;
-      /* PS3_TTY_BT: parte dall'hit, come gli altri trace. Debole: il binario
-       * di test dell'host non ha ppu_hle.cpp. */
-      extern int g_hle_trace_armed;
-      if (s_vd == -2) { const char* e = getenv("RSX_VP_DBG"); s_vd = e ? atoi(e) : 0; }
-      if (s_gate < 0) s_gate = getenv("PS3_TTY_BT") ? 1 : 0;
-      int armed = g_hle_trace_armed;
-      /* RSX_VP_DBG_FP=<hex>: solo i draw con quel fragment program. */
-      static long s_fpf = -2; if (s_fpf == -2) { const char* e = getenv("RSX_VP_DBG_FP"); s_fpf = e ? (long)strtoul(e, 0, 16) : -1; }
-      if (d->vp >= 0 && s_vn < s_vd && (!s_gate || armed) && (s_fpf < 0 || (long)d->fp_addr == s_fpf)) { s_vn++;
-          fprintf(stderr, "[vpdbg] draw#%u vp=%08X mask=%04X prim=%u count=%u surf=%08X fp=%08X\n",
-                  s_draw_count - 1, s_vps[d->vp].hash, s_vps[d->vp].mask, prim, wrote, d->surf, d->fp_addr);
-          const float* base_f = s_vpd + d->vbase / 4; u32 na = d->vstride / 16;
-          for (u32 v = 0; v < 2 && v < wrote; v++) {
-              fprintf(stderr, "[vpdbg]   v%u:", v);
-              u32 rank = 0;
-              for (int a = 0; a < 16; a++) { if (!(s_vps[d->vp].mask & (1u << a))) continue;
-                  const float* f = base_f + v * na * 4 + rank * 4; rank++;
-                  fprintf(stderr, " a%d=(%.3f %.3f %.3f %.3f)", a, f[0], f[1], f[2], f[3]); }
-              fprintf(stderr, "\n"); }
-          const float* cb = (const float*)(s_cbs + d->cblock * MTL_CB_BYTES);
-          static const int slots[] = { 0, 1, 2, 3, 256, 257, 258, 259, 467 };
-          for (unsigned k = 0; k < sizeof slots / sizeof slots[0]; k++) { const float* c = cb + slots[k] * 4;
-              fprintf(stderr, "[vpdbg]   c%d=(%.4f %.4f %.4f %.4f)%s", slots[k], c[0], c[1], c[2], c[3], (k % 3 == 2) ? "\n" : ""); }
-          fprintf(stderr, "[vpdbg]   posscale=(%.3f %.3f %.3f) posoffset=(%.3f %.3f %.3f) vp_scale=(%.1f %.1f %.3f) vp_off=(%.1f %.1f %.3f)\n",
-                  cb[512*4], cb[512*4+1], cb[512*4+2], cb[513*4], cb[513*4+1], cb[513*4+2],
-                  st->viewport_scale[0], st->viewport_scale[1], st->viewport_scale[2],
-                  st->viewport_offset[0], st->viewport_offset[1], st->viewport_offset[2]);
-          for (int a = 0; a < 16; a++) if (s_vps[d->vp].mask & (1u << a))
-              fprintf(stderr, "[vpdbg]   attr%d: fmt=%08X off=%08X\n", a, st->vertex_attribs[a].format, st->vertex_attribs[a].offset);
-          fprintf(stderr, "[vpdbg]   %s base=%u idx:", resolve == resolve_indexed ? "INDEXED" : "linear", base);
-          for (u32 q = 0; q < 6 && q < count; q++) fprintf(stderr, " %u", resolve(st, q, &base));
-          fprintf(stderr, "  index_array_offset=%08X dma=%u\n", st->index_array_offset, st->index_array_dma);
-          { u32 vi0 = resolve(st, 0, &base); u32 vi1 = resolve(st, 1, &base);
-            for (int a = 0; a < 16; a++) if (s_vps[d->vp].mask & (1u << a)) {
-                const rsx_vertex_attrib* at = &st->vertex_attribs[a];
-                u32 off0 = (at->offset & 0x7FFFFFFFu) + vi0 * at->stride, off1 = (at->offset & 0x7FFFFFFFu) + vi1 * at->stride;
-                u32 ea0 = (at->offset & 0x80000000u) ? cellGcmResolveLocated(0, off0) : cellGcmResolveLocated(1, off0);
-                u32 ea1 = (at->offset & 0x80000000u) ? cellGcmResolveLocated(0, off1) : cellGcmResolveLocated(1, off1);
-                fprintf(stderr, "[vpdbg]   attr%d raw v%u@%08X:", a, vi0, ea0);
-                for (u32 k = 0; k < 24 && k < at->stride; k++) fprintf(stderr, "%s%02X", (k % 4) ? "" : " ", vm_base[ea0 + k]);
-                fprintf(stderr, "  v%u@%08X:", vi1, ea1);
-                for (u32 k = 0; k < 24 && k < at->stride; k++) fprintf(stderr, "%s%02X", (k % 4) ? "" : " ", vm_base[ea1 + k]);
-                fprintf(stderr, "\n"); } }
-      } }
     /* Expanded primitives always come out as a triangle list. */
     d->topology = rsx_primitive_needs_expansion(prim) ? MTLPrimitiveTypeTriangle
                                              : topo_to_metal(rsx_primitive_topology(prim));
@@ -545,10 +537,17 @@ static void record_draw(const rsx_state* st, u32 prim, u32 base, u32 count,
     d->fp_addr        = st->shader_program;
     d->tex0           = (st->textures[0].control0 & 0x80000000u) != 0;
     for (u32 t = 0; t < RSX_MAX_TEXTURES; t++)
-        d->tex[t] = (st->textures[t].control0 & 0x80000000u) ? s_tex[t].tex : nil;
+        d->tex[t] = (st->textures[t].control0 & 0x80000000u) ? tex_with_remap(s_tex[t].tex, st->textures[t].control1) : nil;
     d->surf           = st->surface_color_offset[0];
     d->sx = st->scissor_x; d->sy = st->scissor_y;
     d->sw = st->scissor_w; d->sh = st->scissor_h;
+    if (vpdbg_common(d, st, prim, wrote, "array")) {
+          for (int a = 0; a < 16; a++) if (s_vps[d->vp].mask & (1u << a))
+              fprintf(stderr, "[vpdbg]   attr%d: fmt=%08X off=%08X\n", a, st->vertex_attribs[a].format, st->vertex_attribs[a].offset);
+          fprintf(stderr, "[vpdbg]   %s base=%u idx:", resolve == resolve_indexed ? "INDEXED" : "linear", base);
+          for (u32 q = 0; q < 6 && q < count; q++) fprintf(stderr, " %u", resolve(st, q, &base));
+          fprintf(stderr, "  index_array_offset=%08X dma=%u\n", st->index_array_offset, st->index_array_dma);
+    }
 
     /* RSX vertex constant slots 0..3 hold the MVP rows when no vertex program
      * has been translated. An all-zero matrix would collapse every vertex to
@@ -661,10 +660,11 @@ done:
     d->fp_addr        = s_state ? s_state->shader_program : 0;
     d->tex0           = s_state && (s_state->textures[0].control0 & 0x80000000u) != 0;
     for (u32 t = 0; t < RSX_MAX_TEXTURES; t++)
-        d->tex[t] = (s_state && (s_state->textures[t].control0 & 0x80000000u)) ? s_tex[t].tex : nil;
+        d->tex[t] = (s_state && (s_state->textures[t].control0 & 0x80000000u)) ? tex_with_remap(s_tex[t].tex, s_state->textures[t].control1) : nil;
     d->surf           = s_state ? s_state->surface_color_offset[0] : 0;
     d->sx = s_state ? s_state->scissor_x : 0; d->sy = s_state ? s_state->scissor_y : 0;
     d->sw = s_state ? s_state->scissor_w : 4096; d->sh = s_state ? s_state->scissor_h : 4096;
+    if (s_state) vpdbg_common(d, s_state, primitive, wrote, "inline");
 
     memset(d->mvp, 0, sizeof d->mvp);
     d->mvp[0] = d->mvp[5] = d->mvp[10] = d->mvp[15] = 1.0f;
@@ -864,11 +864,50 @@ static void texcache_add(u32 offset, u32 format, u32 image_rect, id<MTLTexture> 
     }
     e->offset = offset; e->format = format; e->image_rect = image_rect; e->tex = t; e->last_use = s_frame_no;
 }
+/* SET_TEXTURE_CONTROL1 (remap): CELL_GCM_REMAP_MODE -- bit [1:0] sorgente di
+ * A, [3:2] di R, [5:4] di G, [7:6] di B (0=A 1=R 2=G 3=B), bit [15:8] il tipo
+ * per uscita (0=ZERO 1=ONE 2=REMAP). Default 0xAAE4 = identita'. L'atlante
+ * dei caratteri del menu (4 pagine di glifi nei 4 canali) usa 0xAA1B: senza
+ * il remap il fragment program sceglieva il canale sbagliato e il testo
+ * usciva con i glifi di un'altra pagina. Vista Metal con swizzle, in cache
+ * per (texture, remap). */
+typedef struct { __unsafe_unretained id<MTLTexture> base; u32 remap; id<MTLTexture> view; } MtlRemapEntry;
+static MtlRemapEntry s_remaps[256];
+static u32 s_remap_n;
+static id<MTLTexture> tex_with_remap(id<MTLTexture> t, u32 remap)
+{
+    remap &= 0xFFFFu;
+    if (!t || remap == 0xAAE4u) return t;
+    for (u32 i = 0; i < s_remap_n; i++)
+        if (s_remaps[i].base == t && s_remaps[i].remap == remap) return s_remaps[i].view;
+    MTLTextureSwizzle sw[4];   /* uscita R,G,B,A */
+    static const MTLTextureSwizzle from[4] = { MTLTextureSwizzleAlpha, MTLTextureSwizzleRed, MTLTextureSwizzleGreen, MTLTextureSwizzleBlue };
+    /* posizione dei campi: A=0, R=1, G=2, B=3 (in quest'ordine nel registro) */
+    for (int out = 0; out < 4; out++) {
+        int field = (out == 3) ? 0 : out + 1;              /* uscita R->campo1, G->2, B->3, A->0 */
+        u32 src  = (remap >> (field * 2)) & 3u;
+        u32 kind = (remap >> (8 + field * 2)) & 3u;
+        sw[out] = (kind == 0) ? MTLTextureSwizzleZero : (kind == 1) ? MTLTextureSwizzleOne : from[src];
+    }
+    MTLTextureSwizzleChannels ch = MTLTextureSwizzleChannelsMake(sw[0], sw[1], sw[2], sw[3]);
+    id<MTLTexture> v = [t newTextureViewWithPixelFormat:t.pixelFormat textureType:t.textureType
+                                                 levels:NSMakeRange(0, t.mipmapLevelCount)
+                                                 slices:NSMakeRange(0, t.arrayLength) swizzle:ch];
+    if (!v) return t;
+    if (s_remap_n < 256) { s_remaps[s_remap_n].base = t; s_remaps[s_remap_n].remap = remap; s_remaps[s_remap_n].view = v; s_remap_n++; }
+    { static int _n = 0; if (_n++ < 8) fprintf(stderr, "[RSX metal] texture remap %04X -> vista con swizzle\n", remap); }
+    return v;
+}
 /* A fine fotogramma (dopo la codifica): via le voci ferme da 600 fotogrammi. */
 static void texcache_sweep(void)
 {
     for (u32 i = 0; i < s_texcache_n; i++)
-        if (s_texcache[i].tex && s_frame_no > s_texcache[i].last_use + 600) s_texcache[i].tex = nil;
+        if (s_texcache[i].tex && s_frame_no > s_texcache[i].last_use + 600) {
+            /* anche le viste con remap di questa texture */
+            for (u32 k = 0; k < s_remap_n; k++)
+                if (s_remaps[k].base == s_texcache[i].tex) { s_remaps[k] = s_remaps[s_remap_n - 1]; s_remaps[s_remap_n - 1].view = nil; s_remap_n--; k--; }
+            s_texcache[i].tex = nil;
+        }
 }
 static id<MTLSamplerState> s_sampler;
 /* Il fragment program tradotto del guest dichiara le texture come ARRAY
@@ -973,10 +1012,12 @@ static void mtl_bind_texture(void* ud, u32 unit, const rsx_texture_state* tex)
         /* RSX_TEX_SAVE=1: la texture decodificata su file. Se la geometria si
          * dipinge con una tinta ma resta nera con lo shader vero, o e' la
          * texture o sono le coordinate; questo separa i due casi. */
-        { static int ts = -1;
-          if (ts < 0) ts = getenv("RSX_TEX_SAVE") ? 1 : 0;
+        { static int ts = -1; static long ts_off = -1;
+          if (ts < 0) { ts = getenv("RSX_TEX_SAVE") ? 1 : 0;
+                        /* RSX_TEX_SAVE_OFF=<hex>: solo la texture a quell'offset */
+                        const char* eo = getenv("RSX_TEX_SAVE_OFF"); ts_off = eo ? (long)strtoul(eo, 0, 16) : -1; }
           static int tn = 0;
-          if (ts && tn < 4) {
+          if (ts && tn < 4 && (ts_off < 0 || (long)(tex->offset & 0x7FFFFFFFu) == ts_off)) {
               char tp[96]; snprintf(tp, sizeof tp, "/tmp/rsx_tex%d_%08X.ppm", tn++, tex->offset);
               FILE* tf = fopen(tp, "wb");
               if (tf) {
