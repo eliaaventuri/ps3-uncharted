@@ -252,19 +252,13 @@ typedef struct CellSaveDataSetBuf {
  * Functions
  * -----------------------------------------------------------------------*/
 
-s32 cellSaveDataListSave2(u32 version, CellSaveDataSetList* setList,
-                           CellSaveDataSetBuf* setBuf,
-                           CellSaveDataListCallback funcList,
-                           CellSaveDataStatCallback funcStat,
-                           CellSaveDataFileCallback funcFile,
-                           u32 container, void* userdata);
+/* Guest-marshalled (sessione 27): setList/setBuf sono EA guest, le callback
+ * OPD guest, userdata un puntatore guest. */
+s32 cellSaveDataListSave2(u32 version, u32 setList_ea, u32 setBuf_ea, u32 funcList,
+                          u32 funcStat, u32 funcFile, u32 container, u32 userdata);
 
-s32 cellSaveDataListLoad2(u32 version, CellSaveDataSetList* setList,
-                           CellSaveDataSetBuf* setBuf,
-                           CellSaveDataListCallback funcList,
-                           CellSaveDataStatCallback funcStat,
-                           CellSaveDataFileCallback funcFile,
-                           u32 container, void* userdata);
+s32 cellSaveDataListLoad2(u32 version, u32 setList_ea, u32 setBuf_ea, u32 funcList,
+                          u32 funcStat, u32 funcFile, u32 container, u32 userdata);
 
 s32 cellSaveDataFixedSave2(u32 version, CellSaveDataSetList* setList,
                             CellSaveDataSetBuf* setBuf,

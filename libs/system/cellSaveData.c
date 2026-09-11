@@ -731,135 +731,181 @@ static s32 savedata_execute(const char* dirName, int is_save,
  * API implementations
  * -----------------------------------------------------------------------*/
 
-s32 cellSaveDataListSave2(u32 version, CellSaveDataSetList* setList,
-                           CellSaveDataSetBuf* setBuf,
-                           CellSaveDataListCallback funcList,
-                           CellSaveDataStatCallback funcStat,
-                           CellSaveDataFileCallback funcFile,
-                           u32 container, void* userdata)
+/* cellSaveDataListSave2 / ListLoad2 (NID 0x2DE0D663 / 0x1DFBFDD6) -- con le
+ * callback GUEST, come cellSaveDataListAutoLoad piu' sotto (le versioni
+ * precedenti le chiamavano come puntatori host: "UNTRANSLATED GUEST POINTER"
+ * quando Uncharted ha salvato la prima volta, "New Game" dal menu).
+ *
+ *   (version, setList*, setBuf*, funcList, funcStat, funcFile, container,
+ *    userdata) -- 8 argomenti in r3..r10.
+ *
+ * Il dialogo di scelta del salvataggio non c'e': si prende newData->dirName se
+ * il titolo lo propone, altrimenti fixedList[0], focusDirName, o la prima
+ * directory esistente. Layout guest (RPCS3 cellSaveData.h, big-endian):
+ *   CellSaveDataSetList    +0 sortType +4 sortOrder +8 dirNamePrefix
+ *   CellSaveDataSetBuf     +0 dirListMax +4 fileListMax +32 bufSize +36 buf
+ *   CellSaveDataListGet    +0 dirNum +4 dirListNum +8 dirList
+ *   CellSaveDataDirList    dirName[32] listParam[8] reserved[8]  (48)
+ *   CellSaveDataListSet    +0 focusPosition +4 focusDirName +8 fixedListNum
+ *                          +12 fixedList +16 newData +20 reserved
+ *   CellSaveDataListNewData +0 iconPosition +4 dirName +8 icon
+ *   CellSaveDataStatGet    (1640, vedi marshal_statget_init)
+ *   CellSaveDataStatSet    +0 setParam +4 reCreateMode +8 indicator
+ *   CellSaveDataFileGet    +0 excSize
+ *   CellSaveDataFileSet    +0 fileOperation +8 fileType +28 fileName
+ *                          +32 fileOffset +36 fileSize +40 fileBufSize +44 fileBuf
+ * Le strutture stanno in fondo al buffer del titolo (setBuf->buf, se lungo
+ * almeno 4 KB) e la lista delle directory in testa. I file vanno in
+ * <s_save_root>/<dirName>/; i parametri (titolo, sottotitolo, dettaglio) in
+ * PARAM.TXT della stessa directory, per ripresentarli al caricamento. */
+static void sd_write_str(u32 ea, const char* str, u32 max)
 {
-    printf("[cellSaveData] ListSave2(version=%u)\n", version);
-
-    if (!setList || !setBuf || !funcList || !funcStat)
-        return CELL_SAVEDATA_ERROR_PARAM;
-
-    /* Enumerate existing save dirs */
-    /* CellSaveDataSetList is { u32 sortType; u32 sortOrder; char* dirNamePrefix; }
-     * and CellSaveDataSetBuf starts with u32 dirListMax -- guest layout, so the
-     * prefix EA is the word at +8 and needs translating before it is used as a
-     * host string. The host structs put dirNamePrefix at +8 as an 8-byte
-     * pointer, so a cast would have read half of it plus padding. */
-    u32 dir_max = vm_read32((u32)(uintptr_t)setBuf + 0);
-    if (dir_max == 0) dir_max = CELL_SAVEDATA_DIRLIST_MAX;
-    CellSaveDataDirList* dirList = (CellSaveDataDirList*)calloc(dir_max, sizeof(CellSaveDataDirList));
-
-    u32 dirCount = enumerate_save_dirs(
-        savedata_host_str((const char*)(uintptr_t)vm_read32((u32)(uintptr_t)setList + 8)) ?
-            savedata_host_str((const char*)(uintptr_t)vm_read32((u32)(uintptr_t)setList + 8)) : "",
-        dirList, dir_max);
-
-    /* Call list callback */
-    CellSaveDataCBResult cbResult;
-    memset(&cbResult, 0, sizeof(cbResult));
-    cbResult.result = CELL_SAVEDATA_CBRESULT_OK_NEXT;
-
-    CellSaveDataListGet listGet;
-    memset(&listGet, 0, sizeof(listGet));
-    listGet.dirListNum = dirCount < dir_max ? dirCount : dir_max;
-    listGet.dirList = dirList;
-
-    CellSaveDataListSet listSet;
-    memset(&listSet, 0, sizeof(listSet));
-
-    funcList(&cbResult, &listGet, &listSet);
-
-    if (cbResult.result < 0) {
-        free(dirList);
-        return CELL_SAVEDATA_ERROR_CBRESULT;
-    }
-
-    /* Determine selected directory name */
-    const char* selectedDir = NULL;
-    if (listSet.fixedList && listSet.fixedListNum > 0) {
-        selectedDir = listSet.fixedList[0].dirName;
-    } else if (listSet.focusDirName) {
-        selectedDir = listSet.focusDirName;
-    } else if (dirCount > 0) {
-        selectedDir = dirList[0].dirName;
-    }
-
-    if (!selectedDir || selectedDir[0] == '\0') {
-        free(dirList);
-        return CELL_SAVEDATA_ERROR_NODATA;
-    }
-
-    s32 result = savedata_execute(selectedDir, 1, setBuf, funcStat, funcFile, userdata);
-    free(dirList);
-    return result;
+    u32 i = 0; for (; str && str[i] && i + 1 < max; i++) vm_write8(ea + i, (u8)str[i]);
+    vm_write8(ea + i, 0);
+}
+static void sd_read_str(u32 ea, char* out, u32 max)
+{
+    u32 i = 0; if (ea) for (; i + 1 < max; i++) { out[i] = (char)vm_read8(ea + i); if (!out[i]) break; }
+    out[i] = 0;
 }
 
-s32 cellSaveDataListLoad2(u32 version, CellSaveDataSetList* setList,
-                           CellSaveDataSetBuf* setBuf,
-                           CellSaveDataListCallback funcList,
-                           CellSaveDataStatCallback funcStat,
-                           CellSaveDataFileCallback funcFile,
-                           u32 container, void* userdata)
+static s32 savedata_list_guest(int is_save, u32 setList_ea, u32 setBuf_ea, u32 funcList,
+                               u32 funcStat, u32 funcFile, u32 userdata)
 {
-    printf("[cellSaveData] ListLoad2(version=%u)\n", version);
-
-    if (!setList || !setBuf || !funcList || !funcStat)
+    if (!setList_ea || !setBuf_ea || !funcList || !funcStat)
+        return CELL_SAVEDATA_ERROR_PARAM;
+    u32 buf = vm_read32(setBuf_ea + 36), bufSize = vm_read32(setBuf_ea + 32);
+    u32 dirMax = vm_read32(setBuf_ea + 0);
+    if (!buf || bufSize < 0x1000)
         return CELL_SAVEDATA_ERROR_PARAM;
 
-    /* CellSaveDataSetList is { u32 sortType; u32 sortOrder; char* dirNamePrefix; }
-     * and CellSaveDataSetBuf starts with u32 dirListMax -- guest layout, so the
-     * prefix EA is the word at +8 and needs translating before it is used as a
-     * host string. The host structs put dirNamePrefix at +8 as an 8-byte
-     * pointer, so a cast would have read half of it plus padding. */
-    u32 dir_max = vm_read32((u32)(uintptr_t)setBuf + 0);
-    if (dir_max == 0) dir_max = CELL_SAVEDATA_DIRLIST_MAX;
-    CellSaveDataDirList* dirList = (CellSaveDataDirList*)calloc(dir_max, sizeof(CellSaveDataDirList));
+    /* le strutture delle callback: 2 KB in fondo al buffer del titolo */
+    u32 top = (buf + bufSize - 0x800) & ~15u;
+    u32 cbres = top, listGet = top + 0x20, listSet = top + 0x40, statSet = top + 0x60,
+        fileGet = top + 0x80, fileSet = top + 0xD0, statGet = top + 0x100;   /* +1640 < 0x800 */
+    for (u32 o = 0; o < 0x800; o += 4) vm_write32(top + o, 0);
 
-    u32 dirCount = enumerate_save_dirs(
-        savedata_host_str((const char*)(uintptr_t)vm_read32((u32)(uintptr_t)setList + 8)) ?
-            savedata_host_str((const char*)(uintptr_t)vm_read32((u32)(uintptr_t)setList + 8)) : "",
-        dirList, dir_max);
-
-    CellSaveDataCBResult cbResult;
-    memset(&cbResult, 0, sizeof(cbResult));
-    cbResult.result = CELL_SAVEDATA_CBRESULT_OK_NEXT;
-
-    CellSaveDataListGet listGet;
-    memset(&listGet, 0, sizeof(listGet));
-    listGet.dirListNum = dirCount < dir_max ? dirCount : dir_max;
-    listGet.dirList = dirList;
-
-    CellSaveDataListSet listSet;
-    memset(&listSet, 0, sizeof(listSet));
-
-    funcList(&cbResult, &listGet, &listSet);
-
-    if (cbResult.result < 0) {
-        free(dirList);
-        return CELL_SAVEDATA_ERROR_CBRESULT;
+    /* la lista delle directory esistenti (prefisso) in testa al buffer */
+    char prefix[64]; sd_read_str(vm_read32(setList_ea + 8), prefix, sizeof prefix);
+    u32 maxEntries = (top - buf) / 48; if (dirMax && dirMax < maxEntries) maxEntries = dirMax;
+    CellSaveDataDirList* tmp = (CellSaveDataDirList*)calloc(maxEntries ? maxEntries : 1, sizeof(CellSaveDataDirList));
+    u32 count = enumerate_save_dirs(prefix, tmp, maxEntries);
+    for (u32 i = 0; i < count; i++) {
+        u32 e = buf + i * 48;
+        for (u32 o = 0; o < 48; o += 4) vm_write32(e + o, 0);
+        sd_write_str(e, tmp[i].dirName, 32);
     }
+    free(tmp);
+    vm_write32(listGet + 0, count); vm_write32(listGet + 4, count); vm_write32(listGet + 8, buf);
 
-    const char* selectedDir = NULL;
-    if (listSet.fixedList && listSet.fixedListNum > 0) {
-        selectedDir = listSet.fixedList[0].dirName;
-    } else if (listSet.focusDirName) {
-        selectedDir = listSet.focusDirName;
-    } else if (dirCount > 0) {
-        selectedDir = dirList[0].dirName;
+    /* funcList */
+    marshal_cbresult_init(cbres, CELL_SAVEDATA_CBRESULT_OK_NEXT, userdata);
+    printf("[cellSaveData] %s: %u salvataggi con prefisso '%s'; funcList=0x%08X\n",
+           is_save ? "ListSave2" : "ListLoad2", count, prefix, funcList);
+    ps3_invoke_guest(funcList, cbres, listGet, listSet, 0, 0, 0, 0, 0);
+    s32 result = (s32)vm_read32(cbres);
+    if (result < 0) { printf("[cellSaveData] funcList -> %d\n", result); return CELL_SAVEDATA_ERROR_CBRESULT; }
+
+    /* la directory: newData, fixedList[0], focusDirName, o la prima */
+    char dirName[33] = {0};
+    u32 newData = vm_read32(listSet + 16), fixedNum = vm_read32(listSet + 8),
+        fixedList = vm_read32(listSet + 12), focus = vm_read32(listSet + 4);
+    if (newData && vm_read32(newData + 4)) sd_read_str(vm_read32(newData + 4), dirName, sizeof dirName);
+    else if (fixedNum && fixedList) sd_read_str(fixedList, dirName, sizeof dirName);
+    else if (focus) sd_read_str(focus, dirName, sizeof dirName);
+    else if (count) sd_read_str(buf, dirName, sizeof dirName);
+    if (!dirName[0]) { printf("[cellSaveData] funcList: nessuna directory scelta\n"); return CELL_SAVEDATA_ERROR_NODATA; }
+
+    char save_path[1024]; build_save_path(save_path, sizeof save_path, dirName);
+    int is_new = !dir_exists(save_path);
+    if (!is_save && is_new) { printf("[cellSaveData] ListLoad2: '%s' non esiste\n", dirName); return CELL_SAVEDATA_ERROR_NODATA; }
+    if (is_save) ensure_dirs(save_path);
+    printf("[cellSaveData] %s dir='%s' (nuova=%d)\n", is_save ? "SAVE" : "LOAD", dirName, is_new);
+
+    /* funcStat */
+    marshal_cbresult_init(cbres, CELL_SAVEDATA_CBRESULT_OK_NEXT, userdata);
+    marshal_statget_init(statGet, is_new, dirName, 0, 0);
+    if (!is_new) {   /* i parametri salvati la volta prima */
+        char pp[1100]; snprintf(pp, sizeof pp, "%s/PARAM.TXT", save_path);
+        FILE* pf = fopen(pp, "rb");
+        if (pf) { char line[1200];
+            while (fgets(line, sizeof line, pf)) { size_t L = strlen(line); while (L && (line[L-1] == '\n' || line[L-1] == '\r')) line[--L] = 0;
+                if (!strncmp(line, "title=", 6)) sd_write_str(statGet + 64, line + 6, 128);
+                else if (!strncmp(line, "subtitle=", 9)) sd_write_str(statGet + 64 + 128, line + 9, 128);
+                else if (!strncmp(line, "detail=", 7)) sd_write_str(statGet + 64 + 256, line + 7, 1024); }
+            fclose(pf); }
     }
-
-    if (!selectedDir || selectedDir[0] == '\0') {
-        free(dirList);
-        return CELL_SAVEDATA_ERROR_NODATA;
+    ps3_invoke_guest(funcStat, cbres, statGet, statSet, 0, 0, 0, 0, 0);
+    result = (s32)vm_read32(cbres);
+    if (result < 0) { printf("[cellSaveData] funcStat -> %d\n", result); return CELL_SAVEDATA_ERROR_CBRESULT; }
+    if (is_save) {
+        u32 setParam = vm_read32(statSet + 0);
+        if (setParam) {
+            char title[129], sub[129], det[1025];
+            sd_read_str(setParam, title, sizeof title); sd_read_str(setParam + 128, sub, sizeof sub); sd_read_str(setParam + 256, det, sizeof det);
+            char pp[1100]; snprintf(pp, sizeof pp, "%s/PARAM.TXT", save_path);
+            FILE* pf = fopen(pp, "wb");
+            if (pf) { fprintf(pf, "title=%s\nsubtitle=%s\ndetail=%s\n", title, sub, det); fclose(pf); }
+            printf("[cellSaveData] setParam: '%s' / '%s'\n", title, sub);
+        }
     }
+    if (result == CELL_SAVEDATA_CBRESULT_OK_LAST) return CELL_OK;
 
-    s32 result = savedata_execute(selectedDir, 0, setBuf, funcStat, funcFile, userdata);
-    free(dirList);
-    return result;
+    /* funcFile, finche' il titolo risponde OK_NEXT */
+    for (int iter = 0; iter < 256; iter++) {
+        marshal_cbresult_init(cbres, CELL_SAVEDATA_CBRESULT_OK_NEXT, userdata);
+        for (u32 o = 0; o < 0x30; o += 4) vm_write32(fileSet + o, 0);
+        vm_write32(fileGet, 0);
+        ps3_invoke_guest(funcFile, cbres, fileGet, fileSet, 0, 0, 0, 0, 0);
+        result = (s32)vm_read32(cbres);
+        if (result < 0) { printf("[cellSaveData] funcFile -> %d\n", result); return CELL_SAVEDATA_ERROR_CBRESULT; }
+        u32 op = vm_read32(fileSet + 0), type = vm_read32(fileSet + 8), name_ea = vm_read32(fileSet + 28);
+        u32 off = vm_read32(fileSet + 32), size = vm_read32(fileSet + 36), bufsz = vm_read32(fileSet + 40), fbuf = vm_read32(fileSet + 44);
+        char fname[64];
+        switch (type) {
+        case CELL_SAVEDATA_FILETYPE_CONTENT_ICON0: strcpy(fname, "ICON0.PNG"); break;
+        case CELL_SAVEDATA_FILETYPE_CONTENT_ICON1: strcpy(fname, "ICON1.PAM"); break;
+        case CELL_SAVEDATA_FILETYPE_CONTENT_PIC1:  strcpy(fname, "PIC1.PNG");  break;
+        case CELL_SAVEDATA_FILETYPE_CONTENT_SND0:  strcpy(fname, "SND0.AT3");  break;
+        default: sd_read_str(name_ea, fname, sizeof fname); break;
+        }
+        char fpath[1100]; snprintf(fpath, sizeof fpath, "%s/%s", save_path, fname);
+        u32 done = 0;
+        if (fname[0]) {
+            if (op == CELL_SAVEDATA_FILEOP_WRITE || op == CELL_SAVEDATA_FILEOP_WRITE_NOTRUNC) {
+                FILE* f = fopen(fpath, (op == CELL_SAVEDATA_FILEOP_WRITE && off == 0) ? "wb" : "r+b");
+                if (!f && op != CELL_SAVEDATA_FILEOP_WRITE) f = fopen(fpath, "wb");
+                if (!f) f = fopen(fpath, "wb");
+                if (f) { fseeko(f, (off_t)off, SEEK_SET); u32 n = size < bufsz ? size : bufsz;
+                         if (fbuf && n) done = (u32)fwrite(vm_base + fbuf, 1, n, f); fclose(f); }
+            } else if (op == CELL_SAVEDATA_FILEOP_READ) {
+                FILE* f = fopen(fpath, "rb");
+                if (f) { fseeko(f, (off_t)off, SEEK_SET); u32 n = size < bufsz ? size : bufsz;
+                         if (fbuf && n) done = (u32)fread(vm_base + fbuf, 1, n, f); fclose(f); }
+            } else if (op == CELL_SAVEDATA_FILEOP_DELETE) {
+                remove(fpath); done = 0;
+            }
+        }
+        vm_write32(fileGet, done);
+        printf("[cellSaveData] funcFile: op=%u tipo=%u '%s' off=%u size=%u -> %u byte, result=%d\n",
+               op, type, fname, off, size, done, result);
+        if (result == CELL_SAVEDATA_CBRESULT_OK_LAST) break;
+    }
+    return CELL_OK;
+}
+
+s32 cellSaveDataListSave2(u32 version, u32 setList_ea, u32 setBuf_ea, u32 funcList,
+                          u32 funcStat, u32 funcFile, u32 container, u32 userdata)
+{
+    (void)version; (void)container;
+    return savedata_list_guest(1, setList_ea, setBuf_ea, funcList, funcStat, funcFile, userdata);
+}
+
+s32 cellSaveDataListLoad2(u32 version, u32 setList_ea, u32 setBuf_ea, u32 funcList,
+                          u32 funcStat, u32 funcFile, u32 container, u32 userdata)
+{
+    (void)version; (void)container;
+    return savedata_list_guest(0, setList_ea, setBuf_ea, funcList, funcStat, funcFile, userdata);
 }
 
 s32 cellSaveDataFixedSave2(u32 version, CellSaveDataSetList* setList,
