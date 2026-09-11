@@ -1646,11 +1646,15 @@ static void gcm_rsx_process_fifo_unlocked(void)
                      * che pero' non arriva, perche' il titolo sta aspettando
                      * proprio quel fence. */
                     continue; }
+              { static int _rd = -1; if (_rd < 0) _rd = getenv("GCM_RECDBG") ? 1 : 0;
+                if (_rd) fprintf(stderr, "[CALL] %08X -> %08X (put=%08X)\n", s_fifo_getoff, tgt, put); }
               s_fifo_calloff = s_fifo_getoff + 4;
               s_fifo_getoff  = tgt; }
             continue;
         }
         if (w == 0x00020000u) {                /* RET */
+            { static int _rd = -1; if (_rd < 0) _rd = getenv("GCM_RECDBG") ? 1 : 0;
+              if (_rd) fprintf(stderr, "[RET] %08X -> %08X (put=%08X)\n", s_fifo_getoff, s_fifo_calloff, put); }
             s_fifo_getoff = s_fifo_calloff;
             s_fifo_calloff = 0;
             continue;
@@ -1796,13 +1800,34 @@ static void gcm_rsx_process_fifo_unlocked(void)
             fprintf(stderr, "[FIFOUW] unknown word 0x%08X at getoff 0x%X\n", w, s_fifo_getoff); }
         s_fifo_getoff += 4;                    /* unknown word: skip */
     }
-    /* Uscita per esaurimento del budget: era muta, e lascia `get` a meta' di un
-     * segmento senza che nessuno lo dica ("NON arrivato a put" senza causa). */
+    /* Uscita per esaurimento del budget: il walker gira in un ciclo di JUMP
+     * che non arriva mai a `put`. Il rilevatore di cicli (hash del target,
+     * (tgt>>2)&255) NON lo prende quando i due archi dell'anello collidono
+     * sullo stesso bucket -- misurato con l'anello 0x10000/0x660000, che danno
+     * entrambi hash 0, quindi s_seen_tgt[0] oscilla e non segnala mai.
+     *
+     * Il recupero e' quello di GCM_STRAND_FIX: l'anello e' sempre
+     * [SET_REFERENCE][valore][JUMP], `put` sta subito dopo il valore, e se a
+     * `put`-8 c'e' davvero un'intestazione SET_REFERENCE ci si rimette in pari
+     * da li'. Scatta solo a budget esaurito -- uno stato in cui la FIFO e' gia'
+     * morta -- quindi non puo' peggiorare un caso sano. */
     if (budget <= 0 && s_fifo_getoff != put) {
         static unsigned nb = 0;
+        int fix = 0;
+        { static int f = -1;
+          if (f < 0) { const char* e = getenv("GCM_STRAND_FIX"); f = (e && *e == '0') ? 0 : 1; }
+          if (f && put >= 8) {
+              u32 fe = gcm_io2ea(put - 8);
+              u32 fw = fe ? vm_read32(fe) : 0;
+              if (fe && (fw >> 29) == 0 && (fw & 0x1FFCu) == 0x0050u) {
+                  s_fifo_getoff = put - 8; fix = 1;
+              } } }
         if (nb++ < 32)
-            fprintf(stderr, "[cellGcmSys] budget esaurito (%d parole) a get=0x%08X put=0x%08X\n",
-                    budget0, s_fifo_getoff, put);
+            fprintf(stderr, "[cellGcmSys] budget esaurito (%d parole, ciclo di JUMP) a "
+                    "get=0x%08X put=0x%08X%s\n", budget0,
+                    fix ? (put - 8) : s_fifo_getoff, put,
+                    fix ? " -- riprendo dal SET_REFERENCE a put-8" : "");
+        if (fix) gcm_rsx_process_fifo_unlocked();   /* consuma fence + arriva a put */
     }
 
     /* Walker watchdog. Everything above recovers from a *recognised* stall --

@@ -24,9 +24,11 @@ cinematiche in-game, 829 voci, sottotitoli, e le icone dell'HUD (`assault-rifle-
 sulla parola a `0x20000000` era il job manager WwsJob che, con la local store
 conservata da una corsa all'altra, non rileggeva la job list dopo il
 `ResetList` del PPU. Con `SPURS_PM_FRESH=1` (ora default in `run.sh`) fa 500+
-fotogrammi senza fermarsi. La finestra però è **nera**, e resta un secondo
-blocco, sul lato RSX ("Rendering is stuck on reference value N", 1 corsa su
-2-5). Dettagli nella sezione "Sessione 20".
+fotogrammi senza fermarsi. La finestra però è **nera** (il gioco disegna ma il backend Metal non ha
+ancora vertex program/depth/RTT). Il secondo blocco, sul lato RSX ("Rendering
+is stuck on reference value N"), era un ciclo di JUMP che il rilevatore non
+prendeva per collisione di hash: ora recuperato a budget esaurito, zero stalli
+in 8 corse. Dettagli nella sezione "Sessione 20".
 
 Quanto arriva a fare, dal log:
 
@@ -416,13 +418,20 @@ azzerato e immagine ricaricata a ogni dispatch). Misura, corse da 150 s:
 dal repo, come gli altri). Il commento in `spurs_policy.c` dice gia' che la
 persistenza era una pezza per un bug dell'r4 poi risolto.
 
-Il gioco ora **gira in continuo** dopo il caricamento (~30 fotogrammi/s, 500+
-fotogrammi senza fermarsi). La finestra pero' e' **nera**: screenshot con
-`screencapture -l <id>` a 80 s, tutto `#000000`. Il titolo della finestra e'
-ancora "You Don't Know Jack (ps3recomp)" (cosmetico). Nessun nuovo file viene
-letto dopo `common.bnk` (riga ~12.500 del log): il gioco e' in un ciclo di
-fotogrammi stabile — plausibilmente una schermata che aspetta qualcosa
-(input? il video di intro? un fence?), da capire con il backend Metal.
+**Non e' una cura al 100%, e' una forte mitigazione.** Corsa pulita (macchina
+scarica): 524+ fotogrammi e ancora vivo, un solo `spinning` transitorio a
+confine di fotogramma. Ma sotto contesa (8 corse consecutive back-to-back +
+questa sessione) il modo A ritorna in modo erratico: PUT per corsa
+921/191/757/113/304/**4/28**/184 — due corse si sono fermate a 4 e 28
+fotogrammi. E' la trappola gia' annotata: **misurare con la macchina occupata
+porta fuori strada.** La causa residua del modo A resta da trovare (allo
+stallo la coda lock-free e' comunque vuota, `pop1==push1`).
+
+La finestra e' **nera**: `screencapture -l <id>` su una corsa da 524 fotogrammi,
+centro `(0,0,0)`, l'unico bianco e' la barra del titolo. Il gioco disegna (la
+FIFO drena comandi di draw) ma niente arriva a schermo: e' il buco del backend
+Metal gia' elencato (vertex program in MSL, depth/stencil, MRT, RTT, crossbar
+delle texture). E' il prossimo fronte, non lo stallo.
 
 ### Il secondo modo di fermarsi: "Rendering is stuck on reference value N"
 
@@ -434,14 +443,27 @@ una sola riga:
 Rendering is stuck on reference value N+1. Starting infinite heartbeat loop.
 ```
 
-La passata di drain, partita alla scrittura di `put`, si ferma a `get` dentro
-un segmento a `0x0066xxxx` senza arrivare a `put`; il PPU aspetta il fence
-N+1 e non muove piu' `put`, e con `GCM_DRAIN_ONLY_PUT=1` nessuno ridrena.
-**Non e'** il parcheggio su zeri (`FIFO: zeri a ...` non compare mai): la
-passata esce da un altro `break`. Sospetto: la parola di flip `0xFEAD....`,
-che chiude la passata "per mostrare esattamente il fotogramma finito", con il
-fence accodato DOPO il flip nello stesso batch. La stampa `NON arrivato` ora
-riporta `[get-4]` e `[get]` per dirlo.
+**RISOLTO (o quasi).** Con il trace JUMP/CALL/RET (`GCM_RECDBG=1`) il walker
+gira in un ciclo di due archi che non arriva mai a `put`:
+
+```
+[JMP] 00660AB0 -> 00010000 (put=00011008)
+[JMP] 00010008 -> 00660000 (put=00011008)   ... 500.000 volte, budget esaurito
+```
+
+Il rilevatore di cicli c'e' gia' (hash del target, `(tgt>>2)&255`) ma **non lo
+prende**: `0x10000` e `0x660000` collidono sullo stesso bucket (entrambi hash
+0), quindi `s_seen_tgt[0]` oscilla fra i due e non segnala mai. Il walker
+cammina fino al tetto di 0x100000 parole ed esce muto.
+
+Il fix e' lo stesso di `GCM_STRAND_FIX`: l'anello e'
+`[SET_REFERENCE][valore][JUMP]`, `put` sta subito dopo il valore, e se a
+`put`-8 c'e' un'intestazione SET_REFERENCE ci si rimette in pari da li'. Scatta
+**solo a budget esaurito** — uno stato in cui la FIFO e' gia' morta — quindi
+non puo' peggiorare un caso sano. Misura: 8 corse, **zero** "stuck on
+reference" (prima 1 su 2-5), il recupero scatta ogni volta che serve
+(`recover==budget`). La stampa `NON arrivato` ora riporta `[get-4]`/`[get]` e il
+budget esaurito nomina il ciclo.
 
 ### Strumenti nuovi
 
@@ -451,6 +473,10 @@ riporta `[get-4]` e `[get]` per dirlo.
   exitToKernel (attenzione: e' anche l'uscita normale "niente da fare" a
   `pc=0x02CE0`, quindi inonda — usarla solo con `grep -v 'pc=0x02CE0'`).
 - `[putdrain] NON arrivato` stampa anche le parole a `get-4` e `get`.
+- `GCM_RECDBG=1`: `[JMP]`/`[CALL]`/`[RET]` del walker della FIFO (chi salta
+  dove), piu' `[SEMA]`, `[REC>]`. Serve a vedere i cicli di JUMP.
+- `[cellGcmSys] budget esaurito ...`: il walker ha girato 0x100000 parole
+  senza arrivare a `put` (ciclo di JUMP); dice se e' scattato il recupero.
 - Screenshot della finestra: `swift scratchpad/winid.swift <pid>` da' l'id,
   poi `screencapture -x -l <id> out.png`.
 

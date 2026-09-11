@@ -1645,9 +1645,18 @@ static DWORD WINAPI spurs_kernel_thread(LPVOID p)
             { static int s_dt = -1;
               if (s_dt < 0) s_dt = getenv("SPURS_DISPATCH_TRACE") ? 1 : 0;
               if (s_dt && (kicked || g_spurs_pm_polls)) {
-                  fprintf(stderr, "[spurs-disp] wid=%u kicked=%d arg=0x%016llX polls=%u exited=%u rdy_now=%u\n",
+                  /* Anche l'intestazione della job list DOPO la corsa (0x00..0x3F:
+                   * intestazione + primi 4 job): dice se il job c'era e se il
+                   * manager l'ha preso. Le scritture del PPU qui non passano da
+                   * vm_write* (store vettoriali), quindi la watch non le vede. */
+                  char hb[200]; int hp = 0;
+                  { const uint8_t* m = (const uint8_t*)vm_base + (uint32_t)arg;
+                    for (int o = 0; o < 0x40 && hp < (int)sizeof hb - 12; o += 4)
+                        hp += snprintf(hb + hp, sizeof hb - hp, "%s%02X%02X%02X%02X",
+                                       (o % 16) ? " " : " | ", m[o], m[o+1], m[o+2], m[o+3]); }
+                  fprintf(stderr, "[spurs-disp] wid=%u kicked=%d arg=0x%016llX polls=%u exited=%u rdy_now=%u%s\n",
                           wid, kicked, (unsigned long long)arg, g_spurs_pm_polls,
-                          g_spurs_pm_exited, (unsigned)*rdy);
+                          g_spurs_pm_exited, (unsigned)*rdy, hb);
               } }
             /* "Found work" heuristic: a module that did something polls the
              * kernel for MORE work before exiting (selectWorkload calls >0);
