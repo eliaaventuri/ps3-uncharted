@@ -1564,7 +1564,7 @@ static DWORD WINAPI spurs_kernel_thread(LPVOID p)
                 if (kicked) s_idle[wid] = 0;
                 u32 cad = 1u << (s_idle[wid] > 4 ? 4 : s_idle[wid]);
                 if (!kicked && (s_pass_no & (cad - 1)) != 0) continue;
-                extern volatile unsigned g_spurs_pm_polls;
+                extern volatile unsigned g_spurs_pm_polls, g_spurs_pm_exited;
                 u32 polls_before = g_spurs_pm_polls;   /* heuristic only */
                 (void)polls_before;
 
@@ -1638,6 +1638,17 @@ static DWORD WINAPI spurs_kernel_thread(LPVOID p)
                 }
             }
             *(vm_base + ea + SPURS_WKL_CURCONT + wid) = 0;
+            /* SPURS_DISPATCH_TRACE=1: una riga per ogni corsa del PM che era
+             * stata chiesta (kick) o che ha trovato lavoro (polls>0). Serve a
+             * dire QUALE wid gira quando il PPU arma un lavoro e nessuno lo
+             * completa: il trace `poll #1` non nomina il workload. */
+            { static int s_dt = -1;
+              if (s_dt < 0) s_dt = getenv("SPURS_DISPATCH_TRACE") ? 1 : 0;
+              if (s_dt && (kicked || g_spurs_pm_polls)) {
+                  fprintf(stderr, "[spurs-disp] wid=%u kicked=%d arg=0x%016llX polls=%u exited=%u rdy_now=%u\n",
+                          wid, kicked, (unsigned long long)arg, g_spurs_pm_polls,
+                          g_spurs_pm_exited, (unsigned)*rdy);
+              } }
             /* "Found work" heuristic: a module that did something polls the
              * kernel for MORE work before exiting (selectWorkload calls >0);
              * an idle module exits immediately with polls==0. Grow the idle

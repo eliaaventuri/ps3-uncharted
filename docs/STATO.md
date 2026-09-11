@@ -1,6 +1,6 @@
 # Stato del progetto
 
-Ultimo aggiornamento: **9 settembre 2026** — sessione 19.
+Ultimo aggiornamento: **11 settembre 2026** — sessione 20.
 
 ## Dove siamo
 
@@ -20,10 +20,13 @@ gioco carica **contenuto vero** che non aveva mai raggiunto: pacchetti di livell
 cinematiche in-game, 829 voci, sottotitoli, e le icone dell'HUD (`assault-rifle-a`,
 `bullets`, `treasure`).
 
-**Il prossimo passo** è l'attesa che resta dopo il caricamento: il thread
-principale del PPU gira a vuoto aspettando il bit 0 della parola a `0x20000000`,
-che una SPU dovrebbe scrivere e a un certo punto smette di scrivere. Dettagli e
-numeri nella sezione "Il fronte nuovo: dopo il caricamento".
+**Dalla sessione 20 il gioco non si ferma più dopo il caricamento**: lo stallo
+sulla parola a `0x20000000` era il job manager WwsJob che, con la local store
+conservata da una corsa all'altra, non rileggeva la job list dopo il
+`ResetList` del PPU. Con `SPURS_PM_FRESH=1` (ora default in `run.sh`) fa 500+
+fotogrammi senza fermarsi. La finestra però è **nera**, e resta un secondo
+blocco, sul lato RSX ("Rendering is stuck on reference value N", 1 corsa su
+2-5). Dettagli nella sezione "Sessione 20".
 
 Quanto arriva a fare, dal log:
 
@@ -318,6 +321,139 @@ La lista dei comandi ora viene percorsa fino in fondo — sei coppie
 risultati in memoria principale.** Non era mai successo in nessuna sessione.
 Riproducibile: **tre corse su tre**, identiche -- 14 comandi, un overlay
 residente, zero microstep, cinque stall e due interrupt per corsa.
+
+## Sessione 20 — lo stallo dopo il caricamento era il job manager, non l'event flag
+
+Due correzioni alla diagnosi della sessione 19, entrambe misurate, e la causa
+vera con la sua soluzione.
+
+### La SPU pone l'event flag, eccome — la finestra DMA era cieca agli atomici
+
+La sessione 19 concludeva "zero scritture della SPU in `0x2A870C80`" con
+`SPU_DMA_EAWIN`. **Quella finestra non vede GETLLAR/PUTLLC**: gli atomici
+passano da `spu_mfc_atomic()` in `spu_channels.c` e ritornano PRIMA di
+`mfc_do_transfer()`, dove sta la stampa. Lo strumento giusto e' `SPU_ATOM_EA`
+(ora con `SPU_ATOM_MAX` per alzare il tetto di 48 righe):
+
+- `SPU_ATOM_EA=0x2A870C80 SPU_ATOM_MAX=100000`: **462 PUTLLC** dell'immagine 1
+  (`pc=0x0958C lr=0x034AC`), uno per ogni push nella coda lock-free, ognuno
+  con `STORE=00010000 ...` cioe' `events |= 1`. La struttura dice
+  `direction=1` (SPU→PPU), `clearMode=0` (auto).
+- `cellSpursEventFlagWait` esce ogni volta: **zero righe `BLOCKED`** in
+  150 secondi (la stampa scatta dopo 1 s di attesa).
+
+Quindi il PPU non aspettava un event flag. Aspettava davvero la parola a
+`0x20000000`, come diceva la prima parte della sessione 19.
+
+### La stretta di mano su `0x20000000`, misurata (SPU-FLAG-02)
+
+`YDKJ_WWATCH=0x20000000` + `SPU_DMA_EAWIN=0x20000000:0x20000010`, per fotogramma:
+
+```
+PPU  write32 0x20000000 = 0      (guest-fn 0x00566980, poi 0x00566350)  <- arma
+PPU  sys_event_port_send(port=1,2, data=0x0FEFCA84) -> "Job Manager Event Handler"
+SPU  img=2 pc=0x06120 PUT ea=0x20000000 dati=00000001 00000000            <- fine
+SPU  img=1: 5-7 job dalla coda lock-free, ognuno con un PUTLLC sull'event flag
+```
+
+Allo stallo: **armato e mai finito** (`chiesti == finiti + 1`). L'ultimo
+`write32 = 0` c'e', il PUT della SPU no, e i job della coda lock-free dopo di
+esso sono 12 invece di 6 (il thread che li accoda va avanti un po' da solo).
+
+### Chi esegue il lavoro del fotogramma: `wid=4`, job list `0x2A8D1C00`
+
+Nuovo strumento `SPURS_DISPATCH_TRACE=1` (`cellSpurs.c`): una riga per ogni
+corsa del policy module che era stata chiesta (kick) o che ha trovato lavoro
+(`polls>0`), con wid, argomento (EA della job list), polls, exit. Nel ciclo
+normale:
+
+```
+[spurs-disp] wid=4 kicked=1 arg=0x2A8D1C00 polls=1 exited=1 rdy_now=7   <- il job
+[spurs-disp] wid=6 kicked=1 arg=0x106F0780 polls=0 exited=1
+[spurs-disp] wid=4 kicked=1 arg=0x2A8D1C00 polls=0 exited=1 rdy_now=0
+```
+
+e il PPU, dopo ogni job, fa **`ResetList`** sulla job list (`0x0073FDF0`:
+azzera `+0x20..+0x7F`, scrive `FFFF` nelle sei corsie `+0x14..+0x1E`, zero in
+`+0x10/+0x12`), poi accoda il job successivo e chiama
+`cellSpursReadyCountStore(wid=4, 8)`.
+
+Allo stallo:
+
+```
+[spurs-disp] wid=4 kicked=1 arg=0x2A8D1C00 polls=0 exited=0 rdy_now=7
+[spurs-disp] wid=4 kicked=1 ...                 polls=0 exited=0 rdy_now=6
+   ... otto volte, fino a rdy_now=0, poi piu' niente
+```
+
+Otto corse consecutive del job manager su `wid=4`, ognuna termina subito con
+`stop` a `pc=0x02CE0` (l'uscita "niente da fare", `lr=0x9C0`), il readyCount
+si consuma fino a zero e nessuno lo rialza. Il job c'e' (il PPU l'ha accodato
+e armato), **il manager non lo vede**. I due thread del kernel SPURS non sono
+bloccati (lldb: entrambi in `nanosleep`, il ciclo di 1 ms gira).
+
+### LA CAUSA: il contesto persistente del policy module
+
+`spurs_policy.c` tiene la local store del policy module **da una corsa
+all'altra** (`s_pm_ctx[wid][spu]`), "perche' un PM vero resta residente sulla
+SPU". Ma un kernel SPURS vero ricarica il PM da zero **ogni volta che cambia
+workload** sulla SPU — cioe' continuamente, con 8 workload su 5 SPU — quindi
+WwsJob non puo' fidarsi di niente che abbia lasciato in LS, e infatti rientra
+correttamente da un contesto pulito. Con la LS conservata, dopo il `ResetList`
+del PPU il manager riparte da uno stato che dice "gia' fatto" e non rilegge la
+lista.
+
+Il runtime aveva gia' l'interruttore A/B: `SPURS_PM_FRESH=1` (contesto
+azzerato e immagine ricaricata a ogni dispatch). Misura, corse da 150 s:
+
+| | contesto persistente (default runtime) | `SPURS_PM_FRESH=1` |
+|---|---|---|
+| fotogrammi completati (PUT a 0x20000000) | 57, 62, 16, 32 → **stallo** | **539, 366** → nessuno stallo |
+| spin del PPU su 0x20000000 | si', 3 corse su 3 | **mai**, 2 su 2 |
+| caricamento (SendSignal / Pread / RequestLevel) | 462 / 79 / 4 | 462 / 79 / 4 (identico) |
+
+`SPURS_PM_FRESH=1` e' ora il default in `run.sh` (parametro del titolo, fuori
+dal repo, come gli altri). Il commento in `spurs_policy.c` dice gia' che la
+persistenza era una pezza per un bug dell'r4 poi risolto.
+
+Il gioco ora **gira in continuo** dopo il caricamento (~30 fotogrammi/s, 500+
+fotogrammi senza fermarsi). La finestra pero' e' **nera**: screenshot con
+`screencapture -l <id>` a 80 s, tutto `#000000`. Il titolo della finestra e'
+ancora "You Don't Know Jack (ps3recomp)" (cosmetico). Nessun nuovo file viene
+letto dopo `common.bnk` (riga ~12.500 del log): il gioco e' in un ciclo di
+fotogrammi stabile — plausibilmente una schermata che aspetta qualcosa
+(input? il video di intro? un fence?), da capire con il backend Metal.
+
+### Il secondo modo di fermarsi: "Rendering is stuck on reference value N"
+
+Resta il blocco RSX (1 corsa su 2-5, anche con FRESH). Firma nel log, sempre
+una sola riga:
+
+```
+[putdrain] NON arrivato a put: get=0066xxxx put=0001x008 ref=N
+Rendering is stuck on reference value N+1. Starting infinite heartbeat loop.
+```
+
+La passata di drain, partita alla scrittura di `put`, si ferma a `get` dentro
+un segmento a `0x0066xxxx` senza arrivare a `put`; il PPU aspetta il fence
+N+1 e non muove piu' `put`, e con `GCM_DRAIN_ONLY_PUT=1` nessuno ridrena.
+**Non e'** il parcheggio su zeri (`FIFO: zeri a ...` non compare mai): la
+passata esce da un altro `break`. Sospetto: la parola di flip `0xFEAD....`,
+che chiude la passata "per mostrare esattamente il fotogramma finito", con il
+fence accodato DOPO il flip nello stesso batch. La stampa `NON arrivato` ora
+riporta `[get-4]` e `[get]` per dirlo.
+
+### Strumenti nuovi
+
+- `SPU_ATOM_MAX=<n>`: tetto delle righe `[atom-ea]` (default 48).
+- `SPURS_DISPATCH_TRACE=1`: `[spurs-disp]` per ogni corsa del PM chiesta o
+  produttiva; e `[spurs-pm] END ...` per ogni corsa che non passa da
+  exitToKernel (attenzione: e' anche l'uscita normale "niente da fare" a
+  `pc=0x02CE0`, quindi inonda — usarla solo con `grep -v 'pc=0x02CE0'`).
+- `[putdrain] NON arrivato` stampa anche le parole a `get-4` e `get`.
+- Screenshot della finestra: `swift scratchpad/winid.swift <pid>` da' l'id,
+  poi `screencapture -x -l <id> out.png`.
+
 
 ## Sessione 19 — il segmento tagliato sotto i piedi
 

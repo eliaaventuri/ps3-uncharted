@@ -422,9 +422,16 @@ int spu_run_policy_module(spu_lifted_entry_fn entry, int image_id,
         }
     }
 
-    if (log_this) {
-        fprintf(stderr, "[spurs-pm] END wid=%u status=0x%X pc=0x%05X polls=%u exited=%u\n",
-                wid, ctx->status, ctx->pc, g_spurs_pm_polls, g_spurs_pm_exited);
+    /* Una corsa che finisce SENZA passare da exitToKernel e' anomala (il PM
+     * e' un programma persistente: o esce dal kernel o non esce). Con
+     * SPURS_DISPATCH_TRACE=1 la si stampa sempre, col punto in cui si e'
+     * fermata e il registro di collegamento. */
+    static int s_dt = -1;
+    if (s_dt < 0) s_dt = getenv("SPURS_DISPATCH_TRACE") ? 1 : 0;
+    if (log_this || (s_dt && !g_spurs_pm_exited)) {
+        fprintf(stderr, "[spurs-pm] END wid=%u status=0x%X pc=0x%05X lr=0x%05X polls=%u exited=%u\n",
+                wid, ctx->status, ctx->pc & SPU_LS_MASK, ctx->gpr[0]._u32[0] & SPU_LS_MASK,
+                g_spurs_pm_polls, g_spurs_pm_exited);
         fflush(stderr);
     }
 

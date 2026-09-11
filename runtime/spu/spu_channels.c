@@ -402,7 +402,12 @@ static int spu_mfc_atomic(spu_context* ctx, uint32_t cmd)
             g_barrier_sync_watch = s_aea; } /* arm PUTLLC OK/FAIL verdict log */ }
       if (s_ae == 1 && ((uint32_t)ea & ~127u) == s_aea) {
           static int _n = 0;
-          if (_n++ < 48) {
+          /* SPU_ATOM_MAX alza il tetto (default 48): un flag posto ogni
+           * fotogramma supera 48 righe in due secondi. */
+          static int s_am = -1;
+          if (s_am < 0) { const char* m = getenv("SPU_ATOM_MAX");
+                          s_am = (m && *m) ? atoi(m) : 48; }
+          if (_n++ < s_am) {
               extern uint8_t* vm_base;
               const uint8_t* r = vm_base + ((uint32_t)ea & ~127u);
               static int s_af = -1;

@@ -1305,8 +1305,13 @@ void cellGcm_on_put_write(void)
       if (s_fifo_getoff != put_now) {
           static unsigned n = 0;
           if (n++ < 12)
-              fprintf(stderr, "[putdrain] NON arrivato a put: get=%08X put=%08X ref=%u\n",
-                      s_fifo_getoff, put_now, vm_read32(GCM_CONTROL_GUEST_ADDR + 8));
+              /* Anche la parola PRIMA di `get`: dice su cosa si e' fermata la
+               * passata (un flip 0xFEAD..., un JUMP, degli zeri). */
+              { u32 pe = gcm_io2ea(s_fifo_getoff - 4), ge = gcm_io2ea(s_fifo_getoff);
+                fprintf(stderr, "[putdrain] NON arrivato a put: get=%08X put=%08X ref=%u "
+                        "[get-4]=%08X [get]=%08X\n",
+                        s_fifo_getoff, put_now, vm_read32(GCM_CONTROL_GUEST_ADDR + 8),
+                        pe ? vm_read32(pe) : 0, ge ? vm_read32(ge) : 0); }
       } }
     s_in_put_hook = 0;
     in = 0;
@@ -1380,6 +1385,7 @@ static void gcm_rsx_process_fifo_unlocked(void)
         fprintf(stderr, "[SCANREF] %u SET_REFERENCE in 0..%08X\n", found, put);
       } }
     int budget = 0x100000;                    /* words per tick cap */
+    const int budget0 = budget;
     /* Da dove e' partita QUESTA passata: dopo un park la passata seguente
      * riparte da dentro il segmento e non vede piu' l'uscita. */
     u32 pass_start = s_fifo_getoff;
@@ -1789,6 +1795,14 @@ static void gcm_rsx_process_fifo_unlocked(void)
         { static int _uw = 0; if (_uw++ < 16 && getenv("RTT_DUMP"))
             fprintf(stderr, "[FIFOUW] unknown word 0x%08X at getoff 0x%X\n", w, s_fifo_getoff); }
         s_fifo_getoff += 4;                    /* unknown word: skip */
+    }
+    /* Uscita per esaurimento del budget: era muta, e lascia `get` a meta' di un
+     * segmento senza che nessuno lo dica ("NON arrivato a put" senza causa). */
+    if (budget <= 0 && s_fifo_getoff != put) {
+        static unsigned nb = 0;
+        if (nb++ < 32)
+            fprintf(stderr, "[cellGcmSys] budget esaurito (%d parole) a get=0x%08X put=0x%08X\n",
+                    budget0, s_fifo_getoff, put);
     }
 
     /* Walker watchdog. Everything above recovers from a *recognised* stall --
