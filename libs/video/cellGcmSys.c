@@ -1471,7 +1471,26 @@ static void gcm_rsx_process_fifo_unlocked(void)
                             if (nlog++ < 100000)
                                 fprintf(stderr, "[cellGcmSys] segmento senza uscita a 0x%08X: "
                                         "riprendo dal SET_REFERENCE a 0x%08X (put=0x%08X)\n",
-                                        s_fifo_getoff, put - 8, put); }
+                                        s_fifo_getoff, put - 8, put);
+                            /* GCM_STRAND_PEEK=1: le 48 parole dopo il punto di
+                             * arenamento. Dice se gli zeri sono la fine dei dati
+                             * scritti o solo un riempimento (NOP) seguito da altri
+                             * comandi che stiamo buttando. */
+                            { static int s_pk = -1;
+                              if (s_pk < 0) s_pk = getenv("GCM_STRAND_PEEK") ? 1 : 0;   /* GCM_STRAND_PEEK=1: 64 parole prima e 16 dopo ogni punto di arenamento del walker (prime 40) */
+                              if (s_pk && nlog <= 40) {
+                                  /* 64 parole PRIMA e 16 dopo: se prima degli zeri
+                                   * c'e' un JUMP di coda che abbiamo scavalcato, il
+                                   * difetto e' nel conteggio di un metodo. */
+                                  fprintf(stderr, "[strand-peek] 0x%08X (da -0x100):", s_fifo_getoff);
+                                  for (u32 q = 0; q < 80; q++) {
+                                      u32 io2 = s_fifo_getoff - 0x100 + q * 4;
+                                      u32 pe2 = gcm_io2ea(io2);
+                                      if (!pe2) break;
+                                      fprintf(stderr, "%s%08X", (q % 8) ? " " : (q == 64 ? "\n>> " : "\n   "), vm_read32(pe2));
+                                  }
+                                  fprintf(stderr, "\n");
+                              } } }
                           s_fifo_getoff = put - 8;
                           continue;
                       }

@@ -229,7 +229,14 @@ int spu_run_with_halt(void (*entry)(spu_context*), spu_context* ctx)
 /* ===========================================================================
  * Per-context MFC engine registry
  * ===========================================================================*/
-#define SPU_MAX_CONTEXTS 8
+/* Erano 8, e chi restava fuori finiva su UN motore condiviso ("correct for
+ * single-SPU"). Uncharted ha 9 workload WwsJob da 5-6 lane persistenti l'uno:
+ * decine di contesti si contendevano lo stesso `tag_completed` da thread host
+ * diversi, e un aggiornamento perso lasciava un tag (il 31) incompleto per
+ * sempre -- la lane girava su RdTagStat, il kernel thread non tornava,
+ * contention restava a 5 e il PPU aspettava all'infinito (lo stallo
+ * intermittente "modo A" dopo il caricamento). Un motore per contesto. */
+#define SPU_MAX_CONTEXTS 256
 
 typedef struct {
     spu_context* ctx;
@@ -237,26 +244,41 @@ typedef struct {
 } spu_mfc_slot;
 
 static spu_mfc_slot s_mfc_slots[SPU_MAX_CONTEXTS];
+static void resv_lock(void);
+static void resv_unlock(void);
 
 static mfc_engine* mfc_for(spu_context* ctx)
 {
+    if (ctx->mfc_cache) return (mfc_engine*)ctx->mfc_cache;
+    /* Ricerca/assegnazione sotto lock: le lane di un workload partono
+     * insieme, e senza lock due contesti si prendevano lo stesso slot. */
+    mfc_engine* m = NULL;
     spu_mfc_slot* free_slot = NULL;
+    resv_lock();
     for (int i = 0; i < SPU_MAX_CONTEXTS; i++) {
-        if (s_mfc_slots[i].ctx == ctx)
-            return &s_mfc_slots[i].mfc;
+        if (s_mfc_slots[i].ctx == ctx) { m = &s_mfc_slots[i].mfc; break; }
         if (!free_slot && s_mfc_slots[i].ctx == NULL)
             free_slot = &s_mfc_slots[i];
     }
-    if (free_slot) {
+    if (!m && free_slot) {
         free_slot->ctx = ctx;
         mfc_engine_init(&free_slot->mfc);
-        return &free_slot->mfc;
+        m = &free_slot->mfc;
     }
-    /* Out of slots: fall back to a shared engine (correct for single-SPU). */
-    static mfc_engine fallback;
-    static int fallback_init = 0;
-    if (!fallback_init) { mfc_engine_init(&fallback); fallback_init = 1; }
-    return &fallback;
+    resv_unlock();
+    if (!m) {
+        /* Out of slots: fall back to a shared engine (correct for single-SPU).
+         * Mai in silenzio: e' esattamente il caso che ha nascosto lo stallo. */
+        static mfc_engine fallback;
+        static int fallback_init = 0;
+        if (!fallback_init) { mfc_engine_init(&fallback); fallback_init = 1;
+            fprintf(stderr, "[spu-mfc] finiti gli slot MFC (%d): contesti in piu' "
+                            "su un motore CONDIVISO, tag_completed in corsa fra thread\n",
+                    SPU_MAX_CONTEXTS); fflush(stderr); }
+        m = &fallback;
+    }
+    ctx->mfc_cache = m;
+    return m;
 }
 
 /* ===========================================================================
@@ -512,6 +534,12 @@ static int spu_mfc_atomic(spu_context* ctx, uint32_t cmd)
     default:
         return 0;
     }
+}
+
+/* Per il watchdog delle corse del PM (spurs_policy.c): i tag completati. */
+uint32_t spu_mfc_tag_completed(spu_context* ctx)
+{
+    return mfc_for(ctx)->tag_completed;
 }
 
 static int channel_is_mfc(uint32_t ch)

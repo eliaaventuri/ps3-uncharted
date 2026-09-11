@@ -329,6 +329,25 @@ typedef struct spu_context {
     uint64_t list_stall_ea_base[32];      /* ea base (hi32 carries), per tag */
     uint32_t list_stall_cmd[32];          /* base (non-list) MFC command, per tag */
 
+    /* Anello degli ultimi salti dispacciati (SPURS_PM_WATCHDOG): ctx->pc si
+     * aggiorna solo ai trampolini, e un solo campione non dice in quale ciclo
+     * gira una lane ferma. Riempito in spu_task_launch_check. */
+    uint32_t wd_ring[16];
+    uint32_t wd_ring_i;
+
+    /* Motore MFC di questo contesto (spu_channels.c mfc_for): cache del
+     * puntatore allo slot, per non rifare la ricerca a ogni canale. */
+    void* mfc_cache;
+
+    /* File registri salvato all'ingresso di un interrupt (spu_drain.c
+     * spu_irq_regs_save), ripristinato all'iret. Era una tabella globale di
+     * 8 slot condivisa fra tutti i thread host: con le lane concorrenti di
+     * WwsJob finivano gli slot ("behave as before" = niente ripristino) e
+     * due thread si prendevano lo stesso slot. Per contesto, niente corse. */
+    uint32_t irq_save_valid;
+    uint32_t irq_resume_pc;               /* srr0 al momento dell'interrupt */
+    u128     irq_gpr[128];
+
 } spu_context;
 
 /* Reserved LS addresses (inside the kernel area, below the 0xA00 policy-module

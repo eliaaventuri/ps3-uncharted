@@ -569,9 +569,13 @@ emit:
 }
 
 /* cellPadGetInfo (v1 API, NID 0x3AAAD464) — used by PSL1GHT's ioPadGetInfo.
- * Layout (RPCS3 cellPad.h CellPadInfo, all big-endian):
- *   +0x00 u32 max_connect        +0x04 u32 now_connect   +0x08 u32 system_info
- *   +0x0C u16 vendor_id[7]       +0x1A u16 product_id[7] +0x28 u8 status[7]
+ * Layout (RPCS3 cellPad.h CellPadInfo, all big-endian). Gli array sono da
+ * CELL_MAX_PADS = 127 elementi, NON 7 come in CellPadInfo2:
+ *   +0x00 u32 max_connect        +0x04 u32 now_connect     +0x08 u32 system_info
+ *   +0x0C u16 vendor_id[127]     +0x10A u16 product_id[127] +0x208 u8 status[127]
+ * Uncharted legge status[i] a +0x208+i (func 0xCD98C, `lbz r28, 0x208(r9)`):
+ * con gli array da 7 lo status finiva a +0x28, il titolo leggeva zero e
+ * stampava "Pad 0 has been removed!" a ogni corsa.
  * Leaving this unimplemented let the guest read stack garbage as pad state and
  * run off into the weeds before ever reaching gcm init. */
 s32 cellPadGetInfo(CellPadInfo2* info)
@@ -597,12 +601,12 @@ s32 cellPadGetInfo(CellPadInfo2* info)
     vm_write32(gaddr + 0x00, s_max_connect);
     vm_write32(gaddr + 0x04, connected);
     vm_write32(gaddr + 0x08, 0);                       /* system_info */
-    for (u32 i = 0; i < CELL_PAD_MAX_PORT_NUM; i++) {
+    for (u32 i = 0; i < 127; i++) {
         int on = (i < s_max_connect && i < PAD_MAX_HOST_PORTS &&
                   (s_host_state[i].connected || i == 0));
-        vm_write16(gaddr + 0x0C + i * 2, on ? 0x054C : 0);   /* vendor: Sony  */
-        vm_write16(gaddr + 0x1A + i * 2, on ? 0x0268 : 0);   /* product: DS3  */
-        vm_write8(gaddr + 0x28 + i, on ? CELL_PAD_STATUS_CONNECTED : 0);
+        vm_write16(gaddr + 0x0C + i * 2, on ? 0x054C : 0);    /* vendor: Sony  */
+        vm_write16(gaddr + 0x10A + i * 2, on ? 0x0268 : 0);   /* product: DS3  */
+        vm_write8(gaddr + 0x208 + i, on ? CELL_PAD_STATUS_CONNECTED : 0);
     }
     return CELL_OK;
 }
@@ -724,6 +728,42 @@ s32 cellPadSetPortSetting(u32 port_no, u32 port_setting)
         return CELL_PAD_ERROR_INVALID_PARAMETER;
 
     s_port_setting[port_no] = port_setting;
+    return CELL_OK;
+}
+
+/* Sensor / press mode (SDK 1.x API, used by Uncharted right after it sees the
+ * pad connected: InfoSensorMode -> SetSensorMode(1) -> SetPressMode(1)).
+ * Info* return 1 when the mode is supported (RPCS3: not_an_error(capability
+ * bit)); Set* just record the request. The DS3 we present supports both. */
+s32 cellPadInfoPressMode(u32 port_no)
+{
+    if (!s_pad_initialized) return CELL_PAD_ERROR_NOT_OPENED;
+    if (port_no >= CELL_PAD_MAX_PORT_NUM) return CELL_PAD_ERROR_INVALID_PARAMETER;
+    return 1;
+}
+
+s32 cellPadInfoSensorMode(u32 port_no)
+{
+    if (!s_pad_initialized) return CELL_PAD_ERROR_NOT_OPENED;
+    if (port_no >= CELL_PAD_MAX_PORT_NUM) return CELL_PAD_ERROR_INVALID_PARAMETER;
+    return 1;
+}
+
+s32 cellPadSetPressMode(u32 port_no, u32 mode)
+{
+    if (!s_pad_initialized) return CELL_PAD_ERROR_NOT_OPENED;
+    if (port_no >= CELL_PAD_MAX_PORT_NUM) return CELL_PAD_ERROR_INVALID_PARAMETER;
+    if (mode) s_port_setting[port_no] |=  CELL_PAD_SETTING_PRESS_ON;
+    else      s_port_setting[port_no] &= ~CELL_PAD_SETTING_PRESS_ON;
+    return CELL_OK;
+}
+
+s32 cellPadSetSensorMode(u32 port_no, u32 mode)
+{
+    if (!s_pad_initialized) return CELL_PAD_ERROR_NOT_OPENED;
+    if (port_no >= CELL_PAD_MAX_PORT_NUM) return CELL_PAD_ERROR_INVALID_PARAMETER;
+    if (mode) s_port_setting[port_no] |=  CELL_PAD_SETTING_SENSOR_ON;
+    else      s_port_setting[port_no] &= ~CELL_PAD_SETTING_SENSOR_ON;
     return CELL_OK;
 }
 

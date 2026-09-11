@@ -20,13 +20,13 @@ runtime/ppu/ppu_fs.cpp       file system del titolo (/dev_bdvd, /dev_hdd0/1)
 runtime/ppu/ppu_sysprx.cpp   sysPrxForUser
 runtime/ppu/ppu_tls.h        PPU_THREAD_LOCAL portabile
 runtime/ppu/tests/boot_main.cpp  main del port (finestra, ticker present, boot)
-runtime/spu/spu_channels.c   canali SPU, MFC, atomici GETLLAR/PUTLLC (SPU_ATOM_EA), intercetti PM
+runtime/spu/spu_channels.c   canali SPU, MFC (un motore per contesto), atomici GETLLAR/PUTLLC (SPU_ATOM_EA), intercetti PM
 runtime/spu/spu_dma.h        motore DMA (mfc_do_transfer), SPU_DMA_EAWIN, SPU_DMA_WATCH
 runtime/spu/spu_context.h    stato di una SPU virtuale (LS, gpr, status)
 runtime/spu/spu_workload.c   task SPURS (taskset): WAIT_SIGNAL, park, signal
-runtime/spu/spurs_policy.c   esegue il policy module (WwsJob) su una SPU virtuale; SPURS_PM_FRESH
+runtime/spu/spurs_policy.c   esegue il policy module (WwsJob) su una SPU virtuale; SPURS_PM_FRESH, SPURS_PM_WATCHDOG
 runtime/spu/spurs_job.c      esecuzione di un job WwsJob liftato
-runtime/spu/spu_drain.c      dispatch dei salti indiretti, irq, ritorno
+runtime/spu/spu_drain.c      dispatch dei salti indiretti, irq (snapshot registri nel contesto), ritorno
 runtime/spu/spu_interp.c     interprete SPU di riserva (blocchi non liftati)
 runtime/spu/spu_lockstep.c   esecuzione lockstep per i poll GETLLAR/PUTLLC
 runtime/syscalls/            lv2: sys_event, sys_cond, sys_mutex, sys_ppu_thread, sys_fs, ...

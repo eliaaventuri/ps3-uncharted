@@ -1,6 +1,6 @@
 # Stato del progetto
 
-Ultimo aggiornamento: **11 settembre 2026** — sessione 22.
+Ultimo aggiornamento: **11 settembre 2026** — sessione 23.
 
 ## Dove siamo
 
@@ -43,6 +43,22 @@ residenti; e le texture **DXT1** venivano copiate compresse dentro una RGBA8,
 cioè rumore. Risolti tutti e tre, il titolo disegna un oggetto dorato con
 dettaglio e luce — esce schiacciato in una striscia, ed è il prossimo dettaglio.
 Dettagli in "Sessione 22".
+
+**Dalla sessione 23 lo stallo intermittente dopo il caricamento non c'e' piu'.**
+Non era il gioco: erano due tabelle globali da 8 slot nel runtime SPU (motori
+MFC e salvataggi registri degli interrupt) condivise fra tutti i thread host,
+mentre i 9 job manager WwsJob di Uncharted girano su 5-6 lane persistenti
+l'uno. Chi restava fuori dagli 8 slot finiva su un motore condiviso, e un
+aggiornamento perso lasciava un tag DMA incompleto per sempre: la lane girava,
+il kernel thread non tornava, il PPU aspettava all'infinito. Ora sono per
+contesto: **5 corse consecutive da 240 s senza stallo contro 4 su 4 prima.**
+Corretti anche il layout di `CellPadInfo` (il titolo credeva di non avere il
+controller) e tre import del pad e uno della tastiera che mancavano. La
+"striscia" della sessione 22 non era un difetto: e' il fotogramma 6 della
+moneta che gira (sprite sheet `boot1/coin.dds`, 32 pose da 128x128). Il fronte
+ora e' il walker della FIFO RSX, che ricomincia i segmenti da capo migliaia di
+volte e il titolo stampa `Command context has run out of memory!`. Dettagli in
+"Sessione 23".
 
 Quanto arriva a fare, dal log:
 
@@ -337,6 +353,151 @@ La lista dei comandi ora viene percorsa fino in fondo — sei coppie
 risultati in memoria principale.** Non era mai successo in nessuna sessione.
 Riproducibile: **tre corse su tre**, identiche -- 14 comandi, un overlay
 residente, zero microstep, cinque stall e due interrupt per corsa.
+
+## Sessione 23 — lo stallo intermittente erano due tabelle da 8 slot nel runtime SPU
+
+### 0. La "striscia" della sessione 22 non era un difetto
+
+Il "prossimo passo" numero 1 della sessione 22 (l'oggetto dorato schiacciato in
+36x122) e' chiuso senza toccare codice: la texture 4096x128 legata al disegno e'
+`build/main/boot1/coin.dds`, uno **sprite sheet di 32 pose da 128x128 della
+moneta che gira** (la rotellina di caricamento). Misurato sull'atlante
+decodificato, larghezza della moneta per posa: 123, 116, 107, 95, 78, 58,
+**35, 18, 36**, 58, 79 ... — la posa 6/8 e' larga 35-36 pixel e alta 123: e'
+esattamente il riquadro disegnato. La decodifica BC1 della sessione 22 e'
+corretta (la moneta e' leggibile, con la scritta "PHILIPPUS ... HISPANIARUM").
+Quindi: il titolo era sulla **schermata di caricamento**, in basso a destra.
+
+`RSX_DUMP_COUNT=<k>` (nuovo) salva i primi k fotogrammi sopra soglia in
+`/tmp/rsx_frame_<i>.ppm`, per vedere una sequenza e non un solo istante.
+
+### 1. Il pad: il layout di `CellPadInfo` era sbagliato, non la logica
+
+`Pad 0 has been removed!` continuava a comparire anche dopo la correzione della
+sessione 22. Letto il codice del titolo (`func 0xCD98C`, il poll del pad):
+dopo `cellPadGetInfo` legge lo stato della porta a **`info+0x208+i`**
+(`lbz r28, 0x208(r9)`), non a `+0x28`. La v1 dell'API ha gli array da
+`CELL_MAX_PADS = 127` elementi (RPCS3 `cellPad.h`, PSL1GHT `padInfo`):
+`vendor_id[127]` a +0x0C, `product_id[127]` a +0x10A, `status[127]` a +0x208.
+La nostra HLE scriveva gli array da 7 (il layout di `CellPadInfo2`), e il
+titolo leggeva lo stack: a volte 0 ("removed"), a volte spazzatura
+("connected"). Ora il layout e' quello vero: **0 "removed" in 9 corse**.
+
+Con il pad visto, il titolo chiama tre import che non avevamo —
+`cellPadInfoSensorMode` (0x78200559), `cellPadSetSensorMode` (0xBE5BE3BA),
+`cellPadSetPressMode` (0xF83F8182) — piu' `cellPadInfoPressMode`, e a ogni
+fotogramma `cellKbRead` (0xFF0A21B7: il nome SDK di quello che qui si chiamava
+`cellKbGetData`). Aggiunti tutti; la tabella NID va rigenerata
+(`tools/gen_hle_nids.py --all --out ~/Documents/Coding/uncharted-data/gen/ppu_hle_nids.cpp`).
+
+### 2. Lo stallo "modo A": misurato, non piu' indovinato
+
+Con il pad corretto lo stallo dopo il caricamento e' diventato **sistematico**
+(4 corse su 4 da 240 s: `spinning on 0x20000000` da `lr=0x532620`), quindi
+finalmente misurabile. Strumento nuovo: **`SPURS_PM_WATCHDOG=<s>`** stampa
+ogni corsa del policy module che non torna entro s secondi, con wid, lane, pc,
+gli ultimi 16 salti dispacciati (anello per contesto, `wd_ring`) e lo stato MFC
+(`ie`, maschera/stato eventi, `tagmask`, tag completati, liste parcheggiate).
+
+Prima misura: la lane ferma cicla in 0x2430/0x2438/0x2448 del PM — la routine
+che aspetta i tag DMA — con **`tagmask=0x80000000 completati=0x7FFFFFFF`**:
+il tag 31 non si completa mai e nessuna lista e' parcheggiata. Il tag non e'
+in volo da nessuna parte: e' andato perso.
+
+**Causa 1 — `SPU_MAX_CONTEXTS = 8` in `spu_channels.c`.** I motori MFC
+(`tag_completed`, coda) erano 8 slot; ogni contesto oltre l'ottavo finiva su
+**un unico motore condiviso** ("correct for single-SPU"). Uncharted ha 9
+workload WwsJob con `maxContention` 5-6, cioe' fino a 54 contesti persistenti
+(`s_pm_ctx[wid][spu]`), eseguiti su thread host concorrenti: due lane facevano
+`tag_completed &= ~bit` / `|= bit` sulla stessa parola, e una scrittura persa
+lasciava un tag incompleto per sempre. Ora: 256 slot, assegnazione sotto lock
+(`resv_lock`), puntatore in cache nel contesto (`mfc_cache`), e se gli slot
+finissero lo dice a voce (`[spu-mfc] finiti gli slot`).
+
+Seconda misura, dopo la correzione: ancora una lane ferma, ma diversa —
+wid=4 lane 0 cicla fra 0x2528, 0xA90 (la coda del gestore di interrupt di
+WwsJob: rigenera lo shim a 0x3FEC0, ripristina r76-r79, `iret`) e 0x2E28
+(`bi $r0` con r0=0x2528), 21,8 milioni di salti al secondo, `ie=0`,
+`completati=0xFFFFFFFF`. Un `iret` che torna in un punto che rientra subito
+nel percorso di uscita dall'interrupt: registri sbagliati al ritorno.
+
+**Causa 2 — `g_irq_save[8]` in `spu_drain.c`.** Il salvataggio del file
+registri all'ingresso di un interrupt (contratto hardware: il gestore
+preserva tutto) era una tabella globale di 8 slot per puntatore di contesto,
+senza lock: oltre l'ottavo contesto "behave as before" (nessun ripristino), e
+due thread potevano prendersi lo stesso slot. Ora vive nel contesto
+(`irq_save_valid`, `irq_resume_pc`, `irq_gpr[128]`).
+
+| | prima (s1-s4) | solo MFC (m1) | entrambe (m2, m3, b1, b2, b3) |
+|---|---|---|---|
+| corse da 240 s | 4 | 1 | 5 |
+| stallo (spin permanente su 0x20000000) | **4/4** | 1/1 | **0/5** |
+| corse del PM segnalate dal watchdog | 2-5 per corsa | 1 | 0 |
+
+(m1 e' partita col binario prima della causa 2; m2 e' partita a cavallo della
+ricompilazione — il conteggio prudente e' 5 corse pulite, non 6.)
+
+### 3. Il fronte ora: il walker della FIFO RSX
+
+Senza stallo, il titolo va oltre e stampa un errore suo:
+**`ERROR: ERROR: Command context has run out of memory!`** (in 5 corse su 5,
+fra la riga 22k e la 117k). Prima di quello, i fotogrammi pieni hanno sempre
+12.633 draw e mostrano il riquadro della moneta pieno di **blocchi colorati**:
+la texture legata e' 0x06312F00, dichiarata 4096x128 DXT1 come l'atlante ma con
+contenuto che non lo e' (`RSX_TEX_SAVE`). Ipotesi: uno stato dei registri
+texture non aggiornato perche' il walker perde o ripete comandi.
+
+Misurato con `GCM_RECDBG=1`, `GCM_STRAND_PEEK=1` (nuovo: 64 parole prima e 16
+dopo il punto di arenamento) e `YDKJ_WWATCH=0x21660930` (IO 0x660930; l'IO
+parte a EA 0x21000000, `Init(ioSize=0x1300000, ioAddr=0x21000000)`):
+
+- L'anello e' a 4 slot da 0x1000 (IO 0x10000..0x13000): `[SET_REFERENCE]
+  [valore] [JUMP -> segmento]`, `put` posato a slot+8. Due segmenti, 0x660000 e
+  0x860000, usati **due slot ciascuno** per giro.
+- Il segmento 0x860000 finisce con `JUMP -> 0x10000` (a 0x8608D8). Il segmento
+  0x660000 finisce a **0x930 con zeri** quando il walker ci entra: 2.665-4.580
+  recuperi "segmento senza uscita" per corsa, sempre a 0x660930/0x860930/
+  0x86098C/0x660B00, cioe' sistematici, non una corsa.
+- Il titolo scrive davvero a 0x660930 (`guest-fn=0x704F30`): **`0x20011000`,
+  il JUMP di coda verso lo slot 0x11000**, e SUBITO DOPO lo sovrascrive con
+  altri comandi (`0x00041EA8`, `SET_SEMAPHORE_OFFSET`...) da `0x703488` e
+  `0x48A888`: la coda si sposta in avanti a ogni aggiunta, come annotato nella
+  sessione 19.
+- Con la coda a 0xB00 il walker gira in **ciclo**: `0x11008 -> 0x660000 ->
+  0x660B00 -> 0x11000 -> 0x11008 ...` con `put=0x13008`, finche' il rilevatore
+  di cicli (sessione 20) lo tira fuori. Cioe' il JUMP di coda punta allo slot
+  che ha saltato nel segmento, non al successivo: per il titolo e' un anello di
+  attesa che la RSX percorre finche' la CPU non lo ridirige.
+- Il contenuto prima dello zero e' plausibile fino all'ultima parola (vertici
+  in modalita' immediata della moneta: colore 4F, texcoord 2F **0.1875..0.219 =
+  posa 6 dell'atlante**, posizione 2F; `SET_BEGIN_END(0)`; cinque coppie
+  `SET_SEMAPHORE_OFFSET 0x480..0x4C0` + `TEXTURE_READ_SEMAPHORE_RELEASE`).
+
+Da capire nella prossima sessione: **come la RSX vera percorre questo anello
+senza ripetere i disegni** (ogni nostro rientro nel segmento ri-esegue i draw
+dall'inizio: 12.633 potrebbe essere il doppio del vero) e perche' il titolo
+conclude che il command context e' pieno — probabilmente legge un `get` che
+non avanza come si aspetta. E' il lavoro delle sessioni 19-20 ripreso con dati
+migliori, non un problema nuovo.
+
+### Strumenti nuovi
+
+- `SPURS_PM_WATCHDOG=<s>` — corse del PM che non tornano entro s secondi.
+- `RSX_DUMP_COUNT=<k>` — piu' fotogrammi sopra soglia, numerati.
+- `GCM_STRAND_PEEK=1` — parole attorno al punto di arenamento del walker.
+- Il layout dei dati del titolo per queste misure: IO 0x660930 = EA 0x21660930.
+
+### Il prossimo passo
+
+1. Il walker della FIFO: capire l'anello di attesa del titolo (sopra) e
+   sostituire i recuperi con il comportamento della RSX vera. `RPCS3` e'
+   l'oracolo: come gestisce un JUMP che torna sullo slot corrente con `put`
+   piu' avanti.
+2. La texture 0x06312F00 "4096x128" con contenuto sbagliato — probabilmente
+   cade da sola col punto 1.
+3. Difetto noto del decompilatore dei fragment program (`return r[0]` vs
+   `h[0]`), invariato.
+
 
 ## Sessione 22 — la prima immagine vera: tre difetti in fila fra i vertici e lo schermo
 

@@ -36,6 +36,67 @@ volatile unsigned g_spurs_pm_polls = 0;   /* selectWorkload calls this run */
 volatile unsigned g_spurs_pm_exited = 0;  /* set when exitToKernel was taken */
 volatile unsigned g_wws_batch_gets = 0;   /* loadCommands (LS 0xC00) fetch count, spu_dma.h */
 
+/* Watchdog delle corse del PM (SPURS_PM_WATCHDOG=<s>), vedi il punto d'uso. */
+#include "../platform/win32_compat.h"
+static struct { spu_context* volatile ctx; unsigned long long t0; int reported; } s_pm_wd[16][6];
+static int s_pm_wd_secs = -1;
+static DWORD WINAPI spurs_pm_wd_thread(LPVOID p)
+{
+    (void)p;
+    extern unsigned long long ps3_ms_now(void);
+    for (;;) {
+        Sleep(1000);
+        unsigned long long now = ps3_ms_now();
+        for (int w = 0; w < 16; w++) for (int n = 0; n < 6; n++) {
+            spu_context* c = s_pm_wd[w][n].ctx;
+            if (!c || s_pm_wd[w][n].reported) continue;
+            if (now - s_pm_wd[w][n].t0 < (unsigned long long)s_pm_wd_secs * 1000ull) continue;
+            s_pm_wd[w][n].reported = 1;
+            fprintf(stderr, "[spurs-wd] corsa del PM wid=%d spu=%d in ritardo di %llus: pc=0x%05X "
+                    "status=0x%X LS12A0=%02X%02X LS12C0=%02X%02X LS12F0=%02X%02X ultimi salti:",
+                    w, n, (now - s_pm_wd[w][n].t0) / 1000, c->pc & SPU_LS_MASK, c->status,
+                    c->ls[0x12A2], c->ls[0x12A3], c->ls[0x12C2], c->ls[0x12C3],
+                    c->ls[0x12F2], c->ls[0x12F3]);
+            for (unsigned k = 0; k < 16; k++)
+                fprintf(stderr, " %05X", c->wd_ring[(c->wd_ring_i + k) & 15]);
+            { extern uint32_t spu_mfc_tag_completed(spu_context*);
+              fprintf(stderr, " | ie=%u evmask=0x%X evstat=0x%X tagmask=0x%X completati=0x%X "
+                      "liste parcheggiate=0x%X stallstat=0x%X",
+                      c->int_enable, c->event_mask, c->event_status, c->mfc_tag_mask,
+                      spu_mfc_tag_completed(c), c->list_stall_mask, c->list_stall_stat); }
+            /* Un secondo campione dopo 1 s: se l'anello e' identico la lane
+             * non dispaccia piu' (ciclo dentro un solo blocco); se cambia, e'
+             * un ciclo fra i salti stampati. */
+            { uint32_t before = c->wd_ring_i; Sleep(1000);
+              fprintf(stderr, " | salti in 1s: %u\n", c->wd_ring_i - before); }
+            fflush(stderr);
+        }
+    }
+    return 0;
+}
+static void spurs_pm_wd_arm(uint32_t wid, uint32_t spu_num, spu_context* ctx)
+{
+    if (s_pm_wd_secs < 0) {
+        /* SPURS_PM_WATCHDOG=<s>: stampa wid/spu/pc, gli ultimi 16 salti e lo
+         * stato MFC di ogni corsa del policy module che non torna entro s
+         * secondi (una lane ferma tiene bloccato il kernel thread). */
+        const char* e = getenv("SPURS_PM_WATCHDOG");
+        s_pm_wd_secs = (e && atoi(e) > 0) ? atoi(e) : 0;
+        if (s_pm_wd_secs) { HANDLE h = CreateThread(NULL, 0, spurs_pm_wd_thread, NULL, 0, NULL);
+                            if (h) CloseHandle(h); }
+    }
+    if (!s_pm_wd_secs || wid >= 16 || spu_num >= 6) return;
+    extern unsigned long long ps3_ms_now(void);
+    s_pm_wd[wid][spu_num].t0 = ps3_ms_now();
+    s_pm_wd[wid][spu_num].reported = 0;
+    s_pm_wd[wid][spu_num].ctx = ctx;
+}
+static void spurs_pm_wd_disarm(uint32_t wid, uint32_t spu_num)
+{
+    if (!s_pm_wd_secs || wid >= 16 || spu_num >= 6) return;
+    s_pm_wd[wid][spu_num].ctx = 0;
+}
+
 int spu_run_policy_module(spu_lifted_entry_fn entry, int image_id,
                           const uint8_t* pm_host, uint32_t pm_size,
                           uint64_t wkl_data, uint32_t wid, uint32_t spurs_ea,
@@ -298,7 +359,15 @@ int spu_run_policy_module(spu_lifted_entry_fn entry, int image_id,
     unsigned batch_before = g_wws_batch_gets;
     unsigned claim_before = g_spu_putllc_sync_hit;
 
+    /* SPURS_PM_WATCHDOG=<s>: una corsa del PM che non torna entro s secondi
+     * tiene bloccato il kernel thread (nessun altro workload viene piu'
+     * dispacciato) e lascia contention=maxcont: il PPU che aspetta
+     * contention==0 in GetWorkloadInfo gira per sempre (visto su wid=6, +0x20
+     * fermo a 5). Un thread staccato stampa wid/spu/pc della corsa in
+     * ritardo, una volta per corsa. */
+    spurs_pm_wd_arm(wid, spu_num, ctx);
     spu_run_with_halt(entry, ctx);
+    spurs_pm_wd_disarm(wid, spu_num);
 
     if (s_claimlog) {
         unsigned claims = g_spu_putllc_sync_hit - claim_before;

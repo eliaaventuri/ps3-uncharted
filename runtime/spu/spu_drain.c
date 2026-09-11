@@ -94,6 +94,9 @@ void spu_task_launch_check(spu_context* ctx, void* fn)
       } }
     if (g_pm_flow_ctx == (void*)ctx && g_pm_flow_n < 8192)
         g_pm_flow_buf[g_pm_flow_n++] = ctx->pc;
+    { static int s_wd = -1;
+      if (s_wd < 0) s_wd = getenv("SPURS_PM_WATCHDOG") ? 1 : 0;   /* SPURS_PM_WATCHDOG=<s>: anello degli ultimi 16 salti per contesto, letto dal watchdog delle corse del PM (spurs_policy.c) */
+      if (s_wd) ctx->wd_ring[ctx->wd_ring_i++ & 15] = (uint32_t)ctx->pc & SPU_LS_MASK; }
 
     static int s_on = -1;
     if (s_on < 0) s_on = getenv("LBP_JOBDRAIN") ? 1 : 0;
@@ -197,51 +200,30 @@ unsigned spu_sn_defer_ticks(void)
  * the irete). State the handler legitimately publishes lives in LS/channels
  * and is untouched. Per-ctx slots; no nesting (interrupts stay disabled
  * until iret). */
-#define SPU_IRQ_SLOTS 8
-struct spu_irq_save {
-    spu_context* ctx;          /* NULL = free */
-    uint32_t     resume_pc;    /* srr0 at take */
-    u128         gpr[128];
-};
-static struct spu_irq_save g_irq_save[SPU_IRQ_SLOTS];
-
 static void spu_irq_regs_save(spu_context* ctx)
 {
-    struct spu_irq_save* s = 0;
-    for (int i = 0; i < SPU_IRQ_SLOTS; i++)
-        if (g_irq_save[i].ctx == ctx) { s = &g_irq_save[i]; break; }
-    if (!s) for (int i = 0; i < SPU_IRQ_SLOTS; i++)
-        if (!g_irq_save[i].ctx) { s = &g_irq_save[i]; break; }
-    if (!s) return;                        /* out of slots: behave as before */
-    s->ctx = ctx;
-    s->resume_pc = ctx->srr0;
-    memcpy(s->gpr, ctx->gpr, sizeof s->gpr);
+    ctx->irq_resume_pc = ctx->srr0;
+    memcpy(ctx->irq_gpr, ctx->gpr, sizeof ctx->irq_gpr);
+    ctx->irq_save_valid = 1;
 }
 
 /* Called from spu_indirect_branch on every dispatch. Restores + clears when
  * the iret lands. Returns 1 if a restore happened (diagnostic). */
-/* Drop any saved register file belonging to this context. The save slots are
- * keyed by RAW POINTER, and an spu_context is typically a stack local -- so a
- * later, unrelated run lands on the same address and inherits the earlier
- * context's registers wholesale. A fresh run must never do that. */
+/* Drop any saved register file belonging to this context: a fresh run must
+ * never inherit the registers of an interrupt taken by an earlier one. */
 void spu_irq_regs_forget(spu_context* ctx)
 {
-    for (int i = 0; i < SPU_IRQ_SLOTS; i++)
-        if (g_irq_save[i].ctx == ctx) g_irq_save[i].ctx = 0;
+    ctx->irq_save_valid = 0;
 }
 
 int spu_irq_regs_maybe_restore(spu_context* ctx)
 {
-    for (int i = 0; i < SPU_IRQ_SLOTS; i++) {
-        if (g_irq_save[i].ctx == ctx) {
-            if ((ctx->pc & SPU_LS_MASK) == (g_irq_save[i].resume_pc & SPU_LS_MASK) &&
-                ctx->int_enable) {
-                memcpy(ctx->gpr, g_irq_save[i].gpr, sizeof g_irq_save[i].gpr);
-                g_irq_save[i].ctx = 0;
-                return 1;
-            }
-            return 0;
-        }
+    if (!ctx->irq_save_valid) return 0;
+    if ((ctx->pc & SPU_LS_MASK) == (ctx->irq_resume_pc & SPU_LS_MASK) &&
+        ctx->int_enable) {
+        memcpy(ctx->gpr, ctx->irq_gpr, sizeof ctx->irq_gpr);
+        ctx->irq_save_valid = 0;
+        return 1;
     }
     return 0;
 }

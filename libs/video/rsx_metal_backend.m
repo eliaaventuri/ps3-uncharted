@@ -1265,11 +1265,15 @@ void rsx_metal_backend_present(void)
          * draw. I fotogrammi pieni durano poche decine di millisecondi e uno
          * screenshot da fuori li manca sistematicamente; questo li prende dal
          * di dentro, nell'istante giusto. */
-        { static int s_df = -2; static int s_done = 0;
+        { static int s_df = -2; static int s_done = 0; static int s_dmax = 1;
           if (s_df == -2) { const char* e = getenv("RSX_DUMP_FRAME");
-                            s_df = (e && *e) ? atoi(e) : -1; }
-          if (s_df > 0 && !s_done && (int)s_draw_count > s_df) {
-              s_done = 1;
+                            s_df = (e && *e) ? atoi(e) : -1;
+                            /* RSX_DUMP_COUNT=<k>: salva i primi k fotogrammi
+                             * che superano la soglia (rsx_frame_<i>.ppm). */
+                            const char* c = getenv("RSX_DUMP_COUNT");
+                            if (c && atoi(c) > 1) s_dmax = atoi(c); }
+          if (s_df > 0 && s_done < s_dmax && (int)s_draw_count > s_df) {
+              s_done++;
               MTLTextureDescriptor* sd = [MTLTextureDescriptor
                   texture2DDescriptorWithPixelFormat:MTLPixelFormatBGRA8Unorm
                                                width:target.width
@@ -1310,7 +1314,11 @@ void rsx_metal_backend_present(void)
               if (px) {
                   [rb getBytes:px bytesPerRow:W*4
                     fromRegion:MTLRegionMake2D(0,0,W,H) mipmapLevel:0];
-                  const char* path = "/tmp/rsx_frame.ppm";
+                  char path[64];
+                  if (s_dmax > 1) snprintf(path, sizeof path, "/tmp/rsx_frame%d.ppm", s_done);
+                  else            snprintf(path, sizeof path, "/tmp/rsx_frame.ppm");
+                  if (s_dmax > 1) snprintf(path, sizeof path,
+                                           "/tmp/rsx_frame_%03d.ppm", s_done);
                   FILE* f = fopen(path, "wb");
                   if (f) {
                       fprintf(f, "P6\n%lu %lu\n255\n",
