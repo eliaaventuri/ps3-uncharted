@@ -436,18 +436,23 @@ reagisce agli impulsi di CROSS/START per minuti. Due sospetti:
    del menu non si registrano, il menu non ha niente da disegnare e forse il
    suo script aspetta qualcosa che non arriva. Appare anche una volta durante
    GameInit. Da capire se e' un errore di lift (bitfield 64 bit) o di dati.
-2. `[hle] unresolved NID 0x21425307` = `cellSaveDataListAutoLoad` (thread
-   "Save/Load Game Thread", che poi termina). L'implementazione esistente in
-   `libs/system/cellSaveData.c` chiama le callback guest come puntatori host:
-   va rifatta con `ps3_invoke_guest` come cellVdec. Non e' certo che blocchi
-   il menu.
+2. ~~`cellSaveDataListAutoLoad` mancante~~ -- implementata (fine sessione)
+   con callback guest via `ps3_invoke_guest`: funcFixed del titolo risponde
+   result=0, dirName='NOTE_FREE_SPACE', noi rispondiamo NODATA, il thread
+   "Save/Load Game Thread" termina pulito. **Il menu resta identico**: non
+   era lui. (Le altre funzioni di `cellSaveData.c` chiamano ancora le callback
+   come puntatori host: da rifare quando il titolo le usera'.)
 
 ### Il prossimo passo
 
 1. Capire la tecnica con indice 0 (leggere `func_00483F90` intorno a
-   0x484260-0x484408 con il disassemblato originale, `show_func.py --asm`).
-2. `cellSaveDataListAutoLoad` con callback guest vere (funcList con lista
-   vuota -> il titolo decide).
+   0x484260-0x484408 con il disassemblato originale, `show_func.py --asm`:
+   e' una generazione di nomi di tecnica guidata da bit di feature in una
+   maschera a 64 bit; `rldicl`/`srd` liftati sono corretti, quindi il sospetto
+   passa ai DATI del materiale o a una stringa costruita male).
+2. Capire cosa aspetta lo script del menu (`main-menu-menu`): gli impulsi
+   CROSS/START arrivano (`cellPadGetData` una volta per frame, injection nel
+   runtime) ma niente cambia per 150 s.
 3. Se il menu reagisce all'input: `dive-boat-movie-intro` e il livello
    `jungle-a-1` sono gia' in prefetch -- il gioco vero e' dietro l'angolo.
 4. Ripristinare gli screenshot (la finestra non si trova da questa shell).

@@ -1260,3 +1260,53 @@ s32 cellSaveDataUserAutoLoad(u32 version, u32 userId, const char* dirName,
     return cellSaveDataAutoLoad(version, dirName, errDialog, setBuf,
                                 funcStat, funcFile, container, NULL);
 }
+
+/* cellSaveDataListAutoLoad (NID 0x21425307) --
+ *   (version, errDialog, setList*, setBuf*, funcFixed, funcStat, funcFile,
+ *    container, userdata)  -- 9 argomenti: userdata sta sullo stack guest.
+ *
+ * Le callback sono funzioni GUEST (OPD): vanno chiamate con ps3_invoke_guest
+ * e con le strutture in memoria guest, non come puntatori host (le altre
+ * funzioni di questo file lo fanno ancora: crashano in un port ricompilato).
+ * Layout (RPCS3 cellSaveData.h, big-endian):
+ *   CellSaveDataSetList  +0 sortType +4 sortOrder +8 dirNamePrefix +12 reserved
+ *   CellSaveDataSetBuf   +0 dirListMax +4 fileListMax +8 reserved[6] +32 bufSize +36 buf
+ *   CellSaveDataCBResult +0 result +4 progressBarInc +8 errNeedSizeKB +12 invalidMsg +16 userdata
+ *   CellSaveDataListGet  +0 dirNum +4 dirListNum +8 dirList
+ *   CellSaveDataFixedSet +0 dirName +4 newIcon +8 option
+ * Senza salvataggi su disco: funcFixed riceve una lista vuota; se risponde con
+ * un errore -> CELL_SAVEDATA_ERROR_CBRESULT, altrimenti la directory scelta
+ * non esiste -> CELL_SAVEDATA_ERROR_NODATA (come RPCS3 per le LOAD). funcStat
+ * e funcFile non vengono mai chiamate. Uncharted la chiama dal thread
+ * "Save/Load Game Thread" all'ingresso nel menu. */
+s32 cellSaveDataListAutoLoad(u32 version, u32 errDialog, u32 setList_ea, u32 setBuf_ea,
+                             u32 funcFixed, u32 funcStat, u32 funcFile, u32 container)
+{
+    (void)version; (void)errDialog; (void)funcStat; (void)funcFile; (void)container;
+    extern PPU_THREAD_LOCAL ppu_context* g_active_ctx;
+    u32 userdata = g_active_ctx ? vm_read32((u32)g_active_ctx->gpr[1] + 0x74) : 0;
+    printf("[cellSaveData] ListAutoLoad(setList=0x%08X setBuf=0x%08X funcFixed=0x%08X userdata=0x%08X)\n",
+           setList_ea, setBuf_ea, funcFixed, userdata);
+    if (!setList_ea || !setBuf_ea || !funcFixed)
+        return CELL_SAVEDATA_ERROR_PARAM;
+
+    u32 buf = vm_read32(setBuf_ea + 36), bufSize = vm_read32(setBuf_ea + 32);
+    if (!buf || bufSize < 0x100)
+        return CELL_SAVEDATA_ERROR_PARAM;
+    /* le tre strutture della callback in fondo al buffer del titolo */
+    u32 cbres = (buf + bufSize - 0x80) & ~15u, listGet = cbres + 0x20, fixedSet = cbres + 0x40;
+    for (u32 o = 0; o < 0x60; o += 4) vm_write32(cbres + o, 0);
+    vm_write32(cbres + 16, userdata);
+    vm_write32(listGet + 8, buf);          /* dirList: vuota */
+
+    ps3_invoke_guest(funcFixed, cbres, listGet, fixedSet, 0, 0, 0, 0, 0);
+
+    s32 result = (s32)vm_read32(cbres + 0);
+    u32 dirName = vm_read32(fixedSet + 0);
+    char name[33] = {0};
+    if (dirName) { for (int i = 0; i < 32; i++) { name[i] = (char)vm_read8(dirName + i); if (!name[i]) break; } }
+    printf("[cellSaveData] ListAutoLoad: funcFixed -> result=%d dirName='%s'\n", result, name);
+    if (result < 0)
+        return CELL_SAVEDATA_ERROR_CBRESULT;
+    return CELL_SAVEDATA_ERROR_NODATA;
+}
