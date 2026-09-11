@@ -18,7 +18,8 @@
 #include <stdio.h>
 #include <stdlib.h>   /* getenv -- an implicit decl returns int, truncating the pointer */
 #include <string.h>
-#include "../../runtime/memory/vm.h"    /* VM_HLE_INJECT_BASE */
+
+#include "../../runtime/memory/vm.h"    /* VM_HLE_INJECT_BASE */
 
 /* ---------------------------------------------------------------------------
  * Global backend
@@ -285,6 +286,28 @@ static int process_vertex_attrib_method(rsx_state* state, u32 method, u32 data)
 /* ---------------------------------------------------------------------------
  * Main method dispatch
  * -----------------------------------------------------------------------*/
+
+/* ---- modalita' immediata --------------------------------------------------
+ * Il titolo che disegna cosi' non ha un vertex buffer: ogni vertice e' una
+ * raffica di scritture ai registri di attributo fra BEGIN e END, e il vertice
+ * e' completo quando viene scritto l'attributo 0 (la posizione). Qui si
+ * accumulano, e a END si consegnano al backend in un colpo solo.
+ *
+ * Lo store e' un file-static e non un campo di rsx_state di proposito:
+ * rsx_state viene copiato e passato per valore in piu' punti, e mezzo megabyte
+ * di vertici dentro non ci deve stare. -------------------------------------*/
+#define RSX_INLINE_MAX_VERTS 4096
+static float s_inline_verts[RSX_INLINE_MAX_VERTS * RSX_MAX_VERTEX_ATTRIBS * 4];
+static u32   s_inline_count;
+static u32   s_inline_dropped;
+
+static void rsx_inline_latch(rsx_state* state)
+{
+    if (s_inline_count >= RSX_INLINE_MAX_VERTS) { s_inline_dropped++; return; }
+    memcpy(&s_inline_verts[s_inline_count * RSX_MAX_VERTEX_ATTRIBS * 4],
+           state->vertex_data4f, sizeof(state->vertex_data4f));
+    s_inline_count++;
+}
 
 int rsx_process_method(rsx_state* state, u32 method, u32 data)
 {
@@ -570,6 +593,28 @@ int rsx_process_method(rsx_state* state, u32 method, u32 data)
           static int _n = 0;
           if (_d && _n < 400) { _n++;
             fprintf(stderr, "[VDATA4F] attr=%u lane=%u = %.4f%c", idx, lane, f, 10); } }
+        /* Fra BEGIN e END questi non sono costanti: sono i vertici stessi. */
+        if (state->in_begin_end && idx == 0 && lane == 3) rsx_inline_latch(state);
+        return 0;
+    }
+
+    /* NV4097_SET_VERTEX_DATA2F_M (0x1880): stessa banca di registri, due float
+     * per attributo (z=0, w=1 come sull'hardware). Uncharted disegna l'HUD e i
+     * quad a pieno schermo cosi': misurato, fra BEGIN e END arrivano SOLO
+     * 0x1880-0x188C (attributi 0 e 1, 2F) e 0x1C20-0x1C2C (attributo 2, 4F),
+     * mai un DRAW_ARRAYS. Senza questo ramo il backend non riceveva un solo
+     * draw e lo schermo restava nero. */
+    if (method >= 0x1880u && method < 0x1880u + RSX_MAX_VERTEX_ATTRIBS * 8u) {
+        u32 idx  = (method - 0x1880u) >> 3;         /* attribute */
+        u32 lane = ((method - 0x1880u) >> 2) & 1;   /* x/y       */
+        float f; memcpy(&f, &data, 4);
+        state->vertex_data4f[idx][lane] = f;
+        if (lane == 1) { state->vertex_data4f[idx][2] = 0.0f;
+                         state->vertex_data4f[idx][3] = 1.0f; }
+        /* L'attributo 0 e' la posizione e il titolo lo scrive PER ULTIMO
+         * (misurato: attr2, attr1, poi attr0) -- e' la sua ultima lane a
+         * chiudere il vertice, come sull'hardware NV. */
+        if (state->in_begin_end && idx == 0 && lane == 1) rsx_inline_latch(state);
         return 0;
     }
 
@@ -621,6 +666,7 @@ int rsx_process_method(rsx_state* state, u32 method, u32 data)
             state->primitive_type = data;
             state->in_begin_end = 1;
             state->begin_epoch++;
+            s_inline_count = 0;   /* i vertici immediati sono per-primitiva */
 
             /* Flush dirty state to backend before drawing */
             if (s_backend) {
@@ -664,6 +710,25 @@ int rsx_process_method(rsx_state* state, u32 method, u32 data)
             }
         } else {
             state->in_begin_end = 0;
+            if (s_inline_count) {
+                { static int _d = -1; if (_d < 0) _d = getenv("RSX_INLINE_DBG") ? 1 : 0;
+                  static unsigned long _n = 0;
+                  if (_d && (++_n <= 16 || (_n % 500) == 0))
+                      fprintf(stderr, "[RSX inline] #%lu prim=%u verts=%u%s\n",
+                              _n, state->primitive_type, s_inline_count,
+                              (s_backend && s_backend->draw_inline) ? "" : "  (backend senza draw_inline)"); }
+                if (s_backend && s_backend->draw_inline)
+                    s_backend->draw_inline(s_backend->userdata, state->primitive_type,
+                                           s_inline_verts, s_inline_count);
+                if (s_inline_dropped) {
+                    static int _w = 0;
+                    if (_w++ < 8)
+                        fprintf(stderr, "[RSX inline] %u vertici scartati (tetto %d)\n",
+                                s_inline_dropped, RSX_INLINE_MAX_VERTS);
+                    s_inline_dropped = 0;
+                }
+                s_inline_count = 0;
+            }
         }
         return 0;
     }

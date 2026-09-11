@@ -1771,6 +1771,46 @@ static void gcm_rsx_process_fifo_unlocked(void)
                 /* RSX_LIVE_FEED_DBG=1: what the FIFO actually carries. Counted
                  * for any run, live engine or not, so the method stream and the
                  * backend's draw callbacks can be compared in one measurement. */
+                /* RSX_METHIST=1: istogramma di TUTTI i metodi del subchannel 0
+                 * che compaiono fra un BEGIN e il suo END. Serve quando il
+                 * backend non riceve draw ma la FIFO e' piena di BEGIN/END:
+                 * dice con QUALE metodo il titolo disegna davvero. */
+                { static int mh = -1;
+                  if (mh < 0) mh = getenv("RSX_METHIST") ? 1 : 0;
+                  if (mh && subch == 0) {
+                      static unsigned hist[2048]; static int inside = 0;
+                      static unsigned long dumped = 0, ends = 0;
+                      const u32 cm = m & 0x1FFCu;
+                      if (cm == 0x1808u) {
+                          if (vm_read32(dea) != 0) inside = 1;
+                          else { inside = 0; ends++; }
+                      } else if (inside) hist[(cm >> 2) & 2047]++;
+                      /* RSX_METSEQ=1: la sequenza CRUDA dei metodi di una
+                       * primitiva, con i valori. Dice in che ordine il titolo
+                       * scrive gli attributi e quindi quale scrittura chiude
+                       * un vertice. */
+                      { static int ms = -1;
+                        if (ms < 0) ms = getenv("RSX_METSEQ") ? 1 : 0;
+                        static int shown = 0;
+                        if (ms && shown < 2 && (inside || cm == 0x1808u)) {
+                            static int lines = 0;
+                            if (lines++ < 40) {
+                                u32 val = vm_read32(dea);
+                                fprintf(stderr, "[metseq] 0x%04X = 0x%08X (%.4f)\n",
+                                        cm, val, *(const float*)&val);
+                            } else if (cm == 0x1808u && vm_read32(dea) == 0) {
+                                shown++; lines = 0;
+                            }
+                        } }
+                      if (ends == 400 && !dumped) {
+                          dumped = 1;
+                          fprintf(stderr, "[methist] metodi fra BEGIN e END, su 400 primitive:\n");
+                          for (int k = 0; k < 2048; k++)
+                              if (hist[k]) fprintf(stderr, "   0x%04X  %u\n", k << 2, hist[k]);
+                          fflush(stderr);
+                      }
+                  } }
+
                 { static int fdbg = -1;
                   if (fdbg < 0) fdbg = getenv("RSX_LIVE_FEED_DBG") ? 1 : 0;
                   if (fdbg) {

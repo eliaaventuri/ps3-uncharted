@@ -1,6 +1,6 @@
 # Stato del progetto
 
-Ultimo aggiornamento: **11 settembre 2026** — sessione 20.
+Ultimo aggiornamento: **11 settembre 2026** — sessione 21.
 
 ## Dove siamo
 
@@ -24,11 +24,20 @@ cinematiche in-game, 829 voci, sottotitoli, e le icone dell'HUD (`assault-rifle-
 sulla parola a `0x20000000` era il job manager WwsJob che, con la local store
 conservata da una corsa all'altra, non rileggeva la job list dopo il
 `ResetList` del PPU. Con `SPURS_PM_FRESH=1` (ora default in `run.sh`) fa 500+
-fotogrammi senza fermarsi. La finestra però è **nera** (il gioco disegna ma il backend Metal non ha
-ancora vertex program/depth/RTT). Il secondo blocco, sul lato RSX ("Rendering
+fotogrammi senza fermarsi. Il secondo blocco, sul lato RSX ("Rendering
 is stuck on reference value N"), era un ciclo di JUMP che il rilevatore non
 prendeva per collisione di hash: ora recuperato a budget esaurito, zero stalli
 in 8 corse. Dettagli nella sezione "Sessione 20".
+
+**Dalla sessione 21 il renderer riceve davvero i disegni.** Lo schermo nero non
+era il backend Metal: il titolo disegna in **modalità immediata** (ogni vertice
+scritto come registri fra BEGIN e END, mai un `DRAW_ARRAYS`) e quel percorso non
+era implementato — al backend arrivavano **zero** draw. Ora arrivano, tutti
+dentro il volume di clip, e con una tinta di prova la finestra si riempie. Resta
+quasi nera perché a questo punto il gioco disegna solo 2-3 quad (uno nero a
+schermo pieno, cioè un clear, più HUD che campiona zone vuote dell'atlante):
+**la geometria della scena non viene mai sottomessa**, e quello è di nuovo il
+lato SPU/job, non il renderer. Dettagli in "Sessione 21".
 
 Quanto arriva a fare, dal log:
 
@@ -323,6 +332,145 @@ La lista dei comandi ora viene percorsa fino in fondo — sei coppie
 risultati in memoria principale.** Non era mai successo in nessuna sessione.
 Riproducibile: **tre corse su tre**, identiche -- 14 comandi, un overlay
 residente, zero microstep, cinque stall e due interrupt per corsa.
+
+## Sessione 21 — perche' lo schermo era nero: il titolo disegna in modalita' immediata
+
+La sessione 20 chiudeva con "la finestra e' nera, e' il buco del backend Metal
+(vertex program, depth, RTT)". **Era una diagnosi sbagliata**, o meglio: non era
+quello a fermare l'immagine. Il motivo vero e' molto piu' a monte.
+
+### La misura che cambia tutto: zero draw al backend
+
+Nuovo strumento `RSX_FRAMEDBG=1`: una riga per fotogramma con quanti draw e
+quanti vertici arrivano al backend Metal, e dove finiscono in clip space.
+
+```
+[RSX frame#300] draws=0 verts=0 dentro-clip=0
+```
+
+**Zero draw, sempre.** Quindi non e' il vertex program, non e' la matrice, non
+e' il depth: al renderer non arrivava proprio niente da disegnare.
+
+### Dove si perdevano: il titolo non usa DRAW_ARRAYS
+
+`RSX_LIVE_FEED_DBG=1` conta i metodi di disegno nella FIFO:
+
+```
+[feed] begin_end=6674 draw_arrays=0 draw_index=0
+```
+
+Migliaia di coppie BEGIN/END, e **nemmeno un DRAW_ARRAYS o DRAW_INDEX_ARRAY**.
+Il nuovo `RSX_METHIST=1` (istogramma dei metodi fra un BEGIN e il suo END) dice
+con che cosa disegna davvero, su 400 primitive:
+
+```
+0x1880 1436   0x1884 1436   0x1888 1436   0x188C 1436      (SET_VERTEX_DATA2F_M)
+0x1C20 1436   0x1C24 1436   0x1C28 1436   0x1C2C 1436      (SET_VERTEX_DATA4F_M)
+```
+
+E `RSX_METSEQ=1` da' l'ordine crudo dentro una primitiva:
+
+```
+0x1808 = 8            <- BEGIN, primitiva 8 = QUADS
+0x1C20..0x1C2C = 0    <- attributo 2, 4 float
+0x1888, 0x188C = 0    <- attributo 1, 2 float
+0x1880 = -1.0  0x1884 = 1.0   <- attributo 0: la POSIZIONE, scritta per ultima
+```
+
+Cioe': **modalita' immediata**. Il titolo non riempie un vertex buffer, scrive
+ogni vertice come una raffica di registri di attributo fra BEGIN e END, e il
+vertice e' completo quando arriva l'attributo 0. Esattamente come glVertex su
+OpenGL immediato. Nel port quel percorso **non esisteva**: `rsx_commands.c`
+trattava `0x1C00+` come costante di attributo (giusto quando l'array e'
+disabilitato, sbagliato dentro BEGIN/END) e `0x1880` non lo gestiva affatto.
+
+### Cosa e' stato aggiunto
+
+1. `rsx_commands.c`: `SET_VERTEX_DATA2F_M` (0x1880, due float, z=0 w=1 come
+   sull'hardware) accanto al gia' presente `4F`; e, dentro BEGIN/END, la
+   scrittura dell'**attributo 0** chiude un vertice e lo accumula. A END i
+   vertici accumulati vanno al backend in un colpo solo.
+2. `rsx_commands.h`: nuova voce **opzionale** della vtable,
+   `draw_inline(userdata, primitive, verts, count)` — `verts` e' contiguo,
+   `RSX_MAX_VERTEX_ATTRIBS x 4` float per vertice. Un backend che la lascia
+   NULL si comporta come prima: **D3D12 e null non cambiano di una riga**.
+3. `rsx_metal_backend.m`: `mtl_draw_inline`, con la stessa espansione delle
+   primitive di `emit_vertices` (Metal non ha quad ne' fan).
+
+Lo store dei vertici e' un file-static in `rsx_commands.c`, non un campo di
+`rsx_state`: quella struttura viene copiata e passata in giro, e mezzo megabyte
+di vertici dentro non ci deve stare.
+
+Mappatura degli attributi, **letta dai dati**, non indovinata:
+
+```
+v0 attr0=(-1.000 1.000 0.000 1.000)  attr1=(0.000 0.000 ...)  attr2=(0.000 ...)
+v1 attr0=( 0.609 -0.444 ...)         attr1=(0.125 0.000 ...)  attr2=(0.132 0.132 0.132 0.000)
+```
+
+attr0 = posizione (gia' in coordinate normalizzate -1..1: il vertex program per
+questi passaggi e' un pass-through, quindi la matrice resta l'identita' —
+`RSX_INLINE_MVP=1` applica comunque le costanti 0..3 per il confronto);
+attr1 = coordinate di texture (0..1, variano lungo il quad); attr2 = colore.
+`RSX_INLINE_MAP=col,tc` rimappa senza ricompilare.
+
+### Il risultato, misurato
+
+```
+[RSX frame#300] draws=3 verts=18 dentro-clip=18  x[-1.00 1.00] y[-1.00 1.00] z[0.00 0.00] w[1.00 1.00]
+```
+
+Da 0 a 18 vertici per fotogramma, **tutti dentro il volume di clip**. E con
+`RSX_FORCE_BUILTIN=1 RSX_DEBUG_TINT=1` (shader incorporato, tinta fissa) la
+finestra si riempie: **3.680.414 pixel** del colore di prova. La catena
+FIFO -> vertici immediati -> Metal -> schermo funziona end-to-end.
+
+### Perche' lo schermo e' ANCORA quasi nero (e non e' piu' un difetto)
+
+Con gli shader veri il fotogramma resta nero, e ora si sa perche':
+
+- Il titolo disegna **2-3 quad per fotogramma**, non di piu'.
+- Il primo e' un quad a schermo pieno di colore `(0,0,0,0)`: di fatto un clear a
+  nero. Lo fa lui, e' giusto che sia nero.
+- Gli altri sono piccoli quad con texture (unita' 0, 4096x128, formato `0xA6` =
+  DXT1 | LN). La texture **e' decodificata bene** — `RSX_TEX_DBG=1`: 65.464
+  texel non neri su 524.288, 48.170 con alpha — ma quei quad campionano la
+  fascia `u in [0, 0.031]` dell'atlante, che li' e' vuota.
+- Verificato saltando il quad a schermo pieno (`RSX_ONLY_SMALL=1`): dentro
+  l'area di contenuto restano **zero** pixel disegnati (i 2.416 trovati stanno
+  tutti sulla riga y=1555, cioe' il bordo della finestra).
+
+Il fragment program del guest si traduce e compila (`RSX_FP_DUMP=1`): due
+istruzioni, `r0 = tex2D(tc0)`, `h0 = r0 * col0`. Nota per dopo: **emette
+`return r[0]` mentre l'ultima scrittura e' a `h[0]`** — sul ramo a mezza
+precisione l'uscita dovrebbe venire da `h`. Qui non cambia nulla (entrambi sono
+neri), ma e' un difetto vero del decompilatore, da correggere quando servira'.
+
+### Il prossimo passo, e non e' piu' il renderer
+
+**La geometria della scena non viene mai sottomessa.** Zero `DRAW_ARRAYS` e zero
+`DRAW_INDEX_ARRAY` in tutta la corsa: il titolo non sta disegnando un mondo, sta
+disegnando una schermata di caricamento fatta di due quad. Il renderer non e'
+piu' il collo di bottiglia — lo e' il fatto che il gioco non arriva a produrre
+i comandi di disegno della scena, che e' il lato SPU/job (le liste di comandi
+del rendering le costruisce il job manager). Il fronte torna li'.
+
+### Strumenti nuovi
+
+- `RSX_FRAMEDBG=1` — per fotogramma: draw, vertici, quanti dentro il clip, e i
+  bounding box di x/y/z/w dopo la matrice. E' la prima cosa da guardare davanti
+  a uno schermo nero: separa "nessun draw" da "draw fuori schermo" da "draw
+  dentro ma invisibili".
+- `RSX_METHIST=1` — istogramma dei metodi fra BEGIN e END (dice COME disegna).
+- `RSX_METSEQ=1` — la sequenza cruda con i valori (dice in che ORDINE).
+- `RSX_INLINE_DBG=1` — i draw in modalita' immediata e i primi vertici.
+- `RSX_INLINE_MAP=col,tc` / `RSX_INLINE_MVP=1` — rimappatura attributi / matrice.
+- `RSX_FORCE_BUILTIN=1`, `RSX_DEBUG_TINT=1` — shader incorporato, tinta fissa:
+  separano "non rasterizza" da "rasterizza nero".
+- `RSX_TEX_DBG=1` — quanti texel non neri sono davvero atterrati.
+- `RSX_FP_DUMP=1` — l'MSL del fragment program tradotto.
+- `RSX_ONLY_SMALL=1` — salta i quad a schermo pieno.
+
 
 ## Sessione 20 — lo stallo dopo il caricamento era il job manager, non l'event flag
 
@@ -1916,6 +2064,12 @@ stampi EA, `vm_base` e il chiamante guest. Senza quello si procede a tentoni.
 
 vertex program del guest in MSL; depth/stencil, MRT, render-to-texture; il
 crossbar `TEXTURE_CONTROL1` e i sampler per unità.
+
+Dalla sessione 21 la **modalità immediata** c'è (`draw_inline` nella vtable,
+`SET_VERTEX_DATA2F/4F_M` fra BEGIN e END) — era lei a mancare, non i pezzi qui
+sopra, e senza di lei al backend non arrivava un solo draw. Difetto noto del
+decompilatore dei fragment program: emette `return r[0]` anche quando l'ultima
+scrittura è al banco a mezza precisione `h[0]`, da cui dovrebbe venire l'uscita.
 
 ## Come si ricostruisce il port
 

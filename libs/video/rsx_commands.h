@@ -376,6 +376,14 @@ typedef struct rsx_backend {
     /* Draw */
     void (*draw_arrays)(void* userdata, u32 primitive, u32 first, u32 count);
     void (*draw_indexed)(void* userdata, u32 primitive, u32 index_offset, u32 count);
+    /* Modalita' immediata: il titolo non usa un vertex buffer, scrive ogni
+     * vertice come registri di attributo fra BEGIN e END
+     * (NV4097_SET_VERTEX_DATA2F/4F_M). `verts` e' un array contiguo di `count`
+     * vertici, ognuno RSX_MAX_VERTEX_ATTRIBS x 4 float, gia' nell'ordine di
+     * emissione. Opzionale: un backend che la lascia NULL si comporta come
+     * prima (nessun draw), che e' cio' che facevano tutti. */
+    void (*draw_inline)(void* userdata, u32 primitive,
+                        const float* verts, u32 count);
 
     /* Texture */
     void (*bind_texture)(void* userdata, u32 unit, const rsx_texture_state* tex);

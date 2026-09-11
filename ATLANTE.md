@@ -46,6 +46,7 @@ libs/video/rsx_dispatch.c    decodifica metodi NV40 -> backend
 libs/video/rsx_*decompiler.c vertex/fragment program -> MSL
 libs/system/, libs/filesystem/, libs/audio/, libs/input/, ...  HLE delle librerie cell*
 
+libs/video/rsx_commands.c    stato RSX + modalita immediata (SET_VERTEX_DATA fra BEGIN/END)
 tools/ppu_lifter.py          lift PPU -> C++ (chunk in uncharted-data/recomp)
 tools/spu_lifter.py          lift SPU -> C
 tools/lift_jobmods.py        lift dei job module WwsJob

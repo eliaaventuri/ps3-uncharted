@@ -31,6 +31,7 @@
 #include "cellGcmSys.h"          /* cellGcmResolveLocated */
 #include <stdio.h>
 #include <stdlib.h>
+#include <math.h>
 
 /* ------------------------------------------------------------------------- */
 
@@ -139,6 +140,7 @@ static void mtl_set_viewport(void* ud, const rsx_state* state)
 
 static void mtl_draw_arrays(void*, u32, u32, u32);
 static void mtl_draw_indexed(void*, u32, u32, u32);
+static void mtl_draw_inline(void*, u32, const float*, u32);
 static void mtl_bind_texture(void*, u32, const rsx_texture_state*);
 
 static rsx_backend s_backend_vtable = {
@@ -150,6 +152,7 @@ static rsx_backend s_backend_vtable = {
     .set_viewport       = mtl_set_viewport,
     .draw_arrays       = mtl_draw_arrays,
     .draw_indexed      = mtl_draw_indexed,
+    .draw_inline       = mtl_draw_inline,
     .bind_texture      = mtl_bind_texture,
 };
 
@@ -372,6 +375,105 @@ static void mtl_draw_indexed(void* ud, u32 primitive, u32 index_offset, u32 coun
     record_draw(s_state, primitive, index_offset, count, resolve_indexed);
 }
 
+/* Modalita' immediata: i vertici non stanno in un vertex buffer del guest, li
+ * ha appena consegnati rsx_commands.c come array contiguo di
+ * RSX_MAX_VERTEX_ATTRIBS x 4 float ciascuno. L'espansione delle primitive e'
+ * la stessa di emit_vertices (Metal non ha quad ne' fan); la differenza e' solo
+ * da dove arrivano i numeri.
+ *
+ * La matrice resta l'IDENTITA': le posizioni misurate arrivano gia' in
+ * coordinate normalizzate (-1..1), perche' il vertex program del titolo per
+ * questi passaggi e' un pass-through. RSX_INLINE_MVP=1 applica comunque le
+ * costanti 0..3, per il confronto A/B. */
+static void mtl_draw_inline(void* ud, u32 primitive, const float* verts, u32 count)
+{
+    (void)ud;
+    if (!s_ready || !s_verts || !verts || count == 0) return;
+    if (s_draw_count >= MTL_MAX_DRAWS) { s_dropped_draws++; return; }
+
+    const u32 STRIDE = RSX_MAX_VERTEX_ATTRIBS * 4;
+    u32 first_vert = s_vert_count, wrote = 0;
+
+    /* Quale attributo porta cosa. Il titolo scrive attr0 (posizione, 2F),
+     * attr1 e attr2; RSX_INLINE_MAP=col,tc rimappa senza ricompilare mentre si
+     * capisce quale sia il colore e quale la coordinata di texture. */
+    static int s_col = -1, s_tc = -1;
+    if (s_col < 0) {
+        const char* e = getenv("RSX_INLINE_MAP");
+        s_col = 2; s_tc = 1;
+        if (e && *e) { int a = 0, b = 0;
+            if (sscanf(e, "%d,%d", &a, &b) == 2) { s_col = a; s_tc = b; } }
+        if (s_col >= (int)RSX_MAX_VERTEX_ATTRIBS) s_col = 2;
+        if (s_tc  >= (int)RSX_MAX_VERTEX_ATTRIBS) s_tc  = 1;
+    }
+
+    #define IPUSH(seq) do {                                                    \
+        if (s_vert_count >= MTL_MAX_VERTS) goto done;                          \
+        const float* a = &verts[(seq) * STRIDE];                               \
+        MtlVertex* o = &s_verts[s_vert_count++];                               \
+        memcpy(o->pos, &a[0],           sizeof o->pos);                        \
+        memcpy(o->col, &a[s_col * 4],   sizeof o->col);                        \
+        memcpy(o->tc,  &a[s_tc  * 4],   sizeof o->tc);                         \
+        wrote++;                                                               \
+    } while (0)
+
+    if (primitive == RSX_PRIMITIVE_QUADS) {
+        for (u32 q = 0; q + 3 < count; q += 4) {
+            IPUSH(q); IPUSH(q+1); IPUSH(q+2);
+            IPUSH(q); IPUSH(q+2); IPUSH(q+3);
+        }
+    } else if (primitive == RSX_PRIMITIVE_QUAD_STRIP) {
+        for (u32 q = 0; q + 3 < count; q += 2) {
+            IPUSH(q); IPUSH(q+1); IPUSH(q+2);
+            IPUSH(q+1); IPUSH(q+3); IPUSH(q+2);
+        }
+    } else if (primitive == RSX_PRIMITIVE_TRIANGLE_FAN || primitive == RSX_PRIMITIVE_POLYGON) {
+        for (u32 t = 1; t + 1 < count; t++) { IPUSH(0); IPUSH(t); IPUSH(t+1); }
+    } else {
+        for (u32 v = 0; v < count; v++) IPUSH(v);
+    }
+done:
+    #undef IPUSH
+    if (wrote == 0) { s_dropped_draws++; return; }
+
+    MtlDraw* d = &s_draws[s_draw_count++];
+    d->base  = first_vert;
+    d->count = wrote;
+    d->topology = rsx_primitive_needs_expansion(primitive) ? MTLPrimitiveTypeTriangle
+                : topo_to_metal(rsx_primitive_topology(primitive));
+    d->blend_enable   = s_state ? s_state->blend_enable   : 0;
+    d->blend_sfactor  = s_state ? s_state->blend_sfactor  : 0;
+    d->blend_dfactor  = s_state ? s_state->blend_dfactor  : 0;
+    d->blend_equation = s_state ? s_state->blend_equation : 0;
+    d->fp_addr        = s_state ? s_state->shader_program : 0;
+    d->tex0           = s_state && (s_state->textures[0].control0 & 0x80000000u) != 0;
+
+    memset(d->mvp, 0, sizeof d->mvp);
+    d->mvp[0] = d->mvp[5] = d->mvp[10] = d->mvp[15] = 1.0f;
+    { static int im = -1;
+      if (im < 0) im = getenv("RSX_INLINE_MVP") ? 1 : 0;
+      if (im && s_state)
+          for (int r = 0; r < 4; r++)
+              for (int c = 0; c < 4; c++)
+                  d->mvp[r * 4 + c] = s_state->vertex_constants[r][c]; }
+
+    { static int dbg = -1;
+      if (dbg < 0) dbg = getenv("RSX_INLINE_DBG") ? 1 : 0;
+      static unsigned long n = 0;
+      if (dbg && (++n <= 6)) {
+          fprintf(stderr, "[mtl inline] #%lu prim=%u in=%u out=%u topo=%d tex0=%d blend=%d\n",
+                  n, primitive, count, wrote, (int)d->topology, d->tex0, d->blend_enable);
+          for (u32 v = 0; v < count && v < 4; v++) {
+              const float* a = &verts[v * STRIDE];
+              fprintf(stderr, "   v%u attr0=(%.3f %.3f %.3f %.3f) attr1=(%.3f %.3f %.3f %.3f) "
+                              "attr2=(%.3f %.3f %.3f %.3f)\n", v,
+                      a[0], a[1], a[2], a[3], a[4], a[5], a[6], a[7],
+                      a[8], a[9], a[10], a[11]);
+          }
+          fflush(stderr);
+      } }
+}
+
 /* ---- pipeline state ------------------------------------------------------ */
 
 static MTLBlendFactor blend_factor_to_metal(u32 f)
@@ -421,6 +523,7 @@ static NSString* const kBuiltinMSL = @
 "    return o;\n"
 "}\n"
 "fragment float4 fs_main(VOut in [[stage_in]]) { return in.col; }\n"
+"fragment float4 fs_tint(VOut in [[stage_in]]) { return float4(1.0, 0.2, 0.6, 1.0); }\n"
 "fragment float4 fs_tex(VOut in [[stage_in]], texture2d<float> t0 [[texture(0)]],\n"
 "                       sampler s0 [[sampler(0)]]) { return t0.sample(s0, in.tc.xy); }\n";
 
@@ -509,6 +612,24 @@ static void mtl_bind_texture(void* ud, u32 unit, const rsx_texture_state* tex)
         u->image_rect = tex->image_rect;
         fprintf(stderr, "[RSX metal] texture unit %u: %ux%u fmt=0x%02X\n",
                 unit, width, height, fmt);
+        /* RSX_TEX_DBG=1: quanti texel non neri sono davvero atterrati. Una
+         * texture decodificata male e una texture vuota dal backend si vedono
+         * uguali (nero), e da li' non si riparte. */
+        { static int td2 = -1;
+          if (td2 < 0) td2 = getenv("RSX_TEX_DBG") ? 1 : 0;
+          if (td2) {
+              unsigned long nz = 0, na = 0;
+              const size_t n = (size_t)width * height;
+              for (size_t i = 0; i < n; i++) {
+                  const u8* p = staging + i * 4;
+                  if (p[0] | p[1] | p[2]) nz++;
+                  if (p[3]) na++;
+              }
+              fprintf(stderr, "[RSX metal]   texel non neri: %lu/%zu, alpha>0: %lu"
+                              "  primi: %02X%02X%02X%02X %02X%02X%02X%02X\n",
+                      nz, n, na, staging[0], staging[1], staging[2], staging[3],
+                      staging[4], staging[5], staging[6], staging[7]);
+          } }
     }
     free(staging);
 }
@@ -541,9 +662,16 @@ static id<MTLLibrary> guest_fp_library(u32 fp_addr)
             if (!lib)
                 fprintf(stderr, "[RSX metal] guest fp 0x%08X compile failed: %s\n",
                         fp_addr, [[err localizedDescription] UTF8String]);
-            else
+            else {
                 fprintf(stderr, "[RSX metal] guest fp 0x%08X: %d instructions\n",
                         fp_addr, n);
+                /* RSX_FP_DUMP=1: l'MSL tradotto. Quando la geometria rasterizza
+                 * (provato con la tinta) ma resta nera, la risposta e' qui. */
+                { static int fd = -1;
+                  if (fd < 0) fd = getenv("RSX_FP_DUMP") ? 1 : 0;
+                  if (fd) fprintf(stderr, "---- MSL fp 0x%08X ----\n%s\n----\n",
+                                  fp_addr, msl); }
+            }
         } else {
             fprintf(stderr, "[RSX metal] guest fp 0x%08X: decompile failed\n", fp_addr);
         }
@@ -586,14 +714,25 @@ static id<MTLRenderPipelineState> pso_for(const MtlDraw* d)
     MTLRenderPipelineDescriptor* pd = [MTLRenderPipelineDescriptor new];
     /* The guest's own fragment program when it has one and it translated;
      * otherwise the built-in pair. */
-    id<MTLLibrary> glib = d->fp_addr ? guest_fp_library(d->fp_addr) : nil;
+    /* RSX_FORCE_BUILTIN=1: ignora il fragment program del guest e usa la
+     * coppia incorporata. E' la prova A/B che separa "la geometria non
+     * rasterizza" da "rasterizza ma il programma del titolo la dipinge di
+     * nero". */
+    static int s_fb = -1;
+    if (s_fb < 0) s_fb = getenv("RSX_FORCE_BUILTIN") ? 1 : 0;
+    id<MTLLibrary> glib = (d->fp_addr && !s_fb) ? guest_fp_library(d->fp_addr) : nil;
     if (glib) {
         pd.vertexFunction   = [glib newFunctionWithName:@"vs_guest"];
         pd.fragmentFunction = [glib newFunctionWithName:@"rsx_fp_main"];
     } else {
         pd.vertexFunction   = [s_shader_lib newFunctionWithName:@"vs_main"];
+        /* RSX_DEBUG_TINT=1: tinta fissa, per vedere DOVE cade la geometria
+         * quando i colori veri sono quasi neri (misurato: 0.031). */
+        static int s_dt = -1;
+        if (s_dt < 0) s_dt = getenv("RSX_DEBUG_TINT") ? 1 : 0;
         pd.fragmentFunction = [s_shader_lib newFunctionWithName:
-                               (d->tex0 && s_tex[0].tex) ? @"fs_tex" : @"fs_main"];
+                               s_dt ? @"fs_tint"
+                               : ((d->tex0 && s_tex[0].tex) ? @"fs_tex" : @"fs_main")];
     }
     pd.vertexDescriptor = vd;
     pd.colorAttachments[0].pixelFormat = MTLPixelFormatBGRA8Unorm;
@@ -790,6 +929,24 @@ void rsx_metal_backend_present(void)
 
             for (u32 i = 0; i < s_draw_count; i++) {
                 MtlDraw* d = &s_draws[i];
+                /* RSX_ONLY_SMALL=1: salta i quad che coprono tutto lo schermo.
+                 * Il titolo ne disegna uno nero per fotogramma (di fatto un
+                 * clear) e sopra ci mette l'HUD: saltandolo si vede se l'HUD
+                 * dipinge davvero qualcosa o se e' nero anche lui. */
+                { static int os = -1;
+                  if (os < 0) os = getenv("RSX_ONLY_SMALL") ? 1 : 0;
+                  if (os) {
+                      float mnx = 1e30f, mxx = -1e30f, mny = 1e30f, mxy = -1e30f;
+                      for (u32 v = d->base; v < d->base + d->count && v < s_vert_count; v++) {
+                          const float* P = s_verts[v].pos;
+                          if (P[0] < mnx) mnx = P[0];
+                          if (P[0] > mxx) mxx = P[0];
+                          if (P[1] < mny) mny = P[1];
+                          if (P[1] > mxy) mxy = P[1];
+                      }
+                      if (mnx <= -0.99f && mxx >= 0.99f && mny <= -0.99f && mxy >= 0.99f)
+                          continue;
+                  } }
                 id<MTLRenderPipelineState> pso = pso_for(d);
                 if (!pso) continue;
                 [enc setRenderPipelineState:pso];
@@ -809,6 +966,44 @@ void rsx_metal_backend_present(void)
             }
         }
         [enc endEncoding];
+
+        /* RSX_FRAMEDBG=1: una riga per fotogramma con quanto e' arrivato al
+         * backend e DOVE finisce in clip space. Distingue le tre cause di uno
+         * schermo nero -- nessun draw, draw fuori dal volume di clip, draw
+         * dentro ma invisibili -- che dal nero non si distinguono. */
+        { static int fd = -1;
+          if (fd < 0) fd = getenv("RSX_FRAMEDBG") ? 1 : 0;
+          if (fd) {
+              static unsigned long fno = 0;
+              unsigned long n = ++fno;
+              if (n <= 8 || (n % 60) == 0) {
+                  float lo[4] = { 1e30f, 1e30f, 1e30f, 1e30f };
+                  float hi[4] = { -1e30f, -1e30f, -1e30f, -1e30f };
+                  unsigned inside = 0;
+                  for (u32 i = 0; i < s_draw_count; i++) {
+                      const MtlDraw* d = &s_draws[i];
+                      for (u32 v = d->base; v < d->base + d->count && v < s_vert_count; v++) {
+                          const float* P = s_verts[v].pos;
+                          float o[4];
+                          for (int r = 0; r < 4; r++)
+                              o[r] = d->mvp[r*4+0]*P[0] + d->mvp[r*4+1]*P[1]
+                                   + d->mvp[r*4+2]*P[2] + d->mvp[r*4+3]*P[3];
+                          for (int r = 0; r < 4; r++) {
+                              if (o[r] < lo[r]) lo[r] = o[r];
+                              if (o[r] > hi[r]) hi[r] = o[r];
+                          }
+                          if (o[3] > 0.0f && fabsf(o[0]) <= o[3] && fabsf(o[1]) <= o[3]
+                              && o[2] >= 0.0f && o[2] <= o[3]) inside++;
+                      }
+                  }
+                  fprintf(stderr,
+                          "[RSX frame#%lu] draws=%u verts=%u dentro-clip=%u  "
+                          "x[%.2f %.2f] y[%.2f %.2f] z[%.2f %.2f] w[%.2f %.2f]\n",
+                          n, s_draw_count, s_vert_count, inside,
+                          lo[0], hi[0], lo[1], hi[1], lo[2], hi[2], lo[3], hi[3]);
+                  fflush(stderr);
+              }
+          } }
 
         if (drawable) [cb presentDrawable:drawable];
 
