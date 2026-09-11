@@ -156,9 +156,9 @@ void spu_stop_at(spu_context* ctx, uint32_t addr)
     if (!known) {
         if (n < 32) seen[n++] = key;
         char b[600];
-        int q = snprintf(b, sizeof b, "[spu-assert] img=%d stopd @0x%05X -- il modulo "
+        int q = snprintf(b, sizeof b, "[spu-assert] img=%d ovl=%d stopd @0x%05X -- il modulo "
                          "si ferma qui e riparte al tick dopo\n         r0-31:",
-                         ctx->image_id, addr);
+                         ctx->image_id, ctx->resident_ovl, addr);
         /* I registri servono quanto l'indirizzo: un'assert di WwsJob dice
          * "questo valore e' fuori intervallo", e senza il valore resta una
          * riga di log. Solo r0-r31: le condizioni stanno tutte li'. */
@@ -1671,9 +1671,12 @@ void spu_indirect_branch(spu_context* ctx)
         { extern int g_hle_trace_armed; static int s_gate = -1;
           if (s_gate < 0) s_gate = getenv("PS3_TTY_BT") ? 1 : 0;
           if (p >= 0x4000 && (!s_gate || g_hle_trace_armed)) _armed = 1; }
-        if (_armed && _n++ < 1500) {
-            fprintf(stderr, "[jobtrace] ovl=%d pc=0x%05X lr=0x%05X%s",
-                    ctx->resident_ovl, p, ctx->gpr[0]._u32[0] & SPU_LS_MASK,
+        /* SPU_JOBTRACE_OVL=<id>: solo quel modulo (il sintetizzatore audio
+         * da solo riempie il tetto di 1500 righe in due fotogrammi). */
+        static int s_only = -2; if (s_only == -2) { const char* e = getenv("SPU_JOBTRACE_OVL"); s_only = e ? atoi(e) : -1; }
+        if (_armed && (s_only < 0 || ctx->resident_ovl == s_only) && _n++ < 1500) {
+            fprintf(stderr, "[jobtrace] ovl=%d pc=0x%05X lr=0x%05X ie=%u%s",
+                    ctx->resident_ovl, p, ctx->gpr[0]._u32[0] & SPU_LS_MASK, ctx->int_enable,
                     fn ? "" : " (no lift)");
             /* JobApi entries: args r3-r5. Post-job return 0x3308: result r3 +
              * the job's saved GetBufferTag result r80. */

@@ -221,7 +221,7 @@ int rsx_vp_analyze_inputs(const u8* ucode, u32 max_bytes,
 
 static int rsx_vp_decompile_impl(
     const u8* ucode, u32 max_bytes, u32 vtex_mask, int compact_inputs,
-    u32 input_mask, char* out, u32 out_size);
+    u32 input_mask, int msl, char* out, u32 out_size);
 
 int rsx_vp_decompile(const u8* ucode, u32 max_bytes, char* out, u32 out_size)
 {
@@ -232,7 +232,7 @@ int rsx_vp_decompile_ex(const u8* ucode, u32 max_bytes, u32 vtex_mask,
                         char* out, u32 out_size)
 {
     return rsx_vp_decompile_impl(
-        ucode, max_bytes, vtex_mask, 0, 0xFFFFu, out, out_size);
+        ucode, max_bytes, vtex_mask, 0, 0xFFFFu, 0, out, out_size);
 }
 
 int rsx_vp_decompile_compact_ex(
@@ -247,12 +247,31 @@ int rsx_vp_decompile_compact_ex(
     else
         input_mask = analysis.input_mask;
     return rsx_vp_decompile_impl(
-        ucode, max_bytes, vtex_mask, 1, input_mask, out, out_size);
+        ucode, max_bytes, vtex_mask, 1, input_mask, 0, out, out_size);
+}
+
+/* MSL variant for the Metal backend: compact inputs (only the attributes the
+ * program reads are declared, as [[attribute(N)]]), constants and the RSX
+ * viewport transform in `constant VPConst& [[buffer(0)]]`, PSInput as the
+ * MSL fragment decompiler declares it (the two go in one source). No vertex
+ * textures (TXL reads zero). *out_mask receives the declared attribute set. */
+int rsx_vp_decompile_msl(const u8* ucode, u32 max_bytes, u32* out_mask,
+                         char* out, u32 out_size)
+{
+    rsx_vp_input_analysis analysis;
+    u32 input_mask;
+    if (rsx_vp_analyze_inputs(ucode, max_bytes, &analysis) < 0 || !analysis.exact)
+        input_mask = 0xFFFFu;
+    else
+        input_mask = analysis.input_mask;
+    if (out_mask) *out_mask = input_mask;
+    return rsx_vp_decompile_impl(
+        ucode, max_bytes, 0u, 1, input_mask, 1, out, out_size);
 }
 
 static int rsx_vp_decompile_impl(
     const u8* ucode, u32 max_bytes, u32 vtex_mask, int compact_inputs,
-    u32 input_mask, char* out, u32 out_size)
+    u32 input_mask, int msl, char* out, u32 out_size)
 {
     if (!ucode || !out || out_size < 256) return -1;
 
@@ -322,22 +341,23 @@ static int rsx_vp_decompile_impl(
             case 0x08: snprintf(rhs,sizeof rhs,"float4(1,(%s).y*(%s).y,(%s).z,(%s).w)",A,B,A,B); break; /* DST */
             case 0x09: snprintf(rhs,sizeof rhs,"min((%s),(%s))",A,B); break;   /* MIN */
             case 0x0A: snprintf(rhs,sizeof rhs,"max((%s),(%s))",A,B); break;   /* MAX */
-            case 0x0B: snprintf(rhs,sizeof rhs,"(float4)((%s)<(%s))",A,B); break;  /* SLT */
-            case 0x0C: snprintf(rhs,sizeof rhs,"(float4)((%s)>=(%s))",A,B); break; /* SGE */
-            case 0x0E: snprintf(rhs,sizeof rhs,"frac(%s)",A); break;           /* FRC */
+            case 0x0B: snprintf(rhs,sizeof rhs,msl ? "float4((%s)<(%s))" : "(float4)((%s)<(%s))",A,B); break;  /* SLT */
+            case 0x0C: snprintf(rhs,sizeof rhs,msl ? "float4((%s)>=(%s))" : "(float4)((%s)>=(%s))",A,B); break; /* SGE */
+            case 0x0E: snprintf(rhs,sizeof rhs,msl ? "fract(%s)" : "frac(%s)",A); break; /* FRC */
             case 0x0F: snprintf(rhs,sizeof rhs,"floor(%s)",A); break;          /* FLR */
-            case 0x10: snprintf(rhs,sizeof rhs,"(float4)((%s)==(%s))",A,B); break; /* SEQ */
-            case 0x11: snprintf(rhs,sizeof rhs,"(float4)0"); break;            /* SFL */
-            case 0x12: snprintf(rhs,sizeof rhs,"(float4)((%s)>(%s))",A,B); break;  /* SGT */
-            case 0x13: snprintf(rhs,sizeof rhs,"(float4)((%s)<=(%s))",A,B); break; /* SLE */
-            case 0x14: snprintf(rhs,sizeof rhs,"(float4)((%s)!=(%s))",A,B); break; /* SNE */
+            case 0x10: snprintf(rhs,sizeof rhs,msl ? "float4((%s)==(%s))" : "(float4)((%s)==(%s))",A,B); break; /* SEQ */
+            case 0x11: snprintf(rhs,sizeof rhs,msl ? "float4(0)" : "(float4)0"); break; /* SFL */
+            case 0x12: snprintf(rhs,sizeof rhs,msl ? "float4((%s)>(%s))" : "(float4)((%s)>(%s))",A,B); break;  /* SGT */
+            case 0x13: snprintf(rhs,sizeof rhs,msl ? "float4((%s)<=(%s))" : "(float4)((%s)<=(%s))",A,B); break; /* SLE */
+            case 0x14: snprintf(rhs,sizeof rhs,msl ? "float4((%s)!=(%s))" : "(float4)((%s)!=(%s))",A,B); break; /* SNE */
             case 0x15: snprintf(rhs,sizeof rhs,"float4(1,1,1,1)"); break;      /* STR */
             case 0x16: snprintf(rhs,sizeof rhs,"sign(%s)",A); break;           /* SSG */
             case 0x19: {
                 const u32 tex_unit = (d2 >> 8) & 3u;
                 if ((vtex_mask >> tex_unit) & 1u)
                     snprintf(rhs, sizeof rhs,
-                        "rsx_vtex%u.SampleLevel(rsx_vsamp%u, (%s).xy, 0.0)",
+                        msl ? "rsx_vtex%u.sample(rsx_vsamp%u, (%s).xy, level(0.0))"
+                            : "rsx_vtex%u.SampleLevel(rsx_vsamp%u, (%s).xy, 0.0)",
                         tex_unit, tex_unit, A);
                 else
                     snprintf(rhs, sizeof rhs, "float4(0,0,0,0)");
@@ -348,7 +368,8 @@ static int rsx_vp_decompile_impl(
                     char m[6]; mask_str(vmx,vmy,vmz,vmw,m);
                     char line[256];
                     snprintf(line,sizeof line,
-                        "    { int4 _a = (int4)floor(%s); a%u.%s = _a.%s; }\n",
+                        msl ? "    { int4 _a = int4(floor(%s)); a%u.%s = _a.%s; }\n"
+                            : "    { int4 _a = (int4)floor(%s); a%u.%s = _a.%s; }\n",
                         A, addr_sel, m, m);
                     emit(&b, line);
                 }
@@ -364,7 +385,8 @@ static int rsx_vp_decompile_impl(
             if (handled) {
                 char m[6]; mask_str(vmx,vmy,vmz,vmw,m);
                 char line[600];
-                snprintf(line,sizeof line,"    { float4 _v = (float4)(%s);%s\n",
+                snprintf(line,sizeof line,msl ? "    { float4 _v = float4(%s);%s\n"
+                                              : "    { float4 _v = (float4)(%s);%s\n",
                          rhs, saturate ? " _v = saturate(_v);" : "");
                 emit(&b, line);
                 if (vec_result && dst_out != 0x1F)
@@ -406,7 +428,8 @@ static int rsx_vp_decompile_impl(
             if (rhs[0]) {
                 char m[6]; mask_str(smx,smy,smz,smw,m);
                 char line[600];
-                snprintf(line,sizeof line,"    { float4 _v = (float4)(%s);%s\n",
+                snprintf(line,sizeof line,msl ? "    { float4 _v = float4(%s);%s\n"
+                                              : "    { float4 _v = (float4)(%s);%s\n",
                          rhs, saturate ? " _v = saturate(_v);" : "");
                 emit(&b, line);
                 /* SCA writes the output register when the VEC unit does not
@@ -426,6 +449,51 @@ static int rsx_vp_decompile_impl(
 
     /* ---- assemble full shader ---- */
     Out o = { out, out_size, 0, 0 };
+    if (msl) {
+        /* PSInput comes from the fragment decompiler's MSL, emitted before
+         * this in the same source. */
+        emit(&o, "struct VSInput {\n");
+        for (u32 attr = 0; attr < 16; attr++) {
+            if (!(input_mask & (1u << attr))) continue;
+            char declaration[64];
+            snprintf(declaration, sizeof(declaration),
+                     "    float4 a%u [[attribute(%u)]];\n", attr, attr);
+            emit(&o, declaration);
+        }
+        emit(&o,
+            "};\n"
+            "struct VPConst { float4 vp_c[512]; float4 vp_posscale; float4 vp_posoffset; };\n"
+            "vertex PSInput vs_guest(VSInput input [[stage_in]], constant VPConst& vpc [[buffer(0)]]) {\n"
+            "    constant float4* vp_c = vpc.vp_c;\n"
+            "    float4 v[16];\n"
+            "    for (int _k=0;_k<16;_k++) v[_k]=float4(0,0,0,1);\n");
+        for (u32 attr = 0; attr < 16; attr++) {
+            if (!(input_mask & (1u << attr))) continue;
+            char assignment[64];
+            snprintf(assignment, sizeof(assignment),
+                     "    v[%u]=input.a%u;\n", attr, attr);
+            emit(&o, assignment);
+        }
+        emit(&o,
+            "    float4 r[32]; float4 o[16];\n"
+            "    for (int _i=0;_i<32;_i++) r[_i]=float4(0);\n"
+            "    for (int _j=0;_j<16;_j++) o[_j]=float4(0,0,0,1);\n"
+            "    int4 a0 = int4(0); int4 a1 = int4(0);\n");
+        emit(&o, body);
+        emit(&o,
+            "    PSInput Out;\n"
+            "    float4 _p = o[0];\n"
+            "    Out.position = float4(_p.xyz * vpc.vp_posscale.xyz + _p.w * vpc.vp_posoffset.xyz, _p.w);\n"
+            "    Out.col0 = o[1]; Out.col1 = o[2]; Out.fog = o[5].xxxx;\n"
+            "    Out.tc0=o[7];  Out.tc1=o[8];  Out.tc2=o[9];  Out.tc3=o[10];\n"
+            "    Out.tc4=o[11]; Out.tc5=o[12]; Out.tc6=o[13]; Out.tc7=o[14];\n"
+            "    return Out;\n"
+            "}\n");
+        (void)n_cond_skipped;
+        (void)n_flow_skipped;
+        if (o.overflow) return -1;
+        return instrs;
+    }
     if (!compact_inputs) {
         emit(&o,
             /* All 16 RSX vertex attributes arrive as float4 (the harness

@@ -94,7 +94,24 @@ e' ancora un fotogramma verde uniforme: tutti i vertici escono dal clip con
 w negativo (x[-3.4 -2.0] y[-6.7 -5.5] w[-4.0 -2.7]) -- e' il fronte aperto.
 Gli errori "Technique index 0 already exists" sono dati veri del titolo
 (maschere di tag identiche in memoria, lette con `PS3_TTY_DUMP`), non un
-difetto nostro. Dettagli in "Sessione 27".
+difetto nostro.
+
+**Sempre nella sessione 27, il menu principale e' sullo schermo.** Ci sono
+voluti, in fila: il vertex program del guest tradotto in MSL nel backend
+Metal (prima c'era solo una MVP fissa dalle costanti 0..3), gli indici letti
+dal registro giusto (SET_INDEX_ARRAY_DMA, non dall'offset), le texture legate
+per draw (prima tutti i draw del fotogramma usavano le ultime), un secondo
+bug del lifter SPU (l'idioma `brsl $r2,.+4; ai $r2,$r2,8; bid $r2` letto come
+ritorno: il job di culling usciva dal suo helper DMA senza fare la DMA), tre
+istruzioni SPU mancanti nel disassemblatore (`orbi/xorhi/xorbi`), lo script
+`relift_spu.sh` che liftava il policy module senza gli ingressi extra (un
+commento dentro il comando), il walker della FIFO che deve ASPETTARE sui
+JUMP-a-se-stessi dei buffer scritti dai job SPU (`GCM_PARK_WAIT=1`) e
+attraversare gli zeri (NOP) dentro le CALL, e lo slot di partenza del vertex
+program (`SET_TRANSFORM_PROGRAM_START`). Risultato: ~33 draw per fotogramma
+nel menu, testo (glifi sbagliati), l'icona del tasto X, la voce evidenziata
+in giallo. Manca lo sfondo 3D (i buchi dei draw nei buffer SPU restano NOP)
+e i glifi del testo sono quelli sbagliati. Dettagli in "Sessione 27".
 
 Quanto arriva a fare, dal log:
 
@@ -458,8 +475,94 @@ dei vertici (vertex program / costanti / formato degli attributi).
   `SYN_ASSERT`) e ovl 212 (`jobmod_008cc900`, "CHANCE ASSERTION").
   Il rendering della scena non passa da job SPU: e' PPU (DRAW_ARRAYS).
 
+### Seconda parte: dal fotogramma verde al menu (in ordine di scoperta)
+
+1. **Vertex program del guest in Metal.** `rsx_vp_decompile_msl()` (nuovo in
+   `rsx_vp_decompiler.c`: stesso corpo dell'HLSL con le grafie MSL, input
+   compatti `[[attribute(N)]]` per i soli attributi letti, costanti +
+   viewport in `constant VPConst& [[buffer(0)]]`, PSInput del fragment
+   decompiler). Nel backend: cache dei VP per hash (`s_vps`), flusso di
+   attributi a passo variabile letto sul CPU (`rsx_fetch_attrib`, come il
+   D3D12) in `s_vpd` (64 MB), blocchi di 512 costanti + scale/offset per
+   draw deduplicati (`s_cbs`), libreria (VP, FP) e PSO per VP. `RSX_VP=0`
+   torna al percorso incorporato. I quad 2D del titolo: posizione da attr1,
+   `x' = 2x-1, y' = -2y+1` con c256/c257, z da c467.
+2. **Indici.** `resolve_indexed` leggeva il tipo dall'OFFSET e risolveva
+   con la tabella IO anche la VRAM: ogni indice era 0 (tutti i quad in un
+   punto). Ora da `index_array_dma` (tipo bit 4-7, locazione bit 0-3), come
+   `read_guest_index` del D3D12.
+3. **Texture per draw.** `MtlDraw.tex[16]` (puntatori non ritenuti) presi
+   da `s_tex` al momento del draw; `s_texcache` (2048 voci per offset/
+   formato/dimensioni, evizione a fine fotogramma dopo 600 fotogrammi).
+4. **Nel menu il main thread si bloccava** dentro `CreateVisibleBuckets`
+   (0x185360) -> API WwsJob (0x74xxxx) aspettando i job di culling
+   (`sample` del processo: spin in 0x742838/0x74073C). Sul lato SPU
+   `SPURS_PM_WATCHDOG=5`: corsa di wid=10 ferma a 0x81C4 dopo tre
+   `stopd` a 0xB3CC/0xAE60/0xB3F4 (ovl 204 = `jobmod_00894700`,
+   `game/render/culling.cpp`). L'assert a 0xAB3C e' `rdch SPU_RdMachStat;
+   andi 1; brz` = "gli interrupt devono essere abilitati"; erano spenti
+   perche' l'helper DMA 0xB948 usa l'idioma
+   `brsl $r2,.+4 ; ai $r2,$r2,8 ; bid $r2` (salta a .+12 disabilitando gli
+   interrupt) e `compute_link_returns` (`tools/spu_lifter.py`) vedeva
+   `bi $r2` con r2 "mai scritto nella funzione" -- l'`ai` sta nella funzione
+   aperta dal target del brsl -- e lo emetteva come `SPU_RET`: l'helper
+   tornava al chiamante senza fare la DMA. Ora la scansione all'indietro e'
+   lineare (si ferma ai flow break, non ai confini di funzione).
+5. `relift_spu.sh`: il blocco di commenti stava DENTRO il comando del policy
+   module e ne spezzava la continuazione: il PM veniva liftato senza
+   `--extra-funcs/--force-indirect` (il lift buono era stato fatto a mano).
+6. `tools/spu_disasm.py`: mancavano `orbi` (op8 0x06), `xorhi` (0x45),
+   `xorbi` (0x46): il job di geometria (ovl 215, `jobmod_008dc900`, 74 KB)
+   eseguiva `.word 0x06004716` a 0xE160. Gli altri "unsupported" dei moduli
+   sono stringhe/tabelle nel segmento codice, mai eseguite.
+7. **Buffer di comandi dei job SPU.** L'anello fa `CALL 0x0A400000` (IO ->
+   EA 0x20500000, mappatura del titolo); il buffer comincia con
+   `2A400000` = JUMP a se stesso, scritto dal job insieme a 22 NOP
+   (`40580100`), e viene PATCHATO dopo (DMA di 0x50 byte da pc 0x41B0:
+   `00041710 0 | 00041680 8AF99980 | 000416A0.. | 0004168C.. | 0004181C.. |
+   00041820 00000011 | 8 zeri | 00041D6C 490 | 00041D74 20999A00 | 00020000
+   RET`). La RSX vera aspetta sul park; il walker invece risincronizzava
+   sull'anello ("jump-park"), saltava il buffer e la SET_REFERENCE dietro la
+   CALL: "Rendering is stuck on reference value 645". Ora `GCM_PARK_WAIT=1`
+   (in `run.sh`): resta parcheggiato e il ticker del present ripassa ogni
+   pochi ms anche con `GCM_DRAIN_ONLY_PUT`. E dentro una CALL gli zeri sono
+   NOP da attraversare (la regola dei 4 zeri era per l'anello).
+8. **`SET_TRANSFORM_PROGRAM_START`.** La RSX ha 512 slot di VP e il titolo
+   ne tiene caricati piu' d'uno: hash e decompilazione partono dallo slot di
+   inizio. Prima i quad del testo (VP 91A6DB47, 9 istruzioni, attr 0/2/3/4)
+   usavano il VP a slot 0 e sparivano.
+
+Con tutto questo (`run_s27_c30.log`, `RSX_DRAWLIST=900`): 33 draw per
+fotogramma nel menu -- 14 passaggi di post-processing a catena (1280x720 ->
+320x180 -> 160x90 -> 40x23 -> 10x6 -> 3x2 -> 1x1: l'esposizione), il
+composito sul display, 13 draw dell'interfaccia con blend (VP 91A6DB47, FP
+0x0F900401, texture 256x128 e 512x512). Il fotogramma (`RSX_DUMP_FRAME=25
+RSX_DUMP_SKIP=60`) mostra il menu: righe di testo con i glifi sbagliati, il
+tasto X in un cerchio blu, una voce in giallo. Sfondo nero: i buchi da 8
+parole nei buffer SPU (dove il job di geometria patcha i draw) restano zeri.
+
+### Il prossimo passo
+
+1. I glifi: il testo usa attr 0/2/3/4 dai vertici immediati; da capire se
+   sono le coordinate di texture (attributo sbagliato) o la texture stessa
+   (formato dell'atlante 256x128). `RSX_VP_DBG` con `RSX_VP_DBG_FP=0F900401`
+   sulla via inline (oggi stampa solo record_draw).
+2. Lo sfondo 3D: i buchi restano NOP. Chi dovrebbe patcharli (job di
+   geometria ovl 215?) e perche' non lo fa: `SPU_DMA_EAWIN` sui buffer
+   (EA 0x20500000+), `SPU_JOBTRACE_OVL=215`.
+3. Il menu reagisce ai tasti? Con l'immagine si puo' vedere.
+4. Assert non deterministico `joblist.cpp(578)` sul thread audio (tid 14).
+
 ### Strumenti nuovi
 
+- `RSX_VP_DUMP=1` (MSL del VP tradotto), `RSX_VP_DBG=<n>` [+
+  `RSX_VP_DBG_FP=<hex>`, armato da `PS3_TTY_BT`]: attributi dei primi due
+  vertici, costanti c0-3/c256-259/c467, viewport, formato degli attributi,
+  indici risolti e byte grezzi. `RSX_DRAWLIST=<frame|0>`: l'elenco dei draw
+  di un fotogramma (superficie, VP, FP, vertici, blend, ritaglio, texture).
+  `RSX_DEBUG_TINT=1|2` ora vale anche con il VP del guest (2 = solo i draw
+  con blend). `GCM_PARK_WAIT`, `SPU_JOBTRACE_OVL=<id>`, `ovl=` anche in
+  `[spu-assert]` e `[dma-eawin]`.
 - `PS3_TTY_DUMP=<spec>[,<spec>]` con `PS3_TTY_BT`: dump di memoria guest a
   ogni hit. spec = `addr[>off|+off]*:len`; `>off` fa a = read32(a+off),
   `+off` somma. Es. `0x7CB238>0>-7D48>1DBC+190:0x40` = matrice della camera

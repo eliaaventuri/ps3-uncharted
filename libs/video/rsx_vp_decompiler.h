@@ -66,6 +66,14 @@ int rsx_vp_decompile_compact_ex(
     const u8* ucode, u32 max_bytes, u32 vtex_mask, u32 input_mask,
     char* out, u32 out_size);
 
+/* Metal Shading Language variant (Metal backend): compact [[attribute(N)]]
+ * inputs for the attributes the program reads (*out_mask), constants + RSX
+ * viewport transform in `constant VPConst& [[buffer(0)]]`, and a PSInput
+ * return type that the MSL fragment decompiler must have declared earlier in
+ * the same source. No vertex textures. Returns the instruction count. */
+int rsx_vp_decompile_msl(const u8* ucode, u32 max_bytes, u32* out_mask,
+                         char* out, u32 out_size);
+
 /* Mnemonics for the vector / scalar opcode fields ("?" if unknown). */
 const char* rsx_vp_vec_name(u32 op);
 const char* rsx_vp_sca_name(u32 op);

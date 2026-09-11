@@ -47,3 +47,7 @@ void ps3_ww_report_inline(unsigned int addr, unsigned long long val, int width)
 {
     (void)addr; (void)val; (void)width;
 }
+
+/* PS3_TTY_BT arma i trace nel port (ppu_hle.cpp); il binario di test non ha
+ * il PPU, e il backend Metal (RSX_VP_DBG) lo legge: qui e' sempre armato. */
+int g_hle_trace_armed = 1;

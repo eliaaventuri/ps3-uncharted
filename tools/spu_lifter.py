@@ -406,12 +406,25 @@ def compute_link_returns(insns, bounds) -> set:
             # move), the target was computed here -> a real indirect branch, not
             # a return. Scan stops at unconditional flow breaks (block boundary
             # -- see the twin guard in compute_bi_r0_jumps).
+            # The scan is LINEAR (ordered), not bounded to `fn`: a brsl target
+            # opens a new function in our partition even when the code just
+            # falls into it, and the get-PC idiom Sony's compiler uses for
+            # bid/bie to the next instruction is exactly that --
+            #     brsl $r2, .+4 ; ai $r2, $r2, 8 ; bid $r2   (-> .+12)
+            # Bounded to `fn`, the `ai $r2` was invisible (it sits in the
+            # function opened by the brsl target), `bid $r2` read as a
+            # link-return, and Uncharted's culling job returned out of its
+            # DMA helper before issuing the DMA (interrupts left disabled,
+            # CHANCE assert "SPU_RdMachStat & 1", PPU spinning forever on the
+            # job). Stopping at flow breaks still keeps the previous function's
+            # tail out when it really is a different function.
             written = False
             block_start = s
-            for j in range(idx - 1, -1, -1):
-                w = fn[j]
+            gi = idx_of_all[insn.addr]
+            for j in range(gi - 1, max(-1, gi - 1 - 64), -1):
+                w = ordered[j]
                 if w.mnemonic in ("bi", "br", "bra", "iret", "stop", "stopd"):
-                    block_start = fn[j + 1].addr if j + 1 <= idx else s
+                    block_start = ordered[j + 1].addr if j + 1 <= gi else s
                     break
                 if (w.mnemonic not in _NO_RT_WRITE and _dest_reg(w) == rn
                         and not _is_identity_move(w)):

@@ -217,8 +217,8 @@ static inline int mfc_do_transfer(spu_context* spu, uint32_t lsa, uint64_t ea,
       if (s_hi && (uint32_t)ea < (uint32_t)s_hi && (uint32_t)ea + size > (uint32_t)s_lo) {
           static int _n = 0;
           if (_n++ < 100000)
-              fprintf(stderr, "[dma-eawin] img=%d pc=0x%05X %s lsa=0x%05X ea=0x%08X size=0x%X\n",
-                      spu->image_id, (uint32_t)spu->pc & SPU_LS_MASK,
+              fprintf(stderr, "[dma-eawin] img=%d ovl=%d pc=0x%05X %s lsa=0x%05X ea=0x%08X size=0x%X\n",
+                      spu->image_id, spu->resident_ovl, (uint32_t)spu->pc & SPU_LS_MASK,
                       mfc_is_get(cmd) ? "GET" : mfc_is_put(cmd) ? "PUT" : "cmd",
                       lsa, (uint32_t)ea, size);
           /* A 0x6120 (il "manda 16 byte") si arriva con un salto indiretto: il

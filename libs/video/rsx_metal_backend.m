@@ -27,6 +27,7 @@
 #include "rsx_vertex_fetch.h"
 #include "rsx_primitives.h"
 #include "rsx_fp_decompiler.h"   /* guest fragment program -> MSL */
+#include "rsx_vp_decompiler.h"   /* guest vertex program -> MSL (sessione 27) */
 #include "rsx_texture_layout.h"  /* swizzle/format decode, shared with D3D12 */
 #include "cellGcmSys.h"          /* cellGcmResolveLocated */
 #include <stdio.h>
@@ -74,13 +75,58 @@ typedef struct {
     int tex0;        /* texture unit 0 enabled: pick the sampling built-in */
     u32 surf;        /* surface_color_offset[0] al momento del draw          */
     u32 sx, sy, sw, sh;  /* rettangolo di ritaglio (scissor) al momento del draw */
+    /* Vertex program del guest (sessione 27): indice in s_vps o -1 (percorso
+     * incorporato: costanti 0..3 come MVP). vbase/vstride = dove stanno gli
+     * attributi letti dal programma in s_vpd; cblock = blocco di costanti. */
+    int vp;
+    u32 vbase, vstride, cblock;
+    /* Le texture legate al momento del draw (sessione 27): prima venivano
+     * legate al present, cioe' TUTTI i draw del fotogramma usavano le ultime.
+     * Puntatori non ritenuti: la cache (s_texcache) le tiene vive fino a fine
+     * fotogramma. */
+    __unsafe_unretained id<MTLTexture> tex[RSX_MAX_TEXTURES];
 } MtlDraw;
+
+/* One MTLTexture per unit, rebuilt when the guest rebinds a different image. */
+typedef struct {
+    id<MTLTexture> tex;
+    u32 offset, format, image_rect;   /* what is currently resident */
+} MtlTexUnit;
+static MtlTexUnit s_tex[RSX_MAX_TEXTURES];
 
 static MtlVertex* s_verts;
 static u32        s_vert_count;
 static MtlDraw    s_draws[MTL_MAX_DRAWS];
 static u32        s_draw_count;
 static u32        s_dropped_draws;
+
+/* ---- vertex program del guest (sessione 27) --------------------------------
+ * Il titolo trasforma i vertici con i propri programmi NV40 (matrici nelle
+ * costanti che vuole lui, attributi compressi, ecc.): con la sola MVP dalle
+ * costanti 0..3 ogni vertice usciva dal clip (w negativo). Ora il programma
+ * viene tradotto in MSL (rsx_vp_decompile_msl), gli attributi che legge
+ * vengono letti sul CPU (rsx_fetch_attrib, come fa il backend D3D12) in un
+ * flusso a passo variabile, e le 512 costanti + la trasformazione di
+ * viewport vanno in un blocco per draw (deduplicato quando non cambiano).
+ * RSX_VP=0 torna al percorso incorporato. */
+#define MTL_VP_FLOATS   (16u * 1024u * 1024u)   /* 64 MB di attributi per fotogramma */
+#define MTL_CB_BYTES    8448u                    /* 512 float4 + scale/offset, a 256 */
+#define MTL_CB_MAX      4096u                    /* blocchi per fotogramma (34 MB) */
+typedef struct { u32 hash; u32 bytes; u32 mask; char* msl; int ok; } MtlVp;
+static MtlVp   s_vps[256];
+static u32     s_vp_count;
+static float*  s_vpd;          /* attributi dei draw con VP, in float */
+static u32     s_vpd_used;
+static u8*     s_cbs;          /* blocchi di costanti del fotogramma */
+static u32     s_cb_count;
+static u32     s_cur_mask;     /* attributi da leggere per il draw in corso */
+static int     s_vp_full;      /* s_vpd esaurito durante il draw in corso */
+static int use_vp(void)
+{
+    static int v = -1;
+    if (v < 0) { const char* e = getenv("RSX_VP"); v = (e && *e == '0') ? 0 : 1; }
+    return v;
+}
 
 static id<MTLLibrary> s_shader_lib;
 
@@ -101,8 +147,8 @@ static dispatch_semaphore_t s_inflight;
 
 /* PSO cache. Keyed on the blend state, which is all the built-in shader path
  * varies; a guest-shader key (vp/fp ucode hash) joins it when that lands. */
-typedef struct { u32 key; id<MTLRenderPipelineState> pso; } MtlPsoEntry;
-static MtlPsoEntry s_pso_cache[64];
+typedef struct { u32 key; int vp; id<MTLRenderPipelineState> pso; } MtlPsoEntry;
+static MtlPsoEntry s_pso_cache[512];
 static u32         s_pso_count;
 
 /* RSX clear colour, ARGB8888, as written by NV4097_SET_COLOR_CLEAR_VALUE. */
@@ -255,6 +301,17 @@ static void fetch_vertex(const rsx_state* st, u32 vi, MtlVertex* out)
     rsx_fetch_attrib(st, 8, vi, out->tc);
 }
 
+/* Gli attributi che il vertex program legge, nell'ordine dei bit della
+ * maschera, in coda a s_vpd (float4 ciascuno). */
+static void fetch_vp_vertex(const rsx_state* st, u32 vi)
+{
+    if (!s_cur_mask) return;
+    u32 n = (u32)__builtin_popcount(s_cur_mask);
+    if (s_vpd_used + n * 4 > MTL_VP_FLOATS) { s_vp_full = 1; return; }
+    for (int a = 0; a < 16; a++)
+        if (s_cur_mask & (1u << a)) { rsx_fetch_attrib(st, a, vi, &s_vpd[s_vpd_used]); s_vpd_used += 4; }
+}
+
 /* ---- primitive conversion -------------------------------------------------
  * Metal, like D3D12, has no quads, quad strips, triangle fans or polygons, so
  * those are expanded to triangle lists on the CPU while the vertices are being
@@ -287,7 +344,9 @@ static u32 emit_vertices(const rsx_state* st, u32 prim, u32 count,
     u32 wrote = 0;
     #define PUSH(seq) do {                                                     \
         if (s_vert_count >= MTL_MAX_VERTS) return wrote;                       \
-        fetch_vertex(st, resolve(st, (seq), ctx), &s_verts[s_vert_count++]);   \
+        u32 _vi = resolve(st, (seq), ctx);                                     \
+        fetch_vertex(st, _vi, &s_verts[s_vert_count++]);                       \
+        fetch_vp_vertex(st, _vi);                                              \
         wrote++;                                                               \
     } while (0)
 
@@ -318,10 +377,17 @@ static u32 resolve_linear(const rsx_state* st, u32 seq, void* ctx)
 static u32 resolve_indexed(const rsx_state* st, u32 seq, void* ctx)
 {
     u32 base = *(u32*)ctx;
-    /* index_array_offset bits [7:4] select the type: 0 = u32, 1 = u16. */
-    int u16type = ((st->index_array_offset >> 4) & 0xFu) == 1;
-    u32 off = st->index_array_offset & ~0xFFu;
-    u32 ea  = cellGcmResolveOffset(off) + (base + seq) * (u16type ? 2u : 4u);
+    /* SET_INDEX_ARRAY_DMA (index_array_dma): bits [7:4] = tipo (0 = u32,
+     * 1 = u16), bits [3:0] = locazione (0 = locale/VRAM, 1 = main). Prima
+     * il tipo veniva letto dall'OFFSET (che e' un offset di byte e basta) e
+     * la base risolta con la tabella IO anche per la VRAM: per Uncharted
+     * (indici in VRAM a 0x5EC3500) ogni indice risolveva a 0 e ogni quad
+     * collassava in un punto. Stessa regola del backend D3D12
+     * (read_guest_index). */
+    int u16type = ((st->index_array_dma >> 4) & 0xFu) == 1;
+    int local   = (st->index_array_dma & 0xFu) == 0;
+    u32 ea  = cellGcmResolveLocated(local, st->index_array_offset)
+            + (base + seq) * (u16type ? 2u : 4u);
     if (!vm_base) return 0;
     const u8* p = vm_base + ea;
     return u16type ? (u32)((p[0] << 8) | p[1])
@@ -330,19 +396,145 @@ static u32 resolve_indexed(const rsx_state* st, u32 seq, void* ctx)
 
 /* ---- draw recording ------------------------------------------------------ */
 
+/* Il programma corrente nella cache (tradotto alla prima vista); -1 se non
+ * c'e' un programma, non si traduce, o non legge attributi. */
+static int vp_lookup(const rsx_state* st)
+{
+    if (!use_vp() || !st || st->vp_ucode_bytes < 16) return -1;
+    /* Il programma parte da SET_TRANSFORM_PROGRAM_START: la RSX ha 512 slot
+     * e Uncharted ne tiene caricati diversi insieme (i quad 2D partono da
+     * uno slot diverso da 0). Hash e decompilazione dal punto di partenza,
+     * fino alla fine dei byte scritti (il decompilatore si ferma al bit END). */
+    u32 start = st->transform_program_start * 16u;
+    if (start + 16 > st->vp_ucode_bytes) return -1;
+    const u8* ucode = st->vp_ucode + start;
+    u32 bytes = st->vp_ucode_bytes - start; if (bytes > sizeof st->vp_ucode - start) bytes = sizeof st->vp_ucode - start;
+    u32 h = 2166136261u;
+    for (u32 i = 0; i < bytes; i++) h = (h ^ ucode[i]) * 16777619u;
+    h ^= bytes;
+    for (u32 i = 0; i < s_vp_count; i++)
+        if (s_vps[i].hash == h && s_vps[i].bytes == bytes) return s_vps[i].ok ? (int)i : -1;
+    if (s_vp_count >= (u32)(sizeof s_vps / sizeof s_vps[0])) return -1;
+    MtlVp* v = &s_vps[s_vp_count++];
+    v->hash = h; v->bytes = bytes; v->ok = 0; v->msl = NULL; v->mask = 0;
+    static char msl[192 * 1024];
+    u32 mask = 0;
+    int n = rsx_vp_decompile_msl(ucode, bytes, &mask, msl, sizeof msl);
+    if (n <= 0 || !(mask & 0xFFFFu)) {
+        fprintf(stderr, "[RSX metal] guest vp %08X: %s (%d instr, mask %04X)\n",
+                h, n <= 0 ? "decompile failed" : "no inputs", n, mask);
+        return -1;
+    }
+    v->msl = strdup(msl); v->mask = mask & 0xFFFFu; v->ok = v->msl != NULL;
+    fprintf(stderr, "[RSX metal] guest vp %08X: %d instructions, inputs %04X\n", h, n, v->mask);
+    /* RSX_VP_DUMP=1: l'MSL tradotto. */
+    { static int vd = -1; if (vd < 0) vd = getenv("RSX_VP_DUMP") ? 1 : 0;
+      if (vd) fprintf(stderr, "---- MSL vp %08X ----\n%s\n----\n", h, msl); }
+    return v->ok ? (int)(s_vp_count - 1) : -1;
+}
+
+/* Il blocco di costanti per il draw: le 512 float4 del guest + la
+ * trasformazione di viewport (x/y identita', z rimappata come fa il backend
+ * D3D12). Riusa l'ultimo blocco se identico. */
+static u32 cb_block(const rsx_state* st)
+{
+    u8 blk[MTL_CB_BYTES];
+    memset(blk, 0, sizeof blk);
+    memcpy(blk, st->vertex_constants, sizeof st->vertex_constants);
+    float* vpx = (float*)(blk + RSX_MAX_VERTEX_CONSTANTS * 16);
+    vpx[0] = vpx[1] = vpx[3] = 1.0f; vpx[4] = vpx[5] = vpx[7] = 0.0f;
+    if (st->viewport_scale[2] != 0.0f) { vpx[2] = st->viewport_scale[2]; vpx[6] = st->viewport_offset[2]; }
+    else                                { vpx[2] = 1.0f; vpx[6] = 0.0f; }
+    if (s_cb_count && memcmp(s_cbs + (s_cb_count - 1) * MTL_CB_BYTES, blk, sizeof blk) == 0)
+        return s_cb_count - 1;
+    if (s_cb_count >= MTL_CB_MAX) return s_cb_count - 1;   /* pieno: riusa (sbagliato ma non esplode) */
+    memcpy(s_cbs + s_cb_count * MTL_CB_BYTES, blk, sizeof blk);
+    return s_cb_count++;
+}
+
+/* Prepara il draw per il VP del guest: maschera, base allineata a 256 in
+ * s_vpd. Da chiamare PRIMA di leggere i vertici. */
+static void vp_begin_draw(const rsx_state* st, MtlDraw* d)
+{
+    d->vp = vp_lookup(st);
+    s_cur_mask = (d->vp >= 0) ? s_vps[d->vp].mask : 0;
+    s_vp_full = 0;
+    s_vpd_used = (s_vpd_used + 63u) & ~63u;
+    d->vbase = s_vpd_used * 4;
+    d->vstride = 16u * (u32)__builtin_popcount(s_cur_mask);
+    d->cblock = (d->vp >= 0) ? cb_block(st) : 0;
+}
+static void vp_end_draw(MtlDraw* d)
+{
+    if (d->vp >= 0 && s_vp_full) d->vp = -1;   /* flusso pieno: percorso incorporato */
+    s_cur_mask = 0;
+}
+
 static void record_draw(const rsx_state* st, u32 prim, u32 base, u32 count,
                         IndexResolver resolve)
 {
     if (!s_ready || !s_verts || !st || count == 0) return;
     if (s_draw_count >= MTL_MAX_DRAWS) { s_dropped_draws++; return; }
 
+    MtlDraw tmp; memset(&tmp, 0, sizeof tmp);
+    vp_begin_draw(st, &tmp);
     u32 first_vert = s_vert_count;
     u32 wrote = emit_vertices(st, prim, count, resolve, &base);
+    vp_end_draw(&tmp);
     if (wrote == 0) { s_dropped_draws++; return; }
 
     MtlDraw* d = &s_draws[s_draw_count++];
+    *d = tmp;
     d->base  = first_vert;
     d->count = wrote;
+    /* RSX_VP_DBG=<n>: i primi n draw con VP del guest: programma, attributi
+     * dei primi due vertici e le costanti che il programma legge (c0..3,
+     * c256..259, c467). Per capire se la trasformazione ha i numeri giusti. */
+    { static int s_vd = -2; static int s_vn = 0; static int s_gate = -1;
+      /* PS3_TTY_BT: parte dall'hit, come gli altri trace. Debole: il binario
+       * di test dell'host non ha ppu_hle.cpp. */
+      extern int g_hle_trace_armed;
+      if (s_vd == -2) { const char* e = getenv("RSX_VP_DBG"); s_vd = e ? atoi(e) : 0; }
+      if (s_gate < 0) s_gate = getenv("PS3_TTY_BT") ? 1 : 0;
+      int armed = g_hle_trace_armed;
+      /* RSX_VP_DBG_FP=<hex>: solo i draw con quel fragment program. */
+      static long s_fpf = -2; if (s_fpf == -2) { const char* e = getenv("RSX_VP_DBG_FP"); s_fpf = e ? (long)strtoul(e, 0, 16) : -1; }
+      if (d->vp >= 0 && s_vn < s_vd && (!s_gate || armed) && (s_fpf < 0 || (long)d->fp_addr == s_fpf)) { s_vn++;
+          fprintf(stderr, "[vpdbg] draw#%u vp=%08X mask=%04X prim=%u count=%u surf=%08X fp=%08X\n",
+                  s_draw_count - 1, s_vps[d->vp].hash, s_vps[d->vp].mask, prim, wrote, d->surf, d->fp_addr);
+          const float* base_f = s_vpd + d->vbase / 4; u32 na = d->vstride / 16;
+          for (u32 v = 0; v < 2 && v < wrote; v++) {
+              fprintf(stderr, "[vpdbg]   v%u:", v);
+              u32 rank = 0;
+              for (int a = 0; a < 16; a++) { if (!(s_vps[d->vp].mask & (1u << a))) continue;
+                  const float* f = base_f + v * na * 4 + rank * 4; rank++;
+                  fprintf(stderr, " a%d=(%.3f %.3f %.3f %.3f)", a, f[0], f[1], f[2], f[3]); }
+              fprintf(stderr, "\n"); }
+          const float* cb = (const float*)(s_cbs + d->cblock * MTL_CB_BYTES);
+          static const int slots[] = { 0, 1, 2, 3, 256, 257, 258, 259, 467 };
+          for (unsigned k = 0; k < sizeof slots / sizeof slots[0]; k++) { const float* c = cb + slots[k] * 4;
+              fprintf(stderr, "[vpdbg]   c%d=(%.4f %.4f %.4f %.4f)%s", slots[k], c[0], c[1], c[2], c[3], (k % 3 == 2) ? "\n" : ""); }
+          fprintf(stderr, "[vpdbg]   posscale=(%.3f %.3f %.3f) posoffset=(%.3f %.3f %.3f) vp_scale=(%.1f %.1f %.3f) vp_off=(%.1f %.1f %.3f)\n",
+                  cb[512*4], cb[512*4+1], cb[512*4+2], cb[513*4], cb[513*4+1], cb[513*4+2],
+                  st->viewport_scale[0], st->viewport_scale[1], st->viewport_scale[2],
+                  st->viewport_offset[0], st->viewport_offset[1], st->viewport_offset[2]);
+          for (int a = 0; a < 16; a++) if (s_vps[d->vp].mask & (1u << a))
+              fprintf(stderr, "[vpdbg]   attr%d: fmt=%08X off=%08X\n", a, st->vertex_attribs[a].format, st->vertex_attribs[a].offset);
+          fprintf(stderr, "[vpdbg]   %s base=%u idx:", resolve == resolve_indexed ? "INDEXED" : "linear", base);
+          for (u32 q = 0; q < 6 && q < count; q++) fprintf(stderr, " %u", resolve(st, q, &base));
+          fprintf(stderr, "  index_array_offset=%08X dma=%u\n", st->index_array_offset, st->index_array_dma);
+          { u32 vi0 = resolve(st, 0, &base); u32 vi1 = resolve(st, 1, &base);
+            for (int a = 0; a < 16; a++) if (s_vps[d->vp].mask & (1u << a)) {
+                const rsx_vertex_attrib* at = &st->vertex_attribs[a];
+                u32 off0 = (at->offset & 0x7FFFFFFFu) + vi0 * at->stride, off1 = (at->offset & 0x7FFFFFFFu) + vi1 * at->stride;
+                u32 ea0 = (at->offset & 0x80000000u) ? cellGcmResolveLocated(0, off0) : cellGcmResolveLocated(1, off0);
+                u32 ea1 = (at->offset & 0x80000000u) ? cellGcmResolveLocated(0, off1) : cellGcmResolveLocated(1, off1);
+                fprintf(stderr, "[vpdbg]   attr%d raw v%u@%08X:", a, vi0, ea0);
+                for (u32 k = 0; k < 24 && k < at->stride; k++) fprintf(stderr, "%s%02X", (k % 4) ? "" : " ", vm_base[ea0 + k]);
+                fprintf(stderr, "  v%u@%08X:", vi1, ea1);
+                for (u32 k = 0; k < 24 && k < at->stride; k++) fprintf(stderr, "%s%02X", (k % 4) ? "" : " ", vm_base[ea1 + k]);
+                fprintf(stderr, "\n"); } }
+      } }
     /* Expanded primitives always come out as a triangle list. */
     d->topology = rsx_primitive_needs_expansion(prim) ? MTLPrimitiveTypeTriangle
                                              : topo_to_metal(rsx_primitive_topology(prim));
@@ -352,6 +544,8 @@ static void record_draw(const rsx_state* st, u32 prim, u32 base, u32 count,
     d->blend_equation = st->blend_equation;
     d->fp_addr        = st->shader_program;
     d->tex0           = (st->textures[0].control0 & 0x80000000u) != 0;
+    for (u32 t = 0; t < RSX_MAX_TEXTURES; t++)
+        d->tex[t] = (st->textures[t].control0 & 0x80000000u) ? s_tex[t].tex : nil;
     d->surf           = st->surface_color_offset[0];
     d->sx = st->scissor_x; d->sy = st->scissor_y;
     d->sw = st->scissor_w; d->sh = st->scissor_h;
@@ -416,6 +610,8 @@ static void mtl_draw_inline(void* ud, u32 primitive, const float* verts, u32 cou
         if (s_tc  >= (int)RSX_MAX_VERTEX_ATTRIBS) s_tc  = 1;
     }
 
+    MtlDraw tmp; memset(&tmp, 0, sizeof tmp);
+    vp_begin_draw(s_state, &tmp);
     #define IPUSH(seq) do {                                                    \
         if (s_vert_count >= MTL_MAX_VERTS) goto done;                          \
         const float* a = &verts[(seq) * STRIDE];                               \
@@ -423,6 +619,12 @@ static void mtl_draw_inline(void* ud, u32 primitive, const float* verts, u32 cou
         memcpy(o->pos, &a[0],           sizeof o->pos);                        \
         memcpy(o->col, &a[s_col * 4],   sizeof o->col);                        \
         memcpy(o->tc,  &a[s_tc  * 4],   sizeof o->tc);                         \
+        if (s_cur_mask) {                                                      \
+            u32 _n = (u32)__builtin_popcount(s_cur_mask);                      \
+            if (s_vpd_used + _n * 4 > MTL_VP_FLOATS) s_vp_full = 1;            \
+            else for (int _a = 0; _a < 16; _a++) if (s_cur_mask & (1u << _a)) { \
+                memcpy(&s_vpd[s_vpd_used], &a[_a * 4], 16); s_vpd_used += 4; } \
+        }                                                                      \
         wrote++;                                                               \
     } while (0)
 
@@ -443,9 +645,11 @@ static void mtl_draw_inline(void* ud, u32 primitive, const float* verts, u32 cou
     }
 done:
     #undef IPUSH
+    vp_end_draw(&tmp);
     if (wrote == 0) { s_dropped_draws++; return; }
 
     MtlDraw* d = &s_draws[s_draw_count++];
+    *d = tmp;
     d->base  = first_vert;
     d->count = wrote;
     d->topology = rsx_primitive_needs_expansion(primitive) ? MTLPrimitiveTypeTriangle
@@ -456,6 +660,8 @@ done:
     d->blend_equation = s_state ? s_state->blend_equation : 0;
     d->fp_addr        = s_state ? s_state->shader_program : 0;
     d->tex0           = s_state && (s_state->textures[0].control0 & 0x80000000u) != 0;
+    for (u32 t = 0; t < RSX_MAX_TEXTURES; t++)
+        d->tex[t] = (s_state && (s_state->textures[t].control0 & 0x80000000u)) ? s_tex[t].tex : nil;
     d->surf           = s_state ? s_state->surface_color_offset[0] : 0;
     d->sx = s_state ? s_state->scissor_x : 0; d->sy = s_state ? s_state->scissor_y : 0;
     d->sw = s_state ? s_state->scissor_w : 4096; d->sh = s_state ? s_state->scissor_h : 4096;
@@ -624,11 +830,46 @@ static NSString* const kGuestVertexMSL = @
 /* One MTLTexture per unit, rebuilt when the guest rebinds a different image.
  * The swizzle/format decode is rsx_texture_layout's, shared with D3D12, so
  * this only owns the upload. */
-typedef struct {
-    id<MTLTexture> tex;
-    u32 offset, format, image_rect;   /* what is currently resident */
-} MtlTexUnit;
-static MtlTexUnit s_tex[RSX_MAX_TEXTURES];
+/* MtlTexUnit / s_tex: dichiarate prima di record_draw (vedi sopra). */
+/* Cache delle texture decodificate, per (offset, formato, dimensioni): il
+ * titolo alterna decine di texture fra un draw e l'altro, e ridecodificarle
+ * a ogni cambio di unita' costava una decodifica per draw. Evizione a fine
+ * fotogramma delle voci non usate da un po'. */
+typedef struct { u32 offset, format, image_rect; id<MTLTexture> tex; unsigned long last_use; } MtlTexEntry;
+#define MTL_TEXCACHE 2048
+static MtlTexEntry s_texcache[MTL_TEXCACHE];
+static u32 s_texcache_n;
+
+static id<MTLTexture> texcache_find(u32 offset, u32 format, u32 image_rect)
+{
+    for (u32 i = 0; i < s_texcache_n; i++) {
+        MtlTexEntry* e = &s_texcache[i];
+        if (e->tex && e->offset == offset && e->format == format && e->image_rect == image_rect) {
+            e->last_use = s_frame_no; return e->tex; }
+    }
+    return nil;
+}
+static void texcache_add(u32 offset, u32 format, u32 image_rect, id<MTLTexture> t)
+{
+    MtlTexEntry* e = NULL;
+    for (u32 i = 0; i < s_texcache_n; i++) if (!s_texcache[i].tex) { e = &s_texcache[i]; break; }
+    if (!e && s_texcache_n < MTL_TEXCACHE) e = &s_texcache[s_texcache_n++];
+    if (!e) {
+        /* piena: la voce piu' vecchia NON usata in questo fotogramma (i draw
+         * registrati la puntano senza ritenerla) */
+        unsigned long best = (unsigned long)-1;
+        for (u32 i = 0; i < s_texcache_n; i++)
+            if (s_texcache[i].last_use < s_frame_no && s_texcache[i].last_use < best) { best = s_texcache[i].last_use; e = &s_texcache[i]; }
+        if (!e) return;
+    }
+    e->offset = offset; e->format = format; e->image_rect = image_rect; e->tex = t; e->last_use = s_frame_no;
+}
+/* A fine fotogramma (dopo la codifica): via le voci ferme da 600 fotogrammi. */
+static void texcache_sweep(void)
+{
+    for (u32 i = 0; i < s_texcache_n; i++)
+        if (s_texcache[i].tex && s_frame_no > s_texcache[i].last_use + 600) s_texcache[i].tex = nil;
+}
 static id<MTLSamplerState> s_sampler;
 /* Il fragment program tradotto del guest dichiara le texture come ARRAY
  * (`array<texture2d<float>, 16> rsx_tex [[texture(0)]]`), e Metal vuole TUTTI
@@ -654,6 +895,9 @@ static void mtl_bind_texture(void* ud, u32 unit, const rsx_texture_state* tex)
     if (u->tex && u->offset == tex->offset && u->format == tex->format &&
         u->image_rect == tex->image_rect)
         return;                            /* already resident */
+    { id<MTLTexture> ct = texcache_find(tex->offset, tex->format, tex->image_rect);
+      if (ct) { u->tex = ct; u->offset = tex->offset; u->format = tex->format;
+                u->image_rect = tex->image_rect; return; } }
 
     /* Se questo offset e' una superficie su cui abbiamo disegnato fuori
      * schermo, il contenuto vero sta nella NOSTRA texture: in memoria guest non
@@ -719,8 +963,10 @@ static void mtl_bind_texture(void* ud, u32 unit, const rsx_texture_state* tex)
         u->tex = mt;
         u->offset = tex->offset; u->format = tex->format;
         u->image_rect = tex->image_rect;
-        fprintf(stderr, "[RSX metal] texture unit %u: %ux%u fmt=0x%02X\n",
-                unit, width, height, fmt);
+        texcache_add(tex->offset, tex->format, tex->image_rect, mt);
+        { static int _tn = 0; if (_tn++ < 64)
+          fprintf(stderr, "[RSX metal] texture unit %u: %ux%u fmt=0x%02X\n",
+                  unit, width, height, fmt); }
         /* RSX_TEX_DBG=1: quanti texel non neri sono davvero atterrati. Una
          * texture decodificata male e una texture vuota dal backend si vedono
          * uguali (nero), e da li' non si riparte. */
@@ -764,14 +1010,14 @@ static void mtl_bind_texture(void* ud, u32 unit, const rsx_texture_state* tex)
 /* One compiled library per guest program. A program that fails to decompile or
  * to compile is remembered as a miss (lib == nil) so it is not retried every
  * draw; that draw falls back to the built-in shader rather than dropping. */
-typedef struct { u32 fp_addr; id<MTLLibrary> lib; } GuestFpEntry;
-static GuestFpEntry s_fp_cache[64];
+typedef struct { u32 fp_addr; int vp; id<MTLLibrary> lib; } GuestFpEntry;
+static GuestFpEntry s_fp_cache[512];
 static u32          s_fp_count;
 
-static id<MTLLibrary> guest_fp_library(u32 fp_addr)
+static id<MTLLibrary> guest_fp_library(u32 fp_addr, int vp)
 {
     for (u32 i = 0; i < s_fp_count; i++)
-        if (s_fp_cache[i].fp_addr == fp_addr) return s_fp_cache[i].lib;
+        if (s_fp_cache[i].fp_addr == fp_addr && s_fp_cache[i].vp == vp) return s_fp_cache[i].lib;
     if (s_fp_count >= (u32)(sizeof(s_fp_cache) / sizeof(s_fp_cache[0]))) return nil;
 
     id<MTLLibrary> lib = nil;
@@ -782,11 +1028,22 @@ static id<MTLLibrary> guest_fp_library(u32 fp_addr)
                                             0u, 0, RSX_FP_LANG_MSL,
                                             msl, sizeof(msl), NULL);
         if (n > 0) {
-            NSString* src = [NSString stringWithFormat:@"%s%@",
-                             msl, kGuestVertexMSL];
+            /* Con un VP del guest il vertex shader e' il suo (stessa
+             * PSInput); altrimenti quello incorporato con la MVP. */
+            /* fs_tint_guest: tinta fissa con il VP del guest (RSX_DEBUG_TINT),
+             * per vedere DOVE cade la geometria trasformata dal titolo. */
+            static NSString* const kTintGuest =
+                @"fragment float4 fs_tint_guest(PSInput in [[stage_in]]) { return float4(1.0, 0.2, 0.6, 1.0); }\n";
+            NSString* src = (vp >= 0)
+                ? [NSString stringWithFormat:@"%s%s%@", msl, s_vps[vp].msl, kTintGuest]
+                : [NSString stringWithFormat:@"%s%@%@", msl, kGuestVertexMSL, kTintGuest];
             NSError* err = nil;
             lib = [s_dev newLibraryWithSource:src options:nil error:&err];
-            if (!lib)
+            if (!lib && vp >= 0) {
+                fprintf(stderr, "[RSX metal] guest vp %08X + fp 0x%08X compile failed: %s\n",
+                        s_vps[vp].hash, fp_addr, [[err localizedDescription] UTF8String]);
+                s_vps[vp].ok = 0;   /* i draw futuri con questo VP: percorso incorporato */
+            } else if (!lib)
                 fprintf(stderr, "[RSX metal] guest fp 0x%08X compile failed: %s\n",
                         fp_addr, [[err localizedDescription] UTF8String]);
             else {
@@ -805,6 +1062,7 @@ static id<MTLLibrary> guest_fp_library(u32 fp_addr)
     }
 
     s_fp_cache[s_fp_count].fp_addr = fp_addr;
+    s_fp_cache[s_fp_count].vp      = vp;
     s_fp_cache[s_fp_count].lib     = lib;
     s_fp_count++;
     return lib;
@@ -823,20 +1081,34 @@ static u32 pso_key(const MtlDraw* d)
               | (fp & 0x80000000u) | tx;
 }
 
-static id<MTLRenderPipelineState> pso_for(const MtlDraw* d)
+static id<MTLRenderPipelineState> pso_for(MtlDraw* d)
 {
+    /* Un VP che non compila (ok=0) manda il draw sul percorso incorporato. */
+    int vp = (d->vp >= 0 && s_vps[d->vp].ok) ? d->vp : -1;
     u32 key = pso_key(d);
     for (u32 i = 0; i < s_pso_count; i++)
-        if (s_pso_cache[i].key == key) return s_pso_cache[i].pso;
+        if (s_pso_cache[i].key == key && s_pso_cache[i].vp == vp) return s_pso_cache[i].pso;
     if (s_pso_count >= (u32)(sizeof(s_pso_cache) / sizeof(s_pso_cache[0]))) return nil;
 
     MTLVertexDescriptor* vd = [MTLVertexDescriptor vertexDescriptor];
-    for (int i = 0; i < 3; i++) {
-        vd.attributes[i].format      = MTLVertexFormatFloat4;
-        vd.attributes[i].offset      = (NSUInteger)(i * 16);
-        vd.attributes[i].bufferIndex = MTL_VB_INDEX;
+    if (vp >= 0) {
+        u32 rank = 0;
+        for (int a = 0; a < 16; a++) {
+            if (!(s_vps[vp].mask & (1u << a))) continue;
+            vd.attributes[a].format      = MTLVertexFormatFloat4;
+            vd.attributes[a].offset      = (NSUInteger)(rank * 16);
+            vd.attributes[a].bufferIndex = MTL_VB_INDEX;
+            rank++;
+        }
+        vd.layouts[MTL_VB_INDEX].stride = rank * 16;
+    } else {
+        for (int i = 0; i < 3; i++) {
+            vd.attributes[i].format      = MTLVertexFormatFloat4;
+            vd.attributes[i].offset      = (NSUInteger)(i * 16);
+            vd.attributes[i].bufferIndex = MTL_VB_INDEX;
+        }
+        vd.layouts[MTL_VB_INDEX].stride = sizeof(MtlVertex);
     }
-    vd.layouts[MTL_VB_INDEX].stride = sizeof(MtlVertex);
 
     MTLRenderPipelineDescriptor* pd = [MTLRenderPipelineDescriptor new];
     /* The guest's own fragment program when it has one and it translated;
@@ -847,10 +1119,30 @@ static id<MTLRenderPipelineState> pso_for(const MtlDraw* d)
      * nero". */
     static int s_fb = -1;
     if (s_fb < 0) s_fb = getenv("RSX_FORCE_BUILTIN") ? 1 : 0;
-    id<MTLLibrary> glib = (d->fp_addr && !s_fb) ? guest_fp_library(d->fp_addr) : nil;
+    id<MTLLibrary> glib = (d->fp_addr && !s_fb) ? guest_fp_library(d->fp_addr, vp) : nil;
+    if (!glib && vp >= 0) {
+        /* il VP non compila: si riprova la coppia con il VS incorporato */
+        vp = -1; d->vp = -1;
+        for (u32 i = 0; i < s_pso_count; i++)
+            if (s_pso_cache[i].key == key && s_pso_cache[i].vp == vp) return s_pso_cache[i].pso;
+        vd = [MTLVertexDescriptor vertexDescriptor];
+        for (int i = 0; i < 3; i++) {
+            vd.attributes[i].format      = MTLVertexFormatFloat4;
+            vd.attributes[i].offset      = (NSUInteger)(i * 16);
+            vd.attributes[i].bufferIndex = MTL_VB_INDEX;
+        }
+        vd.layouts[MTL_VB_INDEX].stride = sizeof(MtlVertex);
+        glib = (d->fp_addr && !s_fb) ? guest_fp_library(d->fp_addr, -1) : nil;
+    }
     if (glib) {
+        static int s_dtg = -1;
+        if (s_dtg < 0) { const char* e = getenv("RSX_DEBUG_TINT");
+                         /* RSX_DEBUG_TINT=2: solo i draw con blend (l'HUD/menu
+                          * sopra la scena), per non coprirli col composito. */
+                         s_dtg = e ? atoi(e) : 0; if (e && !s_dtg) s_dtg = 1; }
+        int tint = s_dtg == 1 || (s_dtg == 2 && d->blend_enable);
         pd.vertexFunction   = [glib newFunctionWithName:@"vs_guest"];
-        pd.fragmentFunction = [glib newFunctionWithName:@"rsx_fp_main"];
+        pd.fragmentFunction = [glib newFunctionWithName:tint ? @"fs_tint_guest" : @"rsx_fp_main"];
     } else {
         pd.vertexFunction   = [s_shader_lib newFunctionWithName:@"vs_main"];
         /* RSX_DEBUG_TINT=1: tinta fissa, per vedere DOVE cade la geometria
@@ -861,8 +1153,8 @@ static id<MTLRenderPipelineState> pso_for(const MtlDraw* d)
         if (s_ta < 0) s_ta = getenv("RSX_TEX_ARRAY") ? 1 : 0;
         pd.fragmentFunction = [s_shader_lib newFunctionWithName:
                                s_dt ? @"fs_tint"
-                               : (s_ta && d->tex0 && s_tex[0].tex) ? @"fs_tex_arr"
-                               : ((d->tex0 && s_tex[0].tex) ? @"fs_tex" : @"fs_main")];
+                               : (s_ta && d->tex0 && d->tex[0]) ? @"fs_tex_arr"
+                               : ((d->tex0 && d->tex[0]) ? @"fs_tex" : @"fs_main")];
     }
     pd.vertexDescriptor = vd;
     pd.colorAttachments[0].pixelFormat = MTLPixelFormatBGRA8Unorm;
@@ -886,6 +1178,7 @@ static id<MTLRenderPipelineState> pso_for(const MtlDraw* d)
         return nil;
     }
     s_pso_cache[s_pso_count].key = key;
+    s_pso_cache[s_pso_count].vp  = vp;
     s_pso_cache[s_pso_count].pso = pso;
     s_pso_count++;
     return pso;
@@ -928,6 +1221,12 @@ int rsx_metal_backend_init(u32 width, u32 height, const char* title)
         s_verts = (MtlVertex*)malloc(sizeof(MtlVertex) * MTL_MAX_VERTS);
         if (!s_verts) {
             fprintf(stderr, "[RSX metal] vertex staging alloc failed\n");
+            return -1;
+        }
+        s_vpd = (float*)malloc(sizeof(float) * MTL_VP_FLOATS);
+        s_cbs = (u8*)malloc((size_t)MTL_CB_BYTES * MTL_CB_MAX);
+        if (!s_vpd || !s_cbs) {
+            fprintf(stderr, "[RSX metal] vp staging alloc failed\n");
             return -1;
         }
 
@@ -1060,6 +1359,27 @@ void rsx_metal_backend_present(void)
               extern unsigned long long ps3_ms_now(void);
               fprintf(stderr, "[RSX metal] fotogramma #%lu: negli ultimi %d presentati %lu draw in %lu fotogrammi non vuoti, t=%llums\n",
                       s_frame_no, s_fs, s_acc, s_nz, ps3_ms_now()); s_acc = 0; s_nz = 0; } }
+        /* RSX_DRAWLIST=<n>: l'elenco dei draw del fotogramma n (o di ogni
+         * fotogramma con piu' di 5 draw quando n = 0 e' il primo tale):
+         * superficie, programmi, texture, ritaglio, blend. La radiografia di
+         * un fotogramma nero. */
+        { static long s_dl = -2; static int s_done = 0;
+          if (s_dl == -2) { const char* e = getenv("RSX_DRAWLIST"); s_dl = e ? atol(e) : -1; }
+          if (s_dl >= 0 && !s_done && ((s_dl > 0 && (long)s_frame_no == s_dl) || (s_dl == 0 && s_draw_count > 5))) {
+              s_done = 1;
+              fprintf(stderr, "[drawlist] fotogramma #%lu: %u draw, %u vertici, %u blocchi di costanti\n",
+                      s_frame_no, s_draw_count, s_vert_count, s_cb_count);
+              for (u32 i = 0; i < s_draw_count; i++) {
+                  const MtlDraw* d = &s_draws[i];
+                  fprintf(stderr, "[drawlist] #%-3u surf=%08X%s vp=%s%08X fp=%08X n=%-5u topo=%d blend=%d(%03X,%03X) sc=%u,%u %ux%u tex:",
+                          i, d->surf, cellGcmOffsetIsDisplay(d->surf) ? "*" : " ",
+                          d->vp >= 0 ? "" : "-", d->vp >= 0 ? s_vps[d->vp].hash : 0u, d->fp_addr, d->count, (int)d->topology,
+                          d->blend_enable, d->blend_sfactor, d->blend_dfactor, d->sx, d->sy, d->sw, d->sh);
+                  for (u32 t = 0; t < RSX_MAX_TEXTURES; t++) if (d->tex[t])
+                      fprintf(stderr, " %u:%lux%lu", t, (unsigned long)d->tex[t].width, (unsigned long)d->tex[t].height);
+                  fprintf(stderr, "\n");
+              }
+          } }
         id<MTLCommandBuffer> cb = [s_queue commandBuffer];
 
         /* Un passaggio di rendering per ogni tratto CONSECUTIVO di draw che
@@ -1071,6 +1391,13 @@ void rsx_metal_backend_present(void)
             vb = [s_dev newBufferWithBytes:s_verts
                                     length:sizeof(MtlVertex) * s_vert_count
                                    options:MTLResourceStorageModeShared];
+        id<MTLBuffer> vpb = nil, cbb = nil;
+        if (s_draw_count > 0 && s_vpd_used > 0)
+            vpb = [s_dev newBufferWithBytes:s_vpd length:sizeof(float) * s_vpd_used
+                                    options:MTLResourceStorageModeShared];
+        if (s_draw_count > 0 && s_cb_count > 0)
+            cbb = [s_dev newBufferWithBytes:s_cbs length:(NSUInteger)MTL_CB_BYTES * s_cb_count
+                                    options:MTLResourceStorageModeShared];
 
         int drawable_cleared = 0;
         u32 i = 0;
@@ -1153,7 +1480,13 @@ void rsx_metal_backend_present(void)
                       [enc setScissorRect:sr];
                   } }
                 [enc setRenderPipelineState:pso];
-                [enc setVertexBytes:d->mvp length:sizeof(d->mvp) atIndex:0];
+                if (d->vp >= 0 && vpb && cbb) {
+                    [enc setVertexBuffer:vpb offset:d->vbase atIndex:MTL_VB_INDEX];
+                    [enc setVertexBuffer:cbb offset:(NSUInteger)d->cblock * MTL_CB_BYTES atIndex:0];
+                } else {
+                    if (vb) [enc setVertexBuffer:vb offset:0 atIndex:MTL_VB_INDEX];
+                    [enc setVertexBytes:d->mvp length:sizeof(d->mvp) atIndex:0];
+                }
                 /* The guest's program declares all sixteen units, so bind
                  * every resident one; the built-in sampling path only reads
                  * unit 0. Metal leaves unbound slots null, which is fine for
@@ -1161,12 +1494,13 @@ void rsx_metal_backend_present(void)
                 if (s_sampler) {
                     for (u32 t = 0; t < RSX_MAX_TEXTURES; t++) {
                         /* OGNI slot, non solo quelli residenti: vedi s_dummy_tex. */
-                        [enc setFragmentTexture:(s_tex[t].tex ? s_tex[t].tex : s_dummy_tex)
+                        [enc setFragmentTexture:(d->tex[t] ? d->tex[t] : s_dummy_tex)
                                         atIndex:t];
                         [enc setFragmentSamplerState:s_sampler atIndex:t];
                     }
                 }
-                [enc drawPrimitives:d->topology vertexStart:d->base vertexCount:d->count];
+                [enc drawPrimitives:d->topology vertexStart:(d->vp >= 0 && vpb && cbb) ? 0 : d->base
+                        vertexCount:d->count];
             }
             [enc endEncoding];
             if (i >= s_draw_count) break;
@@ -1372,7 +1706,7 @@ void rsx_metal_backend_present(void)
               }
               if (drawable) [drawable present];
               if (!s_headless) dispatch_semaphore_signal(s_inflight);
-              s_draw_count = 0; s_vert_count = 0;
+              s_draw_count = 0; s_vert_count = 0; s_vpd_used = 0; s_cb_count = 0;
               return;
           } }
 
@@ -1398,6 +1732,9 @@ void rsx_metal_backend_present(void)
         }
         s_draw_count = 0;
         s_vert_count = 0;
+        s_vpd_used = 0;
+        s_cb_count = 0;
+        texcache_sweep();
 
         if (s_headless && s_offscreen) {
             u32 px = 0;

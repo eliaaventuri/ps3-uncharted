@@ -1261,6 +1261,9 @@ void cellGcm_ref_on_poll(void)
 }
 
 static int s_in_put_hook = 0;
+/* Il walker e' fermo su un JUMP-a-se-stessi (GCM_PARK_WAIT): ripassare anche
+ * senza mosse di `put`, finche' la parola non cambia. */
+static int s_parked = 0;
 /* Ultimo JUMP preso: da li' comincia il segmento in cui si sta camminando. */
 static u32 s_last_jump_tgt = 0;
 
@@ -1272,7 +1275,7 @@ void cellGcm_rsx_process_fifo(void)
      * giro precedente (nel frattempo sovrascritto) e restare senza uscita. */
     { static int only = -1;
       if (only < 0) { const char* e = getenv("GCM_DRAIN_ONLY_PUT"); only = (e && *e && *e != '0') ? 1 : 0; }
-      if (only && !s_in_put_hook) return; }
+      if (only && !s_in_put_hook && !s_parked) return; }
     AcquireSRWLockExclusive(&s_gcm_fifo_lock);
     gcm_rsx_process_fifo_unlocked();
     ReleaseSRWLockExclusive(&s_gcm_fifo_lock);
@@ -1425,6 +1428,7 @@ void cellGcm_on_put_write(void)
 
 static void gcm_rsx_process_fifo_unlocked(void)
 {
+    s_parked = 0;   /* si riparte: se il park e' ancora li' lo si ritrova */
     { static unsigned _n = 0; static unsigned long long _t0 = 0;
       extern unsigned long long ps3_ms_now(void);
       _n++;
@@ -1531,6 +1535,18 @@ static void gcm_rsx_process_fifo_unlocked(void)
          * prosegue), e se restano zero mentre `put` si e' mosso ci pensa il
          * watchdog di stuck-get piu' sotto a risincronizzare. */
         if (w == 0) {
+            /* Dentro una CALL (buffer scritto dai job SPU di Uncharted) gli
+             * zeri sono NOP veri: i blocchi lasciano un "buco" di 8 parole fra
+             * la configurazione dei vertex array e la SEMAPHORE_RELEASE (il
+             * job di geometria ci patcha i draw) e 3 di riempimento prima
+             * della RET. La RSX li attraversa; la regola dei 4 zeri qui sotto
+             * e' per l'anello (segmento tagliato sotto i piedi), non per
+             * questi buffer. Tetto: 64 K parole, poi si cade nella regola. */
+            if (s_fifo_calloff) {
+                u32 z = 0, io2 = s_fifo_getoff;
+                while (z < 65536) { u32 pe = gcm_io2ea(io2); if (!pe || vm_read32(pe) != 0) break; z++; io2 += 4; }
+                if (z < 65536 && gcm_io2ea(io2)) { s_fifo_getoff = io2; continue; }
+            }
             u32 z = 0, probe_io = s_fifo_getoff;
             while (z < 4) {
                 u32 pe = gcm_io2ea(probe_io);
@@ -1764,6 +1780,23 @@ static void gcm_rsx_process_fifo_unlocked(void)
                * CPU the guest needs. Stop this pass instead; the next one
                * re-reads the word, so a patched jump is still followed. */
               if (tgt == s_fifo_getoff) {
+                  /* GCM_PARK_WAIT=1: il park e' la semantica classica "non
+                   * ancora pronto": la RSX vera resta ferma qui finche' chi
+                   * riempie il buffer (in Uncharted un job SPU: le liste di
+                   * comandi della scena stanno in buffer CALLati dall'anello,
+                   * scritti con un JUMP-a-se-stessi in testa e patchati con i
+                   * comandi veri a job finito) non sovrascrive la parola.
+                   * Si resta parcheggiati (get fermo) e il ticker del present
+                   * ripassa di qui ogni pochi ms anche con GCM_DRAIN_ONLY_PUT.
+                   * Misurato senza: il walker risincronizzava sull'anello,
+                   * saltava il buffer e la SET_REFERENCE dietro la CALL, e il
+                   * titolo aspettava per sempre il riferimento 645. */
+                  { static int pw = -1;
+                    if (pw < 0) { const char* e = getenv("GCM_PARK_WAIT"); pw = (e && *e && *e != '0') ? 1 : 0; }
+                    if (pw) { s_parked = 1;
+                              { static int _n = 0; if (_n++ < 8)
+                                fprintf(stderr, "[cellGcmSys] FIFO parcheggiata a 0x%08X (put=0x%08X): aspetto la patch\n", tgt, put); }
+                              break; } }
                   /* Parked. If the title has meanwhile moved `put` somewhere
                    * else, it has switched to its other segment and left this
                    * park standing -- it only patches a park when it reuses that
