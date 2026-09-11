@@ -1,6 +1,6 @@
 # Stato del progetto
 
-Ultimo aggiornamento: **11 settembre 2026** — sessione 21.
+Ultimo aggiornamento: **11 settembre 2026** — sessione 22.
 
 ## Dove siamo
 
@@ -32,12 +32,17 @@ in 8 corse. Dettagli nella sezione "Sessione 20".
 **Dalla sessione 21 il renderer riceve davvero i disegni.** Lo schermo nero non
 era il backend Metal: il titolo disegna in **modalità immediata** (ogni vertice
 scritto come registri fra BEGIN e END, mai un `DRAW_ARRAYS`) e quel percorso non
-era implementato — al backend arrivavano **zero** draw. Ora arrivano, tutti
-dentro il volume di clip, e con una tinta di prova la finestra si riempie. Resta
-quasi nera perché a questo punto il gioco disegna solo 2-3 quad (uno nero a
-schermo pieno, cioè un clear, più HUD che campiona zone vuote dell'atlante):
-**la geometria della scena non viene mai sottomessa**, e quello è di nuovo il
-lato SPU/job, non il renderer. Dettagli in "Sessione 21".
+era implementato — al backend arrivavano **zero** draw.
+
+**Dalla sessione 22 il port disegna la prima immagine vera.** Fra i vertici e lo
+schermo c'erano altri tre difetti in fila, ognuno sufficiente da solo a fare uno
+schermo nero: i passaggi fuori schermo finivano sul drawable e cancellavano
+l'immagine (manca(va) il render-to-texture); le texture dichiarate come **array**
+nel fragment program del guest tornavano zero perché legavamo solo gli slot
+residenti; e le texture **DXT1** venivano copiate compresse dentro una RGBA8,
+cioè rumore. Risolti tutti e tre, il titolo disegna un oggetto dorato con
+dettaglio e luce — esce schiacciato in una striscia, ed è il prossimo dettaglio.
+Dettagli in "Sessione 22".
 
 Quanto arriva a fare, dal log:
 
@@ -332,6 +337,155 @@ La lista dei comandi ora viene percorsa fino in fondo — sei coppie
 risultati in memoria principale.** Non era mai successo in nessuna sessione.
 Riproducibile: **tre corse su tre**, identiche -- 14 comandi, un overlay
 residente, zero microstep, cinque stall e due interrupt per corsa.
+
+## Sessione 22 — la prima immagine vera: tre difetti in fila fra i vertici e lo schermo
+
+La sessione 21 aveva fatto arrivare i disegni al backend. Qui si e' seguito il
+percorso fino al pixel, e i difetti erano **tre, in fila**: ognuno da solo
+bastava a fare uno schermo nero, quindi finche' non sono caduti tutti e tre non
+si vedeva niente.
+
+### 0. Il gioco crede di non avere il controller (corretto, effetto non misurato)
+
+Dal log del titolo: `Pad 0 has been removed!`. Il gioco interroga
+`cellPadGetInfo` (v1, NID `0x3AAAD464`), ed era **l'unica delle nostre quattro
+funzioni sul pad a non dichiarare la porta 0 sempre presente**:
+`cellPadGetData`, `cellPadGetInfo2` e `cellPadPeriphGetInfo` lo fanno tutte
+(`|| i == 0`), la v1 no. Allineata.
+
+Onesta': **il picco di disegni che si vede dopo NON e' causato da questa
+correzione** — rileggendo i log precedenti c'era gia'. La correzione resta
+perche' e' un'incoerenza vera fra quattro funzioni nostre che rispondono alla
+stessa domanda, ma non attribuirle meriti che non ha.
+
+### 1. Meta' dei disegni andava fuori schermo e cancellava l'altra meta'
+
+Con `RSX_FRAMEDBG` si vede che un fotogramma pieno ha ~10.000 disegni, e
+l'istogramma delle dimensioni dice che sono **a coppie**: meta' piccoli, meta' a
+schermo pieno. Quelli a schermo pieno coprivano tutto, e restava visibile solo
+l'ultimo disegno del fotogramma.
+
+Il perche', misurato registrando la superficie di destinazione per disegno:
+
+```
+[RSX frame#798]   superfici: 0x7D0000(4854) [offscreen]  0x50000(4854) [display]
+```
+
+Il titolo alterna **una superficie fuori schermo** e il buffer visibile.
+`mtl_set_render_target` guardava solo la dimensione e buttava via la
+destinazione: tutto finiva sul drawable.
+
+Fatto: ogni offset di superficie non-display ha la sua `MTLTexture`, i disegni
+si raggruppano per superficie in passaggi di rendering distinti (tratti
+consecutivi, cioe' l'ordine in cui il titolo li ha emessi), e quando il titolo
+ricampiona quella superficie come texture gli si consegna la nostra — in memoria
+guest non c'e' niente, perche' a scriverci sarebbe stata la RSX.
+`RSX_RTT=0` torna al comportamento di prima per il confronto.
+
+### 2. LA CAUSA del nero: le texture legate ad array
+
+Anche dopo la separazione delle superfici, tutto nero. La geometria pero'
+rasterizzava: con una tinta fissa la finestra si riempiva. Quindi il difetto era
+nella colorazione.
+
+Il fragment program tradotto del guest dichiara le texture come **array**:
+
+```c
+fragment float4 rsx_fp_main(PSInput input [[stage_in]],
+    array<texture2d<float>, 16> rsx_tex [[texture(0)]],
+    array<sampler, 16> rsx_samp [[sampler(0)]])
+```
+
+e noi legavamo **solo le unita' residenti**, lasciando gli altri 14-15 slot
+vuoti. Con un array, Metal in quel caso restituisce zero da *tutte* le letture,
+compresa quella dello slot legato.
+
+La prova A/B, fatta con uno shader incorporato identico a `fs_tex` salvo la
+dichiarazione ad array (`fs_tex_arr`, `RSX_TEX_ARRAY=1`):
+
+| shader | pixel non neri |
+|---|---|
+| `fs_tex` (dichiarazione scalare) | **2058** |
+| `fs_tex_arr` (dichiarazione ad array) | **0** |
+
+Fatto: si legano **tutti** i 16 slot a ogni disegno; quelli senza texture
+residente ricevono una 1x1 trasparente (`s_dummy_tex`). Dopo la correzione il
+fragment program del titolo produce colore: da 0 a 2249 pixel non neri.
+
+### 3. Le texture compresse finivano in memoria come blocchi grezzi
+
+A quel punto l'immagine c'era ma era **rumore rosso/verde/blu**: un riquadro di
+128x32 pixel di sale e pepe saturo.
+
+Le texture del titolo sono formato `0xA6` = `0x86` (DXT1) | `0x20` (lineare).
+`rsx_texture_decode()` per un formato a blocchi **copia i blocchi cosi' come
+sono** — che e' giusto per un backend che carica una texture BC nativa, come
+D3D12. Il backend Metal pero' crea una `RGBA8Unorm` e ci copiava dentro i
+blocchi compressi: da li' il rumore.
+
+Fatto: `rsx_texture_decode_bc()` in `rsx_texture_layout.c`, decompressione
+BC1/BC2/BC3 sulla CPU in RGBA8 (compresi l'alpha a 1 bit di BC1 quando
+`c0 <= c1`, i 4 bit di BC2 e i 3 bit interpolati di BC3). Il percorso esistente
+non cambia: chi carica BC nativo continua a ricevere i blocchi intatti.
+
+### Il risultato
+
+**La prima immagine vera del port**: un oggetto dorato con dettaglio, ombreggiatura
+e riflessi, disegnato dal titolo con il proprio fragment program e la propria
+texture. Sfondo `(8,4,8)`, 3592 pixel di contenuto, tinte calde — non piu' rumore
+saturo.
+
+L'oggetto esce pero' **schiacciato** in una striscia verticale di 36x122 pixel:
+le proporzioni sono sbagliate, ed e' il prossimo dettaglio da capire (il quad e'
+piccolo, oppure le coordinate di texture coprono solo una fetta dell'atlante
+4096x128).
+
+### Lo scissor: implementato, e non era lui
+
+`scissor_x/y/w/h` erano tracciati in `rsx_state` e non arrivavano mai a Metal.
+Ora si applicano (`RSX_SCISSOR=0` per spegnerli). Misurato pero': in un
+fotogramma pieno **tutti** i 12.633 disegni hanno il ritaglio a schermo intero,
+quindi non era questa la causa dei quad che coprivano tutto (era la superficie,
+punto 1). Resta perche' e' corretto averlo.
+
+### Nota di metodo, di nuovo
+
+Il debug per fotogramma campionava una riga ogni 60, e i fotogrammi pieni
+duravano meno di quello: si vedevano solo i fotogrammi vuoti. E' **lo stesso
+errore del log tappato della sessione 19**. Ora un fotogramma con molti disegni
+si stampa sempre. E siccome uno screenshot da fuori manca sistematicamente i
+fotogrammi pieni, `RSX_DUMP_FRAME=<n>` salva su file dal di dentro il primo
+fotogramma con piu' di n disegni (piu' le superfici fuori schermo).
+
+Tetti alzati di conseguenza: `MTL_MAX_DRAWS` 4096 -> 32768 e `MTL_MAX_VERTS`
+256K -> 1M, perche' a 4096 buttavamo 6.286 disegni per fotogramma, cioe' meta'
+immagine.
+
+### Strumenti nuovi
+
+- `RSX_DUMP_FRAME=<n>` — salva in `/tmp/rsx_frame.ppm` il primo fotogramma con
+  piu' di n disegni, e in `/tmp/rsx_surf_<offset>.ppm` le superfici fuori
+  schermo. E' il modo giusto di guardare un fotogramma pieno.
+- `RSX_TEX_SAVE=1` — le prime texture decodificate su file.
+- `RSX_TEX_ARRAY=1` — shader incorporato con dichiarazione ad array (la prova
+  A/B del punto 2).
+- `RSX_RTT=0` — disattiva il render-to-texture.
+- `RSX_SCISSOR=0` — disattiva il ritaglio.
+- `RSX_ONLY_SMALL=1` — salta i quad a schermo pieno.
+- `RSX_FRAMEDBG=1` ora stampa anche superfici, dimensioni, ritagli e disegni
+  degeneri.
+
+### Il prossimo passo
+
+1. Le proporzioni dell'oggetto disegnato (striscia verticale invece che
+   immagine piena).
+2. Il titolo raggiunge lo stato che disegna contenuto **a intermittenza**: su 6
+   tentativi consecutivi puo' non arrivarci mai. E' lo stallo del modo A della
+   sessione 20, che sotto contesa torna. Finche' c'e', ogni misura grafica
+   richiede piu' tentativi.
+3. Difetto noto del decompilatore dei fragment program: emette `return r[0]`
+   anche quando l'ultima scrittura e' al banco a mezza precisione `h[0]`.
+
 
 ## Sessione 21 — perche' lo schermo era nero: il titolo disegna in modalita' immediata
 
@@ -2067,9 +2221,14 @@ crossbar `TEXTURE_CONTROL1` e i sampler per unità.
 
 Dalla sessione 21 la **modalità immediata** c'è (`draw_inline` nella vtable,
 `SET_VERTEX_DATA2F/4F_M` fra BEGIN e END) — era lei a mancare, non i pezzi qui
-sopra, e senza di lei al backend non arrivava un solo draw. Difetto noto del
-decompilatore dei fragment program: emette `return r[0]` anche quando l'ultima
-scrittura è al banco a mezza precisione `h[0]`, da cui dovrebbe venire l'uscita.
+sopra, e senza di lei al backend non arrivava un solo draw. Dalla sessione 22
+ci sono anche il **render-to-texture** (una `MTLTexture` per superficie non
+display, passaggi raggruppati per superficie), il **ritaglio** (scissor) e la
+**decompressione BC1/BC2/BC3** sulla CPU (`rsx_texture_decode_bc`), più il
+legame di tutti e 16 gli slot di texture che il fragment program del guest
+pretende. Difetto noto del decompilatore dei fragment program: emette
+`return r[0]` anche quando l'ultima scrittura è al banco a mezza precisione
+`h[0]`, da cui dovrebbe venire l'uscita.
 
 ## Come si ricostruisce il port
 

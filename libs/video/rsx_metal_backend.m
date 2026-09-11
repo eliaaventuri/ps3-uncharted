@@ -53,8 +53,11 @@ static u32                 s_height = 720;
  * D3D12 backend's D3D12DrawRecord / render_frame split.
  * --------------------------------------------------------------------------*/
 
-#define MTL_MAX_DRAWS      4096
-#define MTL_MAX_VERTS      (256u * 1024u)
+/* Misurato: un fotogramma del titolo arriva a ~10.400 quad in modalita'
+ * immediata, e con il tetto a 4096 ne buttavamo 6.286 -- cioe' meta' immagine.
+ * I draw sono record piccoli, il costo di alzare il tetto e' memoria statica. */
+#define MTL_MAX_DRAWS      32768
+#define MTL_MAX_VERTS      (1024u * 1024u)
 #define MTL_VB_INDEX       30      /* buffer(0) is the constant buffer */
 
 /* Matches the built-in shader's stage_in layout. */
@@ -69,6 +72,8 @@ typedef struct {
     float mvp[16];   /* 4 rows of the RSX vertex-constant matrix */
     u32 fp_addr;     /* NV4097_SET_SHADER_PROGRAM: 0 = built-in shader */
     int tex0;        /* texture unit 0 enabled: pick the sampling built-in */
+    u32 surf;        /* surface_color_offset[0] al momento del draw          */
+    u32 sx, sy, sw, sh;  /* rettangolo di ritaglio (scissor) al momento del draw */
 } MtlDraw;
 
 static MtlVertex* s_verts;
@@ -219,7 +224,8 @@ static int create_window_impl(const char* title)
     s_layer = [CAMetalLayer layer];
     s_layer.device          = s_dev;
     s_layer.pixelFormat     = MTLPixelFormatBGRA8Unorm;
-    s_layer.framebufferOnly = YES;
+    /* RSX_DUMP_FRAME=<n> deve poter rileggere il drawable per salvarlo. */
+    s_layer.framebufferOnly = getenv("RSX_DUMP_FRAME") ? NO : YES;
     s_layer.drawableSize    = CGSizeMake((CGFloat)s_width, (CGFloat)s_height);
 
     NSView* view = [s_window contentView];
@@ -346,6 +352,9 @@ static void record_draw(const rsx_state* st, u32 prim, u32 base, u32 count,
     d->blend_equation = st->blend_equation;
     d->fp_addr        = st->shader_program;
     d->tex0           = (st->textures[0].control0 & 0x80000000u) != 0;
+    d->surf           = st->surface_color_offset[0];
+    d->sx = st->scissor_x; d->sy = st->scissor_y;
+    d->sw = st->scissor_w; d->sh = st->scissor_h;
 
     /* RSX vertex constant slots 0..3 hold the MVP rows when no vertex program
      * has been translated. An all-zero matrix would collapse every vertex to
@@ -447,6 +456,9 @@ done:
     d->blend_equation = s_state ? s_state->blend_equation : 0;
     d->fp_addr        = s_state ? s_state->shader_program : 0;
     d->tex0           = s_state && (s_state->textures[0].control0 & 0x80000000u) != 0;
+    d->surf           = s_state ? s_state->surface_color_offset[0] : 0;
+    d->sx = s_state ? s_state->scissor_x : 0; d->sy = s_state ? s_state->scissor_y : 0;
+    d->sw = s_state ? s_state->scissor_w : 4096; d->sh = s_state ? s_state->scissor_h : 4096;
 
     memset(d->mvp, 0, sizeof d->mvp);
     d->mvp[0] = d->mvp[5] = d->mvp[10] = d->mvp[15] = 1.0f;
@@ -472,6 +484,64 @@ done:
           }
           fflush(stderr);
       } }
+}
+
+/* ---- superfici fuori schermo (render-to-texture) --------------------------
+ * Il titolo non disegna solo sul buffer di schermo: alterna passaggi su una
+ * superficie fuori schermo e passaggi sul buffer visibile (misurato: 4599 draw
+ * su 0x7D0000 [offscreen] e 4599 su 0x50000 [display], nello stesso
+ * fotogramma). Mandando tutto sul drawable i passaggi fuori schermo
+ * CANCELLAVANO l'immagine: restava visibile solo l'ultimo disegno, e lo
+ * schermo era nero.
+ *
+ * Qui ogni offset di superficie non-display prende la sua texture, e i draw
+ * vengono raggruppati per superficie in passaggi di rendering distinti. La
+ * texture resta viva fra un fotogramma e l'altro: il titolo ci disegna dentro
+ * una volta e la campiona dopo. -------------------------------------------*/
+typedef struct { u32 offset; u32 w, h; id<MTLTexture> tex; int cleared_frame; } MtlSurface;
+static MtlSurface s_surf[16];
+static id<MTLTexture> s_surf_dump[16];
+static u32        s_surf_count;
+static unsigned long s_frame_no;
+
+static id<MTLTexture> surface_texture(u32 offset, u32 w, u32 h, int* first_use)
+{
+    for (u32 i = 0; i < s_surf_count; i++) {
+        if (s_surf[i].offset != offset) continue;
+        if (s_surf[i].w != w || s_surf[i].h != h) { s_surf[i].tex = nil; break; }
+        if (!s_surf[i].tex) break;
+        *first_use = (s_surf[i].cleared_frame != (int)s_frame_no);
+        s_surf[i].cleared_frame = (int)s_frame_no;
+        return s_surf[i].tex;
+    }
+    if (s_surf_count >= 16) return nil;
+    MTLTextureDescriptor* td = [MTLTextureDescriptor
+        texture2DDescriptorWithPixelFormat:MTLPixelFormatBGRA8Unorm
+                                     width:w height:h mipmapped:NO];
+    td.usage = MTLTextureUsageRenderTarget | MTLTextureUsageShaderRead;
+    id<MTLTexture> t = [s_dev newTextureWithDescriptor:td];
+    if (!t) return nil;
+    u32 slot = s_surf_count;
+    for (u32 i = 0; i < s_surf_count; i++) if (s_surf[i].offset == offset) { slot = i; break; }
+    if (slot == s_surf_count) s_surf_count++;
+    s_surf[slot].offset = offset; s_surf[slot].w = w; s_surf[slot].h = h;
+    s_surf[slot].tex = t; s_surf[slot].cleared_frame = (int)s_frame_no;
+    *first_use = 1;
+    { static int sd = -1; if (sd < 0) sd = getenv("RSX_FRAMEDBG") ? 1 : 0;
+      if (sd) fprintf(stderr, "[RSX metal] superficie fuori schermo 0x%X: %ux%u\n",
+                      offset, w, h); }
+    return t;
+}
+
+/* La texture di una superficie su cui abbiamo gia' disegnato, se il titolo la
+ * ricampiona (il passaggio di composizione). La memoria guest per quella
+ * superficie non contiene nulla -- la RSX vera ci avrebbe scritto, noi no --
+ * quindi decodificarla darebbe nero. */
+static id<MTLTexture> surface_texture_lookup(u32 offset)
+{
+    for (u32 i = 0; i < s_surf_count; i++)
+        if (s_surf[i].offset == offset && s_surf[i].tex) return s_surf[i].tex;
+    return nil;
 }
 
 /* ---- pipeline state ------------------------------------------------------ */
@@ -524,6 +594,13 @@ static NSString* const kBuiltinMSL = @
 "}\n"
 "fragment float4 fs_main(VOut in [[stage_in]]) { return in.col; }\n"
 "fragment float4 fs_tint(VOut in [[stage_in]]) { return float4(1.0, 0.2, 0.6, 1.0); }\n"
+/* Come fs_tex ma con la stessa dichiarazione ad ARRAY che usa il fragment
+ * program tradotto del guest. Se questa e' nera e fs_tex no, il difetto e'
+ * nel legame delle texture ad array, non nel programma del titolo. */
+"fragment float4 fs_tex_arr(VOut in [[stage_in]],\n"
+"                           array<texture2d<float>, 16> t [[texture(0)]],\n"
+"                           array<sampler, 16> s [[sampler(0)]])\n"
+"{ return t[0].sample(s[0], in.tc.xy); }\n"
 "fragment float4 fs_tex(VOut in [[stage_in]], texture2d<float> t0 [[texture(0)]],\n"
 "                       sampler s0 [[sampler(0)]]) { return t0.sample(s0, in.tc.xy); }\n";
 
@@ -553,6 +630,13 @@ typedef struct {
 } MtlTexUnit;
 static MtlTexUnit s_tex[RSX_MAX_TEXTURES];
 static id<MTLSamplerState> s_sampler;
+/* Il fragment program tradotto del guest dichiara le texture come ARRAY
+ * (`array<texture2d<float>, 16> rsx_tex [[texture(0)]]`), e Metal vuole TUTTI
+ * gli elementi dell'array legati: legando solo le unita' residenti, ogni
+ * lettura dell'array tornava zero e l'immagine era nera. Misurato con uno
+ * shader incorporato identico a fs_tex ma dichiarato ad array: 0 pixel non
+ * neri, contro 2058 della versione scalare. Questa 1x1 riempie i buchi. */
+static id<MTLTexture> s_dummy_tex;
 
 extern u32 ppu_vm_size;   /* guest VM size the port declared; 0 = unknown */
 
@@ -570,6 +654,23 @@ static void mtl_bind_texture(void* ud, u32 unit, const rsx_texture_state* tex)
     if (u->tex && u->offset == tex->offset && u->format == tex->format &&
         u->image_rect == tex->image_rect)
         return;                            /* already resident */
+
+    /* Se questo offset e' una superficie su cui abbiamo disegnato fuori
+     * schermo, il contenuto vero sta nella NOSTRA texture: in memoria guest non
+     * c'e' niente, perche' a scriverci sarebbe stata la RSX. Senza questo il
+     * passaggio di composizione campiona nero e tutto il lavoro fuori schermo
+     * va perso. */
+    { id<MTLTexture> st = surface_texture_lookup(tex->offset);
+      if (st) {
+          u->tex = st; u->offset = tex->offset; u->format = tex->format;
+          u->image_rect = tex->image_rect;
+          { static int sd = -1; if (sd < 0) sd = getenv("RSX_FRAMEDBG") ? 1 : 0;
+            static int _n = 0;
+            if (sd && _n++ < 8)
+                fprintf(stderr, "[RSX metal] unita' %u legge la superficie "
+                        "fuori schermo 0x%X\n", unit, tex->offset); }
+          return;
+      } }
 
     rsx_tex_layout tl;
     rsx_texture_layout(fmt, width, height, &tl);
@@ -596,8 +697,16 @@ static void mtl_bind_texture(void* ud, u32 unit, const rsx_texture_state* tex)
     const u32 pitch = width * 4u;
     u8* staging = (u8*)malloc((size_t)pitch * height);
     if (!staging) return;
-    rsx_texture_decode(staging, pitch, vm_base + ea, width, height, &tl,
-                       rsx_texture_argb_is_rgba());
+    /* Un formato compresso va DECOMPRESSO: la texture Metal qui e' RGBA8, e
+     * rsx_texture_decode() per i formati a blocchi copia i blocchi cosi' come
+     * sono (che e' giusto per chi carica BC nativo, come D3D12). Copiandoli in
+     * una RGBA8 si otteneva rumore rosso/verde/blu -- misurato: un riquadro di
+     * 128x32 pixel di sale e pepe colorato al posto dell'HUD. */
+    if (tl.compressed)
+        rsx_texture_decode_bc(staging, pitch, vm_base + ea, width, height, &tl);
+    else
+        rsx_texture_decode(staging, pitch, vm_base + ea, width, height, &tl,
+                           rsx_texture_argb_is_rgba());
 
     MTLTextureDescriptor* td = [MTLTextureDescriptor
         texture2DDescriptorWithPixelFormat:MTLPixelFormatRGBA8Unorm
@@ -615,6 +724,24 @@ static void mtl_bind_texture(void* ud, u32 unit, const rsx_texture_state* tex)
         /* RSX_TEX_DBG=1: quanti texel non neri sono davvero atterrati. Una
          * texture decodificata male e una texture vuota dal backend si vedono
          * uguali (nero), e da li' non si riparte. */
+        /* RSX_TEX_SAVE=1: la texture decodificata su file. Se la geometria si
+         * dipinge con una tinta ma resta nera con lo shader vero, o e' la
+         * texture o sono le coordinate; questo separa i due casi. */
+        { static int ts = -1;
+          if (ts < 0) ts = getenv("RSX_TEX_SAVE") ? 1 : 0;
+          static int tn = 0;
+          if (ts && tn < 4) {
+              char tp[96]; snprintf(tp, sizeof tp, "/tmp/rsx_tex%d_%08X.ppm", tn++, tex->offset);
+              FILE* tf = fopen(tp, "wb");
+              if (tf) {
+                  fprintf(tf, "P6\n%u %u\n255\n", width, height);
+                  for (u32 q = 0; q < width * height; q++) {
+                      u8 rgb[3] = { staging[q*4+0], staging[q*4+1], staging[q*4+2] };
+                      fwrite(rgb, 1, 3, tf);
+                  }
+                  fclose(tf);
+                  fprintf(stderr, "[RSX metal] texture salvata in %s\n", tp);
+              } } }
         { static int td2 = -1;
           if (td2 < 0) td2 = getenv("RSX_TEX_DBG") ? 1 : 0;
           if (td2) {
@@ -730,8 +857,11 @@ static id<MTLRenderPipelineState> pso_for(const MtlDraw* d)
          * quando i colori veri sono quasi neri (misurato: 0.031). */
         static int s_dt = -1;
         if (s_dt < 0) s_dt = getenv("RSX_DEBUG_TINT") ? 1 : 0;
+        static int s_ta = -1;
+        if (s_ta < 0) s_ta = getenv("RSX_TEX_ARRAY") ? 1 : 0;
         pd.fragmentFunction = [s_shader_lib newFunctionWithName:
                                s_dt ? @"fs_tint"
+                               : (s_ta && d->tex0 && s_tex[0].tex) ? @"fs_tex_arr"
                                : ((d->tex0 && s_tex[0].tex) ? @"fs_tex" : @"fs_main")];
     }
     pd.vertexDescriptor = vd;
@@ -808,6 +938,15 @@ int rsx_metal_backend_init(u32 width, u32 height, const char* title)
         sd.tAddressMode = MTLSamplerAddressModeRepeat;
         s_sampler = [s_dev newSamplerStateWithDescriptor:sd];
 
+        { MTLTextureDescriptor* dd = [MTLTextureDescriptor
+              texture2DDescriptorWithPixelFormat:MTLPixelFormatRGBA8Unorm
+                                           width:1 height:1 mipmapped:NO];
+          dd.usage = MTLTextureUsageShaderRead;
+          s_dummy_tex = [s_dev newTextureWithDescriptor:dd];
+          const u8 zero[4] = { 0, 0, 0, 0 };
+          [s_dummy_tex replaceRegion:MTLRegionMake2D(0,0,1,1)
+                         mipmapLevel:0 withBytes:zero bytesPerRow:4]; }
+
         NSError* serr = nil;
         s_shader_lib = [s_dev newLibraryWithSource:kBuiltinMSL options:nil error:&serr];
         if (!s_shader_lib) {
@@ -856,6 +995,7 @@ void rsx_metal_backend_shutdown(void)
         for (u32 i = 0; i < (u32)(sizeof(s_pso_cache)/sizeof(s_pso_cache[0])); i++)
             s_pso_cache[i].pso = nil;
         s_shader_lib = nil;
+        s_dummy_tex = nil;
         s_layer     = nil;
         s_offscreen = nil;
         s_queue     = nil;
@@ -910,24 +1050,60 @@ void rsx_metal_backend_present(void)
             return;
         }
 
-        MTLRenderPassDescriptor* rp = [MTLRenderPassDescriptor renderPassDescriptor];
-        rp.colorAttachments[0].texture     = target;
-        rp.colorAttachments[0].loadAction  = MTLLoadActionClear;
-        rp.colorAttachments[0].clearColor  = clear_color_from_rsx();
-        rp.colorAttachments[0].storeAction = MTLStoreActionStore;
-
+        s_frame_no++;
         id<MTLCommandBuffer> cb = [s_queue commandBuffer];
-        id<MTLRenderCommandEncoder> enc = [cb renderCommandEncoderWithDescriptor:rp];
 
-        if (s_draw_count > 0 && s_vert_count > 0) {
-            id<MTLBuffer> vb = [s_dev newBufferWithBytes:s_verts
-                                                  length:sizeof(MtlVertex) * s_vert_count
-                                                 options:MTLResourceStorageModeShared];
-            [enc setVertexBuffer:vb offset:0 atIndex:MTL_VB_INDEX];
-            MTLViewport vp = { 0.0, 0.0, (double)s_width, (double)s_height, 0.0, 1.0 };
-            [enc setViewport:vp];
+        /* Un passaggio di rendering per ogni tratto CONSECUTIVO di draw che
+         * condividono la superficie: e' l'ordine in cui il titolo li ha
+         * emessi, e cambiare superficie e' esattamente cambiare bersaglio.
+         * Il drawable si pulisce una volta sola, all'inizio del fotogramma. */
+        id<MTLBuffer> vb = nil;
+        if (s_draw_count > 0 && s_vert_count > 0)
+            vb = [s_dev newBufferWithBytes:s_verts
+                                    length:sizeof(MtlVertex) * s_vert_count
+                                   options:MTLResourceStorageModeShared];
 
-            for (u32 i = 0; i < s_draw_count; i++) {
+        int drawable_cleared = 0;
+        u32 i = 0;
+        while (i < s_draw_count || i == 0) {
+            u32 run_end = i;
+            u32 surf = (i < s_draw_count) ? s_draws[i].surf : 0;
+            while (run_end < s_draw_count && s_draws[run_end].surf == surf) run_end++;
+
+            int to_display = (i >= s_draw_count) || cellGcmOffsetIsDisplay(surf);
+            int first_use = 0;
+            id<MTLTexture> pass_target = target;
+            if (!to_display) {
+                /* RSX_RTT=0 torna al comportamento precedente (tutto sul
+                 * drawable), per il confronto A/B. */
+                static int rtt = -1;
+                if (rtt < 0) { const char* e = getenv("RSX_RTT"); rtt = (e && *e == '0') ? 0 : 1; }
+                if (rtt) {
+                    id<MTLTexture> st = surface_texture(surf, s_width, s_height, &first_use);
+                    if (st) pass_target = st; else to_display = 1;
+                } else to_display = 1;
+            }
+
+            MTLRenderPassDescriptor* rp = [MTLRenderPassDescriptor renderPassDescriptor];
+            rp.colorAttachments[0].texture = pass_target;
+            if (to_display)
+                rp.colorAttachments[0].loadAction =
+                    drawable_cleared ? MTLLoadActionLoad : MTLLoadActionClear;
+            else
+                rp.colorAttachments[0].loadAction =
+                    first_use ? MTLLoadActionClear : MTLLoadActionLoad;
+            rp.colorAttachments[0].clearColor  = clear_color_from_rsx();
+            rp.colorAttachments[0].storeAction = MTLStoreActionStore;
+            if (to_display) drawable_cleared = 1;
+
+            id<MTLRenderCommandEncoder> enc = [cb renderCommandEncoderWithDescriptor:rp];
+            if (vb) {
+                [enc setVertexBuffer:vb offset:0 atIndex:MTL_VB_INDEX];
+                MTLViewport vp = { 0.0, 0.0, (double)s_width, (double)s_height, 0.0, 1.0 };
+                [enc setViewport:vp];
+            }
+
+            for (; i < run_end; i++) {
                 MtlDraw* d = &s_draws[i];
                 /* RSX_ONLY_SMALL=1: salta i quad che coprono tutto lo schermo.
                  * Il titolo ne disegna uno nero per fotogramma (di fatto un
@@ -949,6 +1125,24 @@ void rsx_metal_backend_present(void)
                   } }
                 id<MTLRenderPipelineState> pso = pso_for(d);
                 if (!pso) continue;
+                /* Il ritaglio: era tracciato in rsx_state e non arrivava mai a
+                 * Metal. Il titolo disegna migliaia di quad "a schermo pieno"
+                 * ritagliati a un rettangolo piccolo -- e' l'idioma con cui
+                 * stira una texture dentro una casella. Senza ritaglio ognuno
+                 * copriva tutto e cancellava quello prima: restava visibile
+                 * solo l'ultimo, cioe' uno schermo di tinta unita. */
+                { static int sc = -1;
+                  if (sc < 0) { const char* e = getenv("RSX_SCISSOR"); sc = (e && *e=='0') ? 0 : 1; }
+                  if (sc) {
+                      NSUInteger x = d->sx, y = d->sy, w = d->sw, h = d->sh;
+                      if (x > s_width)  x = s_width;
+                      if (y > s_height) y = s_height;
+                      if (w > s_width  - x) w = s_width  - x;
+                      if (h > s_height - y) h = s_height - y;
+                      if (w == 0 || h == 0) continue;   /* ritaglio vuoto: niente */
+                      MTLScissorRect sr = { x, y, w, h };
+                      [enc setScissorRect:sr];
+                  } }
                 [enc setRenderPipelineState:pso];
                 [enc setVertexBytes:d->mvp length:sizeof(d->mvp) atIndex:0];
                 /* The guest's program declares all sixteen units, so bind
@@ -957,15 +1151,17 @@ void rsx_metal_backend_present(void)
                  * a shader that does not sample them. */
                 if (s_sampler) {
                     for (u32 t = 0; t < RSX_MAX_TEXTURES; t++) {
-                        if (!s_tex[t].tex) continue;
-                        [enc setFragmentTexture:s_tex[t].tex atIndex:t];
+                        /* OGNI slot, non solo quelli residenti: vedi s_dummy_tex. */
+                        [enc setFragmentTexture:(s_tex[t].tex ? s_tex[t].tex : s_dummy_tex)
+                                        atIndex:t];
                         [enc setFragmentSamplerState:s_sampler atIndex:t];
                     }
                 }
                 [enc drawPrimitives:d->topology vertexStart:d->base vertexCount:d->count];
             }
+            [enc endEncoding];
+            if (i >= s_draw_count) break;
         }
-        [enc endEncoding];
 
         /* RSX_FRAMEDBG=1: una riga per fotogramma con quanto e' arrivato al
          * backend e DOVE finisce in clip space. Distingue le tre cause di uno
@@ -976,7 +1172,11 @@ void rsx_metal_backend_present(void)
           if (fd) {
               static unsigned long fno = 0;
               unsigned long n = ++fno;
-              if (n <= 8 || (n % 60) == 0) {
+              /* Un fotogramma con molti draw si stampa SEMPRE: campionando uno
+               * su 60 si perdono esattamente i fotogrammi interessanti, ed e'
+               * lo stesso errore del log tappato della sessione 19. */
+              if (n <= 8 || (n % 60) == 0 || s_draw_count > 8) {
+                  static unsigned s_szhist[4];
                   float lo[4] = { 1e30f, 1e30f, 1e30f, 1e30f };
                   float hi[4] = { -1e30f, -1e30f, -1e30f, -1e30f };
                   unsigned inside = 0;
@@ -996,13 +1196,163 @@ void rsx_metal_backend_present(void)
                               && o[2] >= 0.0f && o[2] <= o[3]) inside++;
                       }
                   }
+                  /* Quanti draw hanno davvero area sullo schermo: migliaia di
+                   * quad tutti dentro il clip ma degeneri danno lo stesso nero
+                   * di nessun draw, e dal nero non si distinguono. */
+                  unsigned degeneri = 0;
+                  for (u32 i = 0; i < s_draw_count; i++) {
+                      const MtlDraw* d = &s_draws[i];
+                      float mnx = 1e30f, mxx = -1e30f, mny = 1e30f, mxy = -1e30f;
+                      for (u32 v = d->base; v < d->base + d->count && v < s_vert_count; v++) {
+                          const float* P = s_verts[v].pos;
+                          if (P[0] < mnx) mnx = P[0];
+                          if (P[0] > mxx) mxx = P[0];
+                          if (P[1] < mny) mny = P[1];
+                          if (P[1] > mxy) mxy = P[1];
+                      }
+                      /* meno di mezzo pixel in una delle due direzioni */
+                      if ((mxx - mnx) * s_width < 1.0f || (mxy - mny) * s_height < 1.0f)
+                          degeneri++;
+                      /* istogramma delle dimensioni: dice se sono migliaia di
+                       * quad piccoli (testo/HUD) o lo stesso quad a schermo
+                       * pieno ripetuto. */
+                      { float fw = (mxx - mnx) * 0.5f, fh = (mxy - mny) * 0.5f;
+                        int b = (fw > 0.9f && fh > 0.9f) ? 3 : (fw > 0.3f || fh > 0.3f) ? 2
+                              : (fw > 0.05f || fh > 0.05f) ? 1 : 0;
+                        s_szhist[b]++; }
+                  }
+                  /* Quante superfici distinte: se sono molte, il titolo sta
+                   * disegnando fuori schermo (render-to-texture) e noi gli
+                   * mandiamo tutto sul drawable. */
+                  { u32 su[16]; u32 sc[16]; u32 ns = 0;
+                    for (u32 i = 0; i < s_draw_count; i++) {
+                        u32 k = 0; for (; k < ns; k++) if (su[k] == s_draws[i].surf) break;
+                        if (k == ns && ns < 16) { su[ns] = s_draws[i].surf; sc[ns] = 0; ns++; }
+                        if (k < 16) sc[k]++;
+                    }
+                    char b[400]; int bp = snprintf(b, sizeof b, "[RSX frame#%lu]   superfici:", n);
+                    for (u32 k = 0; k < ns && bp < (int)sizeof b - 32; k++)
+                        bp += snprintf(b + bp, sizeof b - bp, " 0x%X(%u)", su[k], sc[k]);
+                    for (u32 k = 0; k < ns && bp < (int)sizeof b - 8; k++)
+                        bp += snprintf(b + bp, sizeof b - bp, "%s",
+                                       cellGcmOffsetIsDisplay(su[k]) ? " [display]" : " [offscreen]");
+                    fprintf(stderr, "%s%s\n", b, ns >= 16 ? " ..." : ""); }
+                  /* Quanti ritagli distinti: se il titolo li usa, i quad a
+                   * schermo pieno non coprono affatto tutto lo schermo. */
+                  { u32 nsc = 0; u32 full = 0;
+                    for (u32 i2 = 0; i2 < s_draw_count; i2++) {
+                        if (s_draws[i2].sw >= s_width && s_draws[i2].sh >= s_height) full++;
+                        else nsc++;
+                    }
+                    fprintf(stderr, "[RSX frame#%lu]   ritagli: pieni=%u ristretti=%u"
+                            " (primo ristretto: %ux%u+%u+%u)\n", n, full, nsc,
+                            nsc ? s_draws[0].sw : 0, nsc ? s_draws[0].sh : 0,
+                            nsc ? s_draws[0].sx : 0, nsc ? s_draws[0].sy : 0); }
+                  fprintf(stderr, "[RSX frame#%lu]   dimensioni: minuscoli=%u piccoli=%u "
+                          "medi=%u schermo-pieno=%u\n", n,
+                          s_szhist[0], s_szhist[1], s_szhist[2], s_szhist[3]);
+                  s_szhist[0] = s_szhist[1] = s_szhist[2] = s_szhist[3] = 0;
                   fprintf(stderr,
-                          "[RSX frame#%lu] draws=%u verts=%u dentro-clip=%u  "
+                          "[RSX frame#%lu] draws=%u (degeneri=%u) verts=%u dentro-clip=%u  "
                           "x[%.2f %.2f] y[%.2f %.2f] z[%.2f %.2f] w[%.2f %.2f]\n",
-                          n, s_draw_count, s_vert_count, inside,
+                          n, s_draw_count, degeneri, s_vert_count, inside,
                           lo[0], hi[0], lo[1], hi[1], lo[2], hi[2], lo[3], hi[3]);
                   fflush(stderr);
               }
+          } }
+
+        /* RSX_DUMP_FRAME=<n>: salva su file il primo fotogramma con piu' di n
+         * draw. I fotogrammi pieni durano poche decine di millisecondi e uno
+         * screenshot da fuori li manca sistematicamente; questo li prende dal
+         * di dentro, nell'istante giusto. */
+        { static int s_df = -2; static int s_done = 0;
+          if (s_df == -2) { const char* e = getenv("RSX_DUMP_FRAME");
+                            s_df = (e && *e) ? atoi(e) : -1; }
+          if (s_df > 0 && !s_done && (int)s_draw_count > s_df) {
+              s_done = 1;
+              MTLTextureDescriptor* sd = [MTLTextureDescriptor
+                  texture2DDescriptorWithPixelFormat:MTLPixelFormatBGRA8Unorm
+                                               width:target.width
+                                              height:target.height mipmapped:NO];
+              sd.usage = MTLTextureUsageShaderRead;
+              sd.storageMode = MTLStorageModeShared;
+              id<MTLTexture> rb = [s_dev newTextureWithDescriptor:sd];
+              id<MTLBlitCommandEncoder> bl = [cb blitCommandEncoder];
+              [bl copyFromTexture:target sourceSlice:0 sourceLevel:0
+                     sourceOrigin:MTLOriginMake(0,0,0)
+                       sourceSize:MTLSizeMake(target.width, target.height, 1)
+                        toTexture:rb destinationSlice:0 destinationLevel:0
+                destinationOrigin:MTLOriginMake(0,0,0)];
+              [bl endEncoding];
+              /* Anche le superfici fuori schermo: se l'immagine vera e' li',
+               * il difetto e' nella composizione, non nel disegno. */
+              for (u32 k = 0; k < s_surf_count; k++) {
+                  if (!s_surf[k].tex) continue;
+                  const NSUInteger SW = s_surf[k].tex.width, SH = s_surf[k].tex.height;
+                  MTLTextureDescriptor* sd2 = [MTLTextureDescriptor
+                      texture2DDescriptorWithPixelFormat:MTLPixelFormatBGRA8Unorm
+                                                   width:SW height:SH mipmapped:NO];
+                  sd2.storageMode = MTLStorageModeShared;
+                  id<MTLTexture> rb2 = [s_dev newTextureWithDescriptor:sd2];
+                  if (!rb2) continue;
+                  id<MTLBlitCommandEncoder> b2 = [cb blitCommandEncoder];
+                  [b2 copyFromTexture:s_surf[k].tex sourceSlice:0 sourceLevel:0
+                         sourceOrigin:MTLOriginMake(0,0,0)
+                           sourceSize:MTLSizeMake(SW, SH, 1)
+                            toTexture:rb2 destinationSlice:0 destinationLevel:0
+                    destinationOrigin:MTLOriginMake(0,0,0)];
+                  [b2 endEncoding];
+                  s_surf_dump[k] = rb2;
+              }
+              [cb commit]; [cb waitUntilCompleted];
+              const NSUInteger W = target.width, H = target.height;
+              u8* px = (u8*)malloc(W * H * 4);
+              if (px) {
+                  [rb getBytes:px bytesPerRow:W*4
+                    fromRegion:MTLRegionMake2D(0,0,W,H) mipmapLevel:0];
+                  const char* path = "/tmp/rsx_frame.ppm";
+                  FILE* f = fopen(path, "wb");
+                  if (f) {
+                      fprintf(f, "P6\n%lu %lu\n255\n",
+                              (unsigned long)W, (unsigned long)H);
+                      for (NSUInteger i = 0; i < W*H; i++) {
+                          u8 rgb[3] = { px[i*4+2], px[i*4+1], px[i*4+0] };
+                          fwrite(rgb, 1, 3, f);
+                      }
+                      fclose(f);
+                      fprintf(stderr, "[RSX metal] fotogramma con %u draw salvato in %s\n",
+                              s_draw_count, path);
+                      fflush(stderr);
+                  }
+                  for (u32 k = 0; k < s_surf_count; k++) {
+                      if (!s_surf_dump[k]) continue;
+                      const NSUInteger SW = s_surf_dump[k].width, SH = s_surf_dump[k].height;
+                      u8* sp = (u8*)malloc(SW * SH * 4);
+                      if (!sp) continue;
+                      [s_surf_dump[k] getBytes:sp bytesPerRow:SW*4
+                                    fromRegion:MTLRegionMake2D(0,0,SW,SH) mipmapLevel:0];
+                      char sp2[128];
+                      snprintf(sp2, sizeof sp2, "/tmp/rsx_surf_%08X.ppm", s_surf[k].offset);
+                      FILE* sf = fopen(sp2, "wb");
+                      if (sf) {
+                          fprintf(sf, "P6\n%lu %lu\n255\n",
+                                  (unsigned long)SW, (unsigned long)SH);
+                          for (NSUInteger q = 0; q < SW*SH; q++) {
+                              u8 rgb[3] = { sp[q*4+2], sp[q*4+1], sp[q*4+0] };
+                              fwrite(rgb, 1, 3, sf);
+                          }
+                          fclose(sf);
+                          fprintf(stderr, "[RSX metal] superficie 0x%X salvata in %s\n",
+                                  s_surf[k].offset, sp2);
+                      }
+                      free(sp); s_surf_dump[k] = nil;
+                  }
+                  free(px);
+              }
+              if (drawable) [drawable present];
+              if (!s_headless) dispatch_semaphore_signal(s_inflight);
+              s_draw_count = 0; s_vert_count = 0;
+              return;
           } }
 
         if (drawable) [cb presentDrawable:drawable];

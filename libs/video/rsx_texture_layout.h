@@ -84,6 +84,23 @@ u32 rsx_log2_ceil(u32 v);
  * the destination and its pitch -- it needs to know nothing about swizzling,
  * channel order or block sizes.
  */
+/* Decompressione dei blocchi BC1/BC2/BC3 in RGBA8 sulla CPU.
+ *
+ * rsx_texture_decode() per un formato compresso COPIA i blocchi cosi' come
+ * sono: e' quello che serve a un backend che carica una texture BC nativa
+ * (D3D12). Il backend Metal invece crea una RGBA8 e ci copiava dentro i
+ * blocchi grezzi, che a schermo sono rumore rosso/verde/blu. Questa li
+ * decomprime davvero.
+ *
+ *   dst        RGBA8, byte 0 = R; almeno dst_pitch * h byte
+ *   dst_pitch  stride di riga in byte della destinazione
+ *   src        i blocchi, come stanno in memoria guest
+ *   w, h       dimensioni in TEXEL
+ * Non fa nulla se tl non e' compresso. */
+void rsx_texture_decode_bc(void* dst, u32 dst_pitch,
+                           const void* src, u32 w, u32 h,
+                           const rsx_tex_layout* tl);
+
 void rsx_texture_decode(void* dst, u32 dst_pitch,
                         const u8* src, u32 w, u32 h,
                         const rsx_tex_layout* tl, int argb_as_rgba);

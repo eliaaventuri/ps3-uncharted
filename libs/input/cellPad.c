@@ -584,16 +584,22 @@ s32 cellPadGetInfo(CellPadInfo2* info)
 
     pad_poll_backend();
 
+    /* Porta 0 sempre presente, come in cellPadGetData, cellPadGetInfo2 e
+     * cellPadPeriphGetInfo: questa era l'UNICA delle quattro a non farlo, e
+     * rispondeva "nessun pad" quando le altre rispondevano "pad connesso".
+     * Uncharted interroga proprio questa (NID 0x3AAAD464) e stampa "Pad 0 has
+     * been removed!", poi si pianta sulla schermata che aspetta il controller:
+     * schermo nero, due quad di HUD e nessuna geometria di scena. */
     u32 connected = 0;
     for (u32 i = 0; i < s_max_connect && i < PAD_MAX_HOST_PORTS; i++)
-        if (s_host_state[i].connected) connected++;
+        if (s_host_state[i].connected || i == 0) connected++;
 
     vm_write32(gaddr + 0x00, s_max_connect);
     vm_write32(gaddr + 0x04, connected);
     vm_write32(gaddr + 0x08, 0);                       /* system_info */
     for (u32 i = 0; i < CELL_PAD_MAX_PORT_NUM; i++) {
         int on = (i < s_max_connect && i < PAD_MAX_HOST_PORTS &&
-                  s_host_state[i].connected);
+                  (s_host_state[i].connected || i == 0));
         vm_write16(gaddr + 0x0C + i * 2, on ? 0x054C : 0);   /* vendor: Sony  */
         vm_write16(gaddr + 0x1A + i * 2, on ? 0x0268 : 0);   /* product: DS3  */
         vm_write8(gaddr + 0x28 + i, on ? CELL_PAD_STATUS_CONNECTED : 0);

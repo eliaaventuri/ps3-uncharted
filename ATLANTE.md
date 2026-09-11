@@ -41,7 +41,8 @@ libs/spurs/spurs_taskset.c   taskset HLE
 libs/spurs/spurs_pm.c        contesto del policy module
 libs/sync/cellSyncLFQueue.c  cellSync LFQueue lato PPU (e la riserva di linea condivisa)
 libs/video/cellGcmSys.c      FIFO RSX: walker (drain), fence/ref, flip, GCM_STRAND_FIX
-libs/video/rsx_metal_backend.m  backend Metal
+libs/video/rsx_metal_backend.m  backend Metal (modalita immediata, render-to-texture, scissor)
+libs/video/rsx_texture_layout.c decodifica texture: swizzle, formati, decompressione BC
 libs/video/rsx_dispatch.c    decodifica metodi NV40 -> backend
 libs/video/rsx_*decompiler.c vertex/fragment program -> MSL
 libs/system/, libs/filesystem/, libs/audio/, libs/input/, ...  HLE delle librerie cell*

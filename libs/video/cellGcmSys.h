@@ -423,6 +423,11 @@ s32 cellGcmSetInvalidateTile(u8 index);
 /* EA IO address remap (stub) */
 void cellGcmSortRemapEaIoAddress(void);
 
+/* Interrogazione dal backend (non e' una API guest): questo offset RSX e' un
+ * display buffer registrato? Serve a separare i disegni destinati allo schermo
+ * dai passaggi fuori schermo (render-to-texture). */
+int cellGcmOffsetIsDisplay(u32 offset);
+
 /* Report data with location */
 CellGcmReportData* cellGcmGetReportDataAddressLocation(u32 index, u32 location);
 u32 cellGcmGetReportDataLocation(u32 index, u32 location);
