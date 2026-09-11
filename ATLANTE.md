@@ -3,7 +3,8 @@
 Una riga per cartella o file chiave. Non mappa `build/`, `graphify-out/`,
 `.venv/`, `__pycache__/`, binari. I dati del titolo stanno FUORI dal repo, in
 `~/Documents/Coding/uncharted-data/` (EBOOT.elf, recomp/, gen/, obj/, run.sh,
-build.sh, il port `uncharted`).
+build.sh, il port `uncharted`, `runfor.sh <s> <log> [VAR=..]` = corsa a tempo
+con `kill -9` finale: il port ignora SIGTERM, senza -9 restano orfani).
 
 ```
 CLAUDE.md                 regole del fork; docs/STATO.md e' la memoria operativa

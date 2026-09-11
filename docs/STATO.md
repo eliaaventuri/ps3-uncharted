@@ -60,6 +60,18 @@ ora e' il walker della FIFO RSX, che ricomincia i segmenti da capo migliaia di
 volte e il titolo stampa `Command context has run out of memory!`. Dettagli in
 "Sessione 23".
 
+**Dalla sessione 25 il caricamento finisce come deve.** Il walker era
+innocente: due thread del titolo scrivevano nello stesso command buffer perche'
+`GameInit` non arrivava a fermare il thread della moneta -- un parser di testo
+aveva uno switch che il lifter non risolveva (la ricerca della base della
+tabella si fermava a un `blr` intermedio) e ogni giro del ciclo di parsing
+diventava una chiamata annidata, fino al cap di ricorsione del runtime. Fix
+nel lifter (`tools/ppu_lifter.py`): 107 switch in piu' risolti in tutto l'ELF,
+`Audio prototypes loaded; 2429 total`, il thread della moneta esce, "segmento
+senza uscita" e "run out of memory" a zero. Ora il main loop gira a ~30
+fotogrammi/s ma vuoti (stato NDI/menu): e' il fronte della sessione 26.
+Dettagli in "Sessione 25".
+
 Quanto arriva a fare, dal log:
 
 - supera `sys_initialize_tls` (dove il boot upstream si fermava);
@@ -353,6 +365,115 @@ La lista dei comandi ora viene percorsa fino in fondo — sei coppie
 risultati in memoria principale.** Non era mai successo in nessuna sessione.
 Riproducibile: **tre corse su tre**, identiche -- 14 comandi, un overlay
 residente, zero microstep, cinque stall e due interrupt per corsa.
+
+## Sessione 25 — il walker era innocente: due thread scrivevano nello stesso command buffer, per un salto mal liftato
+
+(La sessione 24 ha prodotto solo strumenti e 14 corse, senza note: qui c'e' anche
+quello che ha lasciato in sospeso.)
+
+### 1. Cosa faceva davvero il walker
+
+Con `GCM_SEQ=1` + tid guest nei `[SEQ]` e `GCM_RINGDBG=1` (che ora stampa anche
+il command context del titolo, `C = *(*(toc-0x7DB8) - 0x7FB4)` = 0x1068B1A4:
+begin/end/current/callback, i due buffer IO 0x660000/0x860000, frame index):
+
+- Il titolo ha UN solo context, doppio buffer per fotogramma; `SwapBuffers`
+  (0x14F528) scrive nello slot dell'anello `[SET_REF n][JUMP -> begin(buffer)]`
+  e al `C.current` il JUMP di coda verso lo slot successivo (0x704F30), poi
+  muove `put`. `cellGcm_on_put_write` cammina tutto in modo sincrono: se le
+  scritture precedono `put`, il walker le vede. Tutto corretto.
+- Il "segmento senza uscita" (zeri a 0x660930/0x860930) nasce perche' **due
+  thread guest emettono nello stesso context nello stesso momento**: tid 4
+  ("Init", prio 30) disegna la moneta (`func_0004C880`, 566 parole) e tid 1
+  (main) disegna il suo fotogramma (`func_0004D238`). Il secondo sovrascrive
+  il JUMP di coda del primo con i propri comandi, e il walker arriva alla
+  testa di scrittura. Le 12.633 draw e i blocchi colorati sono lo stesso
+  caos. Sull'hardware vero non succede: il ciclo della moneta esce quando il
+  main gli scrive il flag `0x1018B019` (fine di `GameInit` 0x4E568, a 0x4F7C4)
+  e poi aspetta `0x100A15EC == 0` prima di partire col main loop.
+
+### 2. Perche' il main loop partiva senza chiudere la moneta
+
+`GameInit` non arrivava a 0x4F7C4: fra `lr 0x4F108` e `lr 0x4F124` (parsing di
+`sound1/config/prototypes.txt`) il log dice
+`[ppu] recursion cap @0x0068E110 depth=4001 -- skipping`, poi
+`Audio prototypes loaded; 0 total.` e una riga `Global, ...` con il nome file
+sostituito da un pezzo del testo dei prototipi. Da li' il puntatore di stack
+guest r1 resta spostato di -0x2D90 (misurato con `FLOW_WVAL` sugli indirizzi
+di ritorno salvati: i callee di GameInit salvano lr a 0x0FEFF9E0 prima e a
+0x0FEFCC50 dopo), GameInit legge i propri locali dal posto sbagliato e
+"ritorna" a `func_000EAD40` con r1 falso; il main loop parte con la moneta
+ancora viva.
+
+**La causa e' nel lifter.** `func_0068D918` (parser di testo, 2842 istruzioni,
+frame 0x1C70) ha uno switch a 0x68E134 con tabella di offset a due livelli
+(`lwz r11,-0x7F5C(r30)`, r30 = `lwz r30,-0x755C(r2)` nel prologo a 0x68D924).
+`discover_jump_tables` cercava la definizione di r30 all'indietro fino al
+`blr` piu' vicino -- e c'e' un `blr` (return anticipato) a 0x68DB08, prima del
+prologo. Tabella non risolta -> il `bctr` diventa `ps3_indirect_call` -> ogni
+`b 0x68E114` (torna in cima al ciclo di parsing) e' una chiamata annidata ->
+4001 livelli -> il cap del runtime salta la chiamata. Fix in
+`tools/ppu_lifter.py`: la ricerca si ferma al prologo (`stdu r1,-N(r1)`) invece
+che al `blr`, con il `blr` come ripiego se non c'e' prologo entro 8000
+istruzioni. **Esito del rilift: dispatcher risolti 138 -> 245 in tutto l'ELF; `recursion
+cap` sparito; `Audio prototypes loaded; 2429 total` (era 0); GameInit scrive
+0x1018B019, il thread della moneta esce (`sys_ppu_thread_exit(tid=4)`), poi
+parte il main loop. In 3 corse da 100-180 s: "segmento senza uscita" 0 (era
+1000-2000), "Command context has run out of memory" 0, "Rendering is stuck" 0.**
+
+### 3. Nota: cellDiscGameGetBootDiscInfo
+
+`libs/system/cellSysutil.c` scrive il titleId nella struct del titolo PRIMA di
+decidere se rispondere NOT_DISCBOOT: con `PS3_DISCGAME_BOOT=0` il titolo si
+troverebbe comunque "BLES00000" a 0x10189BA8. Non e' la causa di niente qui
+(il PARAM.SFO dell'ISO dice CATEGORY=DG, TITLE_ID=BCES00065: e' il disco
+retail europeo, non la demo NPUA98103), ma RPCS3 non scrive nulla in quel
+caso. Da sistemare quando serve.
+
+### Strumenti nuovi (sessione 24+25)
+
+- `GCM_RINGDBG=1`: a ogni mossa di `put`, slot dell'anello, coda dei segmenti,
+  command context del titolo, flag della transizione caricamento->gioco
+  (quit 0x101879C5, abort 0x10189BA8, stop 0x1018B018, exit-ok 0x1018B019,
+  coin-on 0x100A15EC).
+- `GCM_PUT_BT=lo:hi`: catena guest (con tid) di chi muove `put` con ref in
+  [lo,hi]. `PS3_TTY_BT='a|b|c'`: catena guest quando il titolo stampa una di
+  quelle sottostringhe. `[GCS:...]` ora porta `tid=`.
+- `YDKJ_WWATCH=a1,a2,...` (fino a 8 finestre) e ora vede anche gli store a
+  byte. `FLOW_WVAL=v1,v2,...`: piu' valori; usato per seguire gli lr salvati
+  nei prologhi = "quali chiamate sono avvenute e con quale r1".
+- `GCM_SEQ_RAW=1`, `GCM_JMPWATCH`, `GCM_STRAND_LATE=1` (sessione 24).
+- `scratchpad/runfor.sh <s> <log> [VAR=..]`: lancia, aspetta, `kill -9`,
+  verifica. **Il port ignora SIGTERM**: `kill`/`pkill` semplici lasciano il
+  processo vivo (16 orfani trovati a meta' sessione, tutte le misure di quel
+  tratto erano a macchina piena; le conclusioni strutturali sono state
+  riverificate a macchina pulita).
+
+### Il fronte ora: il main loop presenta fotogrammi vuoti
+
+Dopo l'uscita della moneta (~10 s dall'avvio) il main loop emette ~30
+fotogrammi/s tutti uguali (`GCM_SEGDUMP=300`): superficie 1280x720, clear,
+viewport, scissor, i 5 semafori, JUMP -- **nessun draw e nessuna CALL** a
+display list. `RSX_FRAMESTAT=300`: "0 draw in 0 fotogrammi non vuoti" per
+tutto il resto della corsa. Il titolo e' nello stato "main-menu-ndi" (task
+prefetch `main-menu-autosave-warning`, `main-menu-ndi`, audio
+`sce-ndi-logos.xvag`), non stampa errori, e il thread principale ogni tanto
+gira su 0x20000000 (`[HOTREAD]`, attesa del job manager, 48 volte in 150 s:
+periodica, non permanente). Ipotesi da verificare, in ordine: (1) aspetta un
+input (X/START) che nessuno preme; (2) aspetta lo stream audio/xvag o un
+movie (VDEC caricato, `movie1/` letta); (3) un job SPU che non consegna.
+`GCM_PUT_BT` con ref alto e `PS3_TTY_BT` restano gli strumenti giusti.
+
+Nota: lo screenshot via `CGWindowListCopyWindowInfo` da questa shell non vede
+la finestra (permessi); i `RSX_DUMP_FRAME=1` funzionano (frame della moneta a
+2 draw). Da ripristinare un modo per fotografare lo schermo.
+
+### Il prossimo passo
+
+1. Capire cosa aspetta il main loop nello stato NDI/menu (sopra).
+2. Poi ricontrollare draw/fotogramma e la texture 0x06312F00 (sessione 23),
+   che ora dovrebbero essere un problema diverso o sparito.
+
 
 ## Sessione 23 — lo stallo intermittente erano due tabelle da 8 slot nel runtime SPU
 

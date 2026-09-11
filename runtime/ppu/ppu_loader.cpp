@@ -24,6 +24,7 @@
 #include "../platform/win32_backtrace.h"   /* RtlCaptureStackBackTrace / GetModuleHandleA on POSIX */
 #include "../platform/win32_compat.h"      /* LONG/SIZE_T, _Interlocked*, YieldProcessor on POSIX */
 extern "C" uint32_t ppu_prof_resolve_host(void* ra);
+extern "C" void ppu_guest_callstack(const char* tag);
 
 /* Resolve the GUEST function on the host stack (closest lifted entry below
  * each frame) -- the same trick the [BLOCK] profiler uses. */
@@ -689,6 +690,9 @@ static unsigned seq_tid(void)
     static _Thread_local unsigned id = 0;
     static unsigned next = 1;
     if (!id) id = __atomic_fetch_add(&next, 1u, __ATOMIC_RELAXED);
+    /* Il numero e' quello del thread GUEST (sys_ppu_thread_create tid=N), non
+     * l'ordine di apparizione: cosi' si legge chi e' il thread che disegna. */
+    if (g_active_ctx && g_active_ctx->thread_id) return (unsigned)g_active_ctx->thread_id + 100u;
     return id;
 }
 
@@ -1038,14 +1042,40 @@ static inline void barrier_watch_hit(uint32_t a, uint32_t v, int width, void* ra
 }
 /* Finestra della watch: 0x40 byte bastano per una struttura, non per un
  * pezzo di command buffer. YDKJ_WWATCH_LEN la allarga. */
+/* FLOW_WVAL=v1[,v2,...] (hex): fino a 8 valori. Ritorna 1 se `v` e' uno di
+ * essi -- serve a vedere in una corsa sola quali indirizzi di ritorno (lr
+ * salvato nel prologo) vengono scritti, cioe' quali chiamate avvengono. */
+static int flow_wval_hit(uint32_t v)
+{
+    static uint32_t w[8]; static int nw = -1;
+    if (nw < 0) { nw = 0; const char* e = getenv("FLOW_WVAL");
+        while (e && *e && nw < 8) { char* q = 0; w[nw++] = (uint32_t)strtoul(e, &q, 16); if (!q || *q != ',') break; e = q + 1; } }
+    for (int i = 0; i < nw; i++) if (v == w[i]) return 1;
+    return 0;
+}
 static uint32_t ydkj_wwatch_len(void)
 {
     static int32_t n = -1;
     if (n < 0) { const char* e = getenv("YDKJ_WWATCH_LEN"); n = (e && *e) ? (int32_t)strtoul(e,0,0) : 0x40; }
     return (uint32_t)n;
 }
+/* YDKJ_WWATCH=a1[,a2,...]: fino a 8 finestre (stessa lunghezza), per seguire
+ * in una corsa sola piu' flag sparsi. Ritorna 1 se `ea` cade in una. */
+static int ydkj_wwatch_hit(uint32_t ea)
+{
+    static int64_t w[8]; static int nw = -1;
+    if (nw < 0) { nw = 0; const char* e = getenv("YDKJ_WWATCH");
+        while (e && *e && nw < 8) { char* q = 0; w[nw++] = (int64_t)strtoul(e, &q, 0); if (!q || *q != ',') break; e = q + 1; } }
+    for (int i = 0; i < nw; i++) if (ea >= (uint32_t)w[i] && ea < (uint32_t)w[i] + ydkj_wwatch_len()) return 1;
+    return 0;
+}
 
 void vm_write8 (uint64_t a, uint8_t  v) { barrier_watch_hit((uint32_t)a, v, 1, __builtin_return_address(0)); if (vm_oob((uint32_t)a,1)) return;
+    /* YDKJ_WWATCH copre anche gli store a byte: i flag "ho finito" del
+     * titolo sono bool, e senza questo una watch su di essi restava muta. */
+    { static int64_t w=-2; if (w==-2) { const char* e=getenv("YDKJ_WWATCH"); w = e?(int64_t)strtoul(e,0,0):-1; }
+      if (w>=0) { uint32_t ea=(uint32_t)a; if (ydkj_wwatch_hit(ea))
+        fprintf(stderr,"[WWATCH] write8 0x%08X = 0x%02X  guest-fn=0x%08X\n", ea, v, ppu_prof_resolve_host(__builtin_return_address(0))); } }
 #ifdef _WIN32
     /* FLOW_TRUNC=<hex>: catch the byte-write that clobbers the word currently
      * holding <hex> (e.g. a null-terminator overflow zeroing a pointer's high byte). */
@@ -1097,20 +1127,33 @@ void vm_write8 (uint64_t a, uint8_t  v) { barrier_watch_hit((uint32_t)a, v, 1, _
     vm_base[(uint32_t)a] = v; }
 void vm_write16(uint64_t a, uint16_t v) { barrier_watch_hit((uint32_t)a, v, 2, __builtin_return_address(0)); if (vm_oob((uint32_t)a,2)) return;
     { static int64_t w=-2; if (w==-2) { const char* e=getenv("YDKJ_WWATCH"); w = e?(int64_t)strtoul(e,0,0):-1; }
-      if (w>=0) { uint32_t ea=(uint32_t)a; if (ea>=(uint32_t)w && ea<(uint32_t)w+ydkj_wwatch_len())
+      if (w>=0) { uint32_t ea=(uint32_t)a; if (ydkj_wwatch_hit(ea))
         fprintf(stderr,"[WWATCH] write16 0x%08X = 0x%04X  ra=%p\n", ea, v, __builtin_return_address(0)); } }
     v = __builtin_bswap16(v); memcpy(vm_base + (uint32_t)a, &v, 2); }
 extern "C" uint32_t g_gcm_put_watch_addr;
 extern "C" void cellGcm_on_put_write(void);
 
 void vm_write32(uint64_t a, uint32_t v) { barrier_watch_hit((uint32_t)a, v, 4, __builtin_return_address(0)); if (vm_oob((uint32_t)a,4)) return;
+    /* GCM_JMPWATCH=<ea_lo>:<ea_hi>: ogni parola di JUMP (tipo 1) o di ring che
+     * il titolo scrive in [lo,hi): dice DOVE e QUANDO piazza le code dei
+     * segmenti della FIFO, insieme alle mosse di `put` (GCM_RINGDBG). */
+    { static int64_t jl = -2, jh = -1;
+      if (jl == -2) { const char* e = getenv("GCM_JMPWATCH"); jl = -1;
+          if (e) { char* q = 0; jl = (int64_t)strtoul(e, &q, 16); jh = (q && *q == ':') ? (int64_t)strtoul(q + 1, 0, 16) : jl + 0x1000; } }
+      /* solo i JUMP verso l'anello (0x1xxxx) o i segmenti: i float dei vertici
+       * (0x3F800000...) hanno lo stesso bit 29 e inonderebbero il log. */
+      if (jl >= 0 && (uint32_t)a >= (uint32_t)jl && (uint32_t)a < (uint32_t)jh && (v >> 29) == 1 &&
+          ((v & 0x1FFFFFFFu) < 0x00100000u || (v & 0x000FFFFFu) == 0)) {
+          static int _n = 0; if (_n++ < 3000)
+              fprintf(stderr, "[jmpw] ea=%08X = %08X (JUMP->%08X) guest-fn=0x%08X\n",
+                      (uint32_t)a, v, v & 0x1FFFFFFCu, ppu_prof_resolve_host(__builtin_return_address(0))); } }
 #ifdef _WIN32
     /* PT restore: a full-word store of a valid pointer (high byte set) to a
      * previously-truncated slot clears the record (that truncation was transient). */
     if (g_pt_val>=0 && (v>>24)!=0) pt_restore((uint32_t)a);
 #endif
     { static int64_t w=-2; if (w==-2) { const char* e=getenv("YDKJ_WWATCH"); w = e?(int64_t)strtoul(e,0,0):-1; }
-      if (w>=0) { uint32_t ea=(uint32_t)a; if (ea>=(uint32_t)w && ea<(uint32_t)w+ydkj_wwatch_len()) {
+      if (w>=0) { uint32_t ea=(uint32_t)a; if (ydkj_wwatch_hit(ea)) {
 #ifdef _WIN32
         /* Full host backtrace, not just ra: lifted `bl` is a plain C call, so the
          * host stack walks through every lifted caller INCLUDING vtable dispatch
@@ -1157,7 +1200,7 @@ void vm_write32(uint64_t a, uint32_t v) { barrier_watch_hit((uint32_t)a, v, 4, _
     /* FLOW_WVAL=<hex>: catch the instruction that STORES this value to a non-rodata
      * dest (e.g. a metaclass list node corrupted with a format-string pointer). */
     { static int64_t wv=-2; if (wv==-2){ const char* e=getenv("FLOW_WVAL"); wv=e?(int64_t)strtoul(e,0,16):-1; }
-      if (wv>=0 && v==(uint32_t)wv) { static int _n=0; if(_n++<40){
+      if (wv>=0 && flow_wval_hit(v)) { static int _n=0; if(_n++<40){
         fprintf(stderr,"[WVAL] write32 0x%08X = 0x%08X  (lastread: [0x%08X]=0x%08X %s)\n",
                 (uint32_t)a,v, g_last_rd_addr, g_last_rd_val,
                 (g_last_rd_val==(uint32_t)wv)?"<-COPIED-FROM-HERE":"(value NOT from last read = COMPUTED/origin)");
@@ -1242,8 +1285,16 @@ void vm_write32(uint64_t a, uint32_t v) { barrier_watch_hit((uint32_t)a, v, 4, _
          * l'INTERVALLO di ogni raffica, non ogni parola. Cosi' si vede se una
          * raffica cade dopo il JUMP di coda -- cioe' se il titolo riscrive il
          * segmento che la RSX deve ancora attraversare. */
-        static uint32_t run_lo = 0, run_hi = 0; static int run_open = 0;
+        /* Per thread: due thread del titolo emettono a turno, e uno stato
+         * condiviso fondeva le loro raffiche in un solo intervallo. */
+        static PPU_THREAD_LOCAL uint32_t run_lo = 0, run_hi = 0; static PPU_THREAD_LOCAL int run_open = 0;
         int is_seg = (ea >= 0x21660000u && ea < 0x21A60000u);
+        /* GCM_SEQ_RAW=1: ogni singola scrittura nei segmenti (prime 6000),
+         * senza coalescenza: l'ordine esatto fra batch e JUMP di coda. */
+        { static int raw = -1; if (raw < 0) raw = getenv("GCM_SEQ_RAW") ? 1 : 0;
+          if (raw && is_seg) { static int rn = 0; if (rn++ < 6000)
+              fprintf(stderr, "[SEQ] W %08X = %08X t%u fn=0x%08X\n", ea, gv, seq_tid(),
+                      ppu_prof_resolve_host(__builtin_return_address(0))); } }
         if (is_seg) { if (!run_open) { run_open = 1; run_lo = run_hi = ea; }
                       if (ea < run_lo) run_lo = ea; if (ea > run_hi) run_hi = ea; }
         else if (run_open && ((g_gcm_put_watch_addr && ea == g_gcm_put_watch_addr) ||
@@ -1264,7 +1315,19 @@ void vm_write32(uint64_t a, uint32_t v) { barrier_watch_hit((uint32_t)a, v, 4, _
               fprintf(stderr, "[SEQ] JUMP  [%08X] = %08X   fn=0x%08X t%u\n",
                       ea, gv, ppu_prof_resolve_host(__builtin_return_address(0)), seq_tid()); n++;
           } } } }
-    if (g_gcm_put_watch_addr && (uint32_t)a == g_gcm_put_watch_addr) cellGcm_on_put_write(); }
+    if (g_gcm_put_watch_addr && (uint32_t)a == g_gcm_put_watch_addr) {
+        /* GCM_PUT_BT=lo:hi -- catena di chiamata guest di CHI muove `put`
+         * mentre il fence pubblicato (ctrl+8) sta in [lo,hi]: quali thread, e
+         * da quale ciclo, fanno SwapBuffers attorno alla transizione
+         * caricamento -> gioco. */
+        { static long lo = -2, hi = -1;
+          if (lo == -2) { const char* e = getenv("GCM_PUT_BT"); lo = -1;
+              if (e) { char* q = 0; lo = strtol(e, &q, 10); hi = (q && *q == ':') ? strtol(q + 1, 0, 10) : lo + 4; } }
+          if (lo >= 0) { long r = (long)vm_read32(g_gcm_put_watch_addr + 8);
+              if (r >= lo && r <= hi) {
+                  fprintf(stderr, "[put-bt] ref=%ld put=%08X\n", r, __builtin_bswap32(v));
+                  ppu_guest_callstack("put"); } } }
+        cellGcm_on_put_write(); } }
 void vm_write64(uint64_t a, uint64_t v) {
     /* A 64-bit std used to be invisible to LBP_WW / LBP_WV: only write8/16/32
      * fed the watch, so "nothing writes this field" was a routine false
@@ -1276,15 +1339,15 @@ void vm_write64(uint64_t a, uint64_t v) {
     barrier_watch_hit((uint32_t)a + 4, (uint32_t)v,         8, __builtin_return_address(0));
     if (vm_oob((uint32_t)a,8)) return;
     { static int64_t w=-2; if (w==-2) { const char* e=getenv("YDKJ_WWATCH"); w = e?(int64_t)strtoul(e,0,0):-1; }
-      if (w>=0) { uint32_t ea=(uint32_t)a; if (ea>=(uint32_t)w && ea<(uint32_t)w+ydkj_wwatch_len()) {
+      if (w>=0) { uint32_t ea=(uint32_t)a; if (ydkj_wwatch_hit(ea)) {
         void* ra=__builtin_return_address(0); char* mb=(char*)GetModuleHandleA(NULL);
         fprintf(stderr,"[WWATCH] write64 0x%08X = 0x%016llX  ra_rva=0x%llX guest-fn=0x%08X\n", ea, (unsigned long long)v, (unsigned long long)((char*)ra-mb), ppu_prof_resolve_host(ra)); } } }
     /* FLOW_WVAL (64-bit): catch a 64-bit store whose HIGH or LOW 32-bit half equals
      * the watched value — the blind spot for the vm_write32-only FLOW_WVAL hook. */
     { static int64_t wv=-2; if(wv==-2){const char*e=getenv("FLOW_WVAL"); wv=e?(int64_t)strtoul(e,0,16):-1;}
       if(wv>=0){ uint32_t hi=(uint32_t)(v>>32), lo=(uint32_t)v;
-        if(hi==(uint32_t)wv||lo==(uint32_t)wv){ static int _n=0; if(_n++<24){
-          uint32_t dst=(hi==(uint32_t)wv)?(uint32_t)a:(uint32_t)a+4;
+        if(flow_wval_hit(hi)||flow_wval_hit(lo)){ static int _n=0; if(_n++<24){
+          uint32_t dst=flow_wval_hit(hi)?(uint32_t)a:(uint32_t)a+4;
           uint32_t vtgt = g_vcall_sp>0 ? g_vcall_stk[g_vcall_sp-1] : 0;
           fprintf(stderr,"[WVAL64] write64 0x%08X (poison half @0x%08X) v=0x%016llX  active-vcall=func_%08X (depth %d)\n",(uint32_t)a,dst,(unsigned long long)v,vtgt,g_vcall_sp);
 #ifdef _WIN32
@@ -2309,6 +2372,19 @@ extern "C" void lv2_syscall(ppu_context* ctx)
             /* Le ripetizioni identiche consecutive vengono collassate: vedi
              * ps3_tty_dedup in runtime/syscalls/lv2_register.c. */
             if (n && !ps3_tty_dedup(tty, n)) fwrite(tty, 1, n, out);
+            /* PS3_TTY_BT=<sottostringa>: catena di chiamata guest (dallo
+             * stack host) quando il titolo stampa quel testo -- per trovare
+             * CHI decide "Command context has run out of memory". */
+            { static const char* s_bt = (const char*)-1;
+              if (s_bt == (const char*)-1) s_bt = getenv("PS3_TTY_BT");
+              if (s_bt && n) { tty[n] = 0;
+                  int hit = 0; { const char* p = s_bt; while (*p && !hit) { const char* q = strchr(p, '|'); size_t L = q ? (size_t)(q - p) : strlen(p);
+                      char pat[128]; if (L >= sizeof pat) L = sizeof pat - 1; memcpy(pat, p, L); pat[L] = 0;
+                      if (L && strstr(tty, pat)) hit = 1; p = q ? q + 1 : p + strlen(p); } }
+                  if (hit) {
+                      fprintf(stderr, "[tty-bt] \"%.60s\" lr=0x%08X\n", tty, (uint32_t)ctx->lr);
+                      ppu_guest_callstack("tty");
+                  } } }
         }
         fflush(out);
         if (pwl) vm_write32(pwl, len);
@@ -2762,11 +2838,15 @@ extern "C" void ydkj_host_bt(const char* tag)
  * unlike the guest-sp back-chain, which breaks on SPURS threads / non-standard
  * frames. Trampolined tail-calls (g_trampoline_fn) flatten and won't appear, so
  * this is paired with the raw-stack scan in ppu_dump_guest_stack for coverage. */
+#ifndef _WIN32
+#include <execinfo.h>
+#endif
 extern "C" void ppu_guest_callstack(const char* tag)
 {
 #ifdef _WIN32
     void* bt[48]; unsigned short fr = RtlCaptureStackBackTrace(0, 48, bt, 0);
-    char gs[1500]; int gp = snprintf(gs, sizeof gs, "[GCS:%s] host-bt->guest:", tag ? tag : "?");
+    char gs[1500]; int gp = snprintf(gs, sizeof gs, "[GCS:%s] tid=%llu host-bt->guest:", tag ? tag : "?",
+                                     (unsigned long long)(g_active_ctx ? g_active_ctx->thread_id : 0));
     uint32_t last = 0;
     for (int i = 0; i < fr && gp < 1400; i++) {
         uintptr_t tgt = (uintptr_t)bt[i];
@@ -2795,7 +2875,24 @@ extern "C" void ppu_guest_callstack(const char* tag)
       fprintf(stderr, "%s\n", rs); }
     fprintf(stderr, "%s\n", gs); fflush(stderr);
 #else
-    (void)tag;
+    /* POSIX: stessa mappa host->guest via backtrace(3). */
+    void* bt[48]; int fr = backtrace(bt, 48);
+    char gs[1500]; int gp = snprintf(gs, sizeof gs, "[GCS:%s] tid=%llu host-bt->guest:", tag ? tag : "?",
+                                     (unsigned long long)(g_active_ctx ? g_active_ctx->thread_id : 0));
+    uint32_t last = 0;
+    for (int i = 0; i < fr && gp < 1400; i++) {
+        uintptr_t tgt = (uintptr_t)bt[i];
+        uint32_t bg = 0; uintptr_t bh = 0;
+        for (uint64_t k = 0; k < function_table_count; k++) {
+            uintptr_t h = (uintptr_t)function_table[k].func;
+            if (h <= tgt && h > bh) { bh = h; bg = function_table[k].addr; }
+        }
+        if (bg && (tgt - bh) < 0x8000 && bg != last) {
+            gp += snprintf(gs+gp, sizeof(gs)-gp, " func_%08X+0x%llX", bg, (unsigned long long)(tgt-bh));
+            last = bg;
+        }
+    }
+    fprintf(stderr, "%s\n", gs); fflush(stderr);
 #endif
 }
 

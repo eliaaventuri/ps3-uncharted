@@ -1294,12 +1294,118 @@ void cellGcm_rsx_process_fifo(void)
  * guest (i fence), e quelle scritture ripassano dallo stesso hook. */
 uint32_t g_gcm_put_watch_addr = 0;
 
+/* GCM_RINGDBG=1: fotografia della memoria del titolo nell'istante in cui
+ * muove `put` -- l'unico istante che conta per la RSX vera. Stampa put/get,
+ * i 4 slot dell'anello (IO 0x10000..0x13000: SET_REFERENCE, valore, JUMP) e,
+ * per ogni segmento puntato da uno slot, le prime parole e il primo JUMP che
+ * contiene (la coda). Prime 200 mosse. */
+static void gcm_ringdbg(u32 put)
+{
+    static int s_on = -1; static unsigned n = 0;
+    if (s_on < 0) s_on = getenv("GCM_RINGDBG") ? 1 : 0;
+    /* GCM_SEGDUMP=<k>: alla k-esima mossa di `put`, tutte le parole del
+     * segmento a cui salta lo slot corrente, fino al JUMP di coda (max 512):
+     * cosa c'e' in un fotogramma del main loop che non produce draw. */
+    { static long k = -2; static unsigned nn = 0;
+      if (k == -2) { const char* e = getenv("GCM_SEGDUMP"); k = e ? strtol(e, 0, 10) : -1; }
+      if (k >= 0 && (long)nn++ == k) {
+          u32 sl = put - 8, e2 = gcm_io2ea(sl + 8); u32 j = e2 ? vm_read32(e2) : 0;
+          /* lo slot corrente ha ancora JUMP=0: il segmento e' quello dello slot precedente */
+          u32 prev = (sl >= 0x11000) ? sl - 0x1000 : 0x13000; u32 e3 = gcm_io2ea(prev + 8); u32 jp = e3 ? vm_read32(e3) : 0;
+          u32 tgt = ((j >> 29) == 1) ? (j & 0x1FFFFFFCu) : (jp & 0x1FFFFFFCu);
+          fprintf(stderr, "[segdump] put=%08X slot=%08X jump=%08X prev-jump=%08X -> seg %08X\n", put, sl, j, jp, tgt);
+          /* si cammina per comandi (intestazione + argomenti), non parola per
+           * parola: un argomento con il bit 29 acceso non e' un JUMP */
+          u32 io = tgt; int steps = 0;
+          while (steps++ < 400) { u32 e = gcm_io2ea(io); if (!e) break; u32 w = vm_read32(e);
+              if ((w >> 29) == 1) { fprintf(stderr, "\n   %08X  <- JUMP -> %08X", w, w & 0x1FFFFFFCu); break; }
+              if ((w & 3) == 2) { fprintf(stderr, "\n   %08X  <- CALL -> %08X", w, w & 0x1FFFFFFCu); io += 4; continue; }
+              if (w == 0x00020000u) { fprintf(stderr, "\n   %08X  <- RET", w); io += 4; continue; }
+              u32 cnt = (w >> 18) & 0x7FFu, m = w & 0x1FFCu;
+              fprintf(stderr, "\n   %08X m=%04X n=%-3u", w, m, cnt);
+              for (u32 q = 1; q <= cnt && q <= 12; q++) { u32 e2 = gcm_io2ea(io + q * 4); fprintf(stderr, " %08X", e2 ? vm_read32(e2) : 0); }
+              if (cnt > 12) fprintf(stderr, " ...");
+              if (w == 0) { io += 4; continue; }
+              io += 4 + cnt * 4; }
+          fprintf(stderr, "\n"); } }
+    if (!s_on || n++ >= 200) return;
+    fprintf(stderr, "[ring] put=%08X get=%08X ref=%u\n", put, s_fifo_getoff,
+            vm_read32(GCM_CONTROL_GUEST_ADDR + 8));
+    /* Il command context del titolo (SwapBuffers 0x14F528: G = *(toc-0x7DB8),
+     * C = *(G-0x7FB4); C+0 begin, +4 end, +8 current, +0x18/+0x1C i due
+     * buffer per fotogramma). Dice se `current` e' dove il titolo ha scritto. */
+    { u32 G = vm_read32(0x007D3190u - 0x7DB8u), C = G ? vm_read32(G - 0x7FB4u) : 0;
+      { fprintf(stderr, "[ring]   ctx G=%08X C=%08X:", G, C);
+               for (u32 q = 0; q < 16; q++) fprintf(stderr, "%s%08X", (q == 8) ? " | " : " ", vm_read32(C + q * 4));
+               fprintf(stderr, "\n"); }
+      /* Il contesto che usa il ciclo della moneta (func_0004C880: r27 =
+       * *(G2-0x7CE4) = 0x108DAB44, passato alle Ice::Render). E' lo stesso C? */
+      /* I flag del passaggio caricamento -> gioco (GameInit 0x4E568): quit
+       * 0x101879C5, abort 0x10189BA8, stop-moneta 0x1018B018, moneta-puo'-
+       * uscire 0x1018B019, moneta-attiva 0x100A15EC. */
+      { extern uint8_t vm_read8(unsigned int);
+        fprintf(stderr, "[ring]   flags quit=%u abort=%08X stop=%u exit-ok=%u coin-on=%u\n",
+                vm_read8(0x101879C5u), vm_read32(0x10189BA8u), vm_read8(0x1018B018u),
+                vm_read8(0x1018B019u), vm_read8(0x100A15ECu)); }
+      { u32 p2 = vm_read32(0x108DAB44u);
+        fprintf(stderr, "[ring]   coin-ctx *108DAB44=%08X:", p2);
+        if (p2) for (u32 q = 0; q < 4; q++) fprintf(stderr, " %08X", vm_read32(p2 + q * 4));
+        fprintf(stderr, "\n"); } }
+    u32 segs[4]; int ns = 0;
+    for (u32 sl = 0x10000; sl < 0x14000; sl += 0x1000) {
+        u32 w[3];
+        for (u32 q = 0; q < 3; q++) { u32 e = gcm_io2ea(sl + q * 4); w[q] = e ? vm_read32(e) : 0xDEADDEADu; }
+        fprintf(stderr, "[ring]   slot %08X: %08X %08X %08X%s\n", sl, w[0], w[1], w[2],
+                (put >= sl && put < sl + 0x1000) ? "   <- put" : "");
+        if ((w[2] >> 29) == 1) {
+            u32 t = w[2] & 0x1FFFFFFCu; int dup = 0;
+            for (int k = 0; k < ns; k++) if (segs[k] == t) dup = 1;
+            if (!dup && ns < 4) segs[ns++] = t;
+        }
+    }
+    for (int k = 0; k < ns; k++) {
+        u32 t = segs[k], e0 = gcm_io2ea(t);
+        if (!e0) continue;
+        fprintf(stderr, "[ring]   seg %08X: %08X %08X %08X %08X  code:", t,
+                vm_read32(e0), vm_read32(e0 + 4), vm_read32(e0 + 8), vm_read32(e0 + 12));
+        /* la coda: il primo JUMP (o zero) camminando i comandi come il walker */
+        u32 io = t; int steps = 0;
+        while (steps++ < 20000) {
+            u32 e = gcm_io2ea(io); if (!e) break;
+            u32 w = vm_read32(e);
+            if ((w >> 29) == 1) { fprintf(stderr, " JUMP@%08X->%08X", io, w & 0x1FFFFFFCu); break; }
+            if (w == 0) {
+                /* zeri = NOP: li si scavalca contandoli, per vedere se dopo
+                 * il riempimento c'e' una coda fissa in fondo al segmento */
+                u32 z = 0; while (steps++ < 600000) { u32 e2 = gcm_io2ea(io); if (!e2 || vm_read32(e2) != 0) break; z++; io += 4; }
+                fprintf(stderr, " ZERO@%08X(x%u)->", io - z * 4, z);
+                continue;
+            }
+            if ((w & 0xFFFF0000u) == 0xFEAD0000u) { io += 4; continue; }
+            u32 cnt = (w >> 18) & 0x7FFu;
+            io += 4 + cnt * 4;
+        }
+        fprintf(stderr, "\n");
+    }
+    fflush(stderr);
+}
+
+static u32 s_strand_io = 0, s_strand_put = 0;
 void cellGcm_on_put_write(void)
 {
     static int in = 0;
     if (in) return;
     in = 1;
     s_in_put_hook = 1;
+    { static int s_sl = -1; if (s_sl < 0) s_sl = getenv("GCM_STRAND_LATE") ? 1 : 0;
+      if (s_sl && s_strand_io) { static unsigned n = 0;
+          u32 e = gcm_io2ea(s_strand_io); u32 w = e ? vm_read32(e) : 0;
+          if (n++ < 60)
+              fprintf(stderr, "[strand-late] arenato a %08X con put=%08X; ora [%08X]=%08X%s (put nuovo=%08X)\n",
+                      s_strand_io, s_strand_put, s_strand_io, w,
+                      ((w >> 29) == 1) ? " = JUMP" : "", vm_read32(GCM_CONTROL_GUEST_ADDR + 0));
+          s_strand_io = 0; } }
+    gcm_ringdbg(vm_read32(GCM_CONTROL_GUEST_ADDR + 0));
     cellGcm_rsx_process_fifo();
     { u32 put_now = vm_read32(GCM_CONTROL_GUEST_ADDR + 0);
       if (s_fifo_getoff != put_now) {
@@ -1483,14 +1589,30 @@ static void gcm_rsx_process_fifo_unlocked(void)
                                    * c'e' un JUMP di coda che abbiamo scavalcato, il
                                    * difetto e' nel conteggio di un metodo. */
                                   fprintf(stderr, "[strand-peek] 0x%08X (da -0x100):", s_fifo_getoff);
-                                  for (u32 q = 0; q < 80; q++) {
+                                  for (u32 q = 0; q < 64 + 256; q++) {
                                       u32 io2 = s_fifo_getoff - 0x100 + q * 4;
                                       u32 pe2 = gcm_io2ea(io2);
                                       if (!pe2) break;
                                       fprintf(stderr, "%s%08X", (q % 8) ? " " : (q == 64 ? "\n>> " : "\n   "), vm_read32(pe2));
                                   }
+                                  /* E i 4 slot dell'anello del titolo (IO 0x10000..0x13000),
+                                   * 6 parole ciascuno: SET_REFERENCE, valore, JUMP, ... */
+                                  for (u32 sl = 0x10000; sl < 0x14000; sl += 0x1000) {
+                                      fprintf(stderr, "[strand-ring] %08X:", sl);
+                                      for (u32 q = 0; q < 6; q++) {
+                                          u32 pe3 = gcm_io2ea(sl + q * 4);
+                                          fprintf(stderr, " %08X", pe3 ? vm_read32(pe3) : 0xDEADDEADu);
+                                      }
+                                      fprintf(stderr, "\n");
+                                  }
                                   fprintf(stderr, "\n");
                               } } }
+                          /* GCM_STRAND_LATE=1: alla prossima mossa di `put`
+                           * rilegge la parola al punto di arenamento. Se e'
+                           * diventata un JUMP, la coda del segmento viene
+                           * scritta DOPO `put` (da un altro thread o dopo la
+                           * scrittura di put) e il walker sincrono la manca. */
+                          s_strand_io = s_fifo_getoff; s_strand_put = put;
                           s_fifo_getoff = put - 8;
                           continue;
                       }

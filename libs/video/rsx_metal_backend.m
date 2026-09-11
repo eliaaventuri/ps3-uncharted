@@ -1051,6 +1051,15 @@ void rsx_metal_backend_present(void)
         }
 
         s_frame_no++;
+        /* RSX_FRAMESTAT=<n>: una riga ogni n fotogrammi presentati, con il
+         * numero di draw: la misura piu' economica di "il gioco va avanti". */
+        { static int s_fs = -2; static unsigned long s_acc = 0, s_nz = 0;
+          if (s_fs == -2) { const char* e = getenv("RSX_FRAMESTAT"); s_fs = (e && *e) ? atoi(e) : 0; }
+          s_acc += s_draw_count; if (s_draw_count) s_nz++;
+          if (s_fs > 0 && (s_frame_no % (unsigned long)s_fs) == 0) {
+              extern unsigned long long ps3_ms_now(void);
+              fprintf(stderr, "[RSX metal] fotogramma #%lu: negli ultimi %d presentati %lu draw in %lu fotogrammi non vuoti, t=%llums\n",
+                      s_frame_no, s_fs, s_acc, s_nz, ps3_ms_now()); s_acc = 0; s_nz = 0; } }
         id<MTLCommandBuffer> cb = [s_queue commandBuffer];
 
         /* Un passaggio di rendering per ogni tratto CONSECUTIVO di draw che

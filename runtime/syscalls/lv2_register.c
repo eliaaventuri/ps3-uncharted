@@ -159,6 +159,22 @@ static int64_t sys_tty_write(ppu_context* ctx)
         /* DIAGNOSTIC (FLOW_PSSGTRACE=1): when the title logs a PhyreEngine
          * init failure, dump the guest back-chain so we can locate the failing
          * function (the message itself goes through here, not _sys_printf). */
+        /* PS3_TTY_BT=<sottostringa>: catena di chiamata guest (dallo stack
+         * host) quando il titolo stampa quel testo. Serve a trovare CHI decide
+         * "Command context has run out of memory" e cosa ha letto. */
+        { static const char* s_bt = (const char*)-1;
+          if (s_bt == (const char*)-1) s_bt = getenv("PS3_TTY_BT");
+          if (s_bt && len < 4096) {
+              char tmp[256]; uint32_t n = len < 255 ? len : 255;
+              memcpy(tmp, vm_base + buf_ea, n); tmp[n] = 0;
+              /* piu' sottostringhe separate da '|' */
+              int hit = 0; { const char* p = s_bt; while (*p && !hit) { const char* q = strchr(p, '|'); size_t L = q ? (size_t)(q - p) : strlen(p);
+                  char pat[128]; if (L >= sizeof pat) L = sizeof pat - 1; memcpy(pat, p, L); pat[L] = 0;
+                  if (L && strstr(tmp, pat)) hit = 1; p = q ? q + 1 : p + strlen(p); } }
+              if (hit) {
+                  fprintf(stderr, "[tty-bt] \"%.60s\" lr=0x%08X\n", tmp, (uint32_t)ctx->lr);
+                  extern void ppu_guest_callstack(const char*); ppu_guest_callstack("tty");
+              } } }
         if (getenv("FLOW_PSSGTRACE") && len < 4096) {
             char tmp[256]; uint32_t n = len < 255 ? len : 255;
             memcpy(tmp, vm_base + buf_ea, n); tmp[n] = 0;

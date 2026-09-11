@@ -3422,19 +3422,51 @@ def discover_jump_tables(all_insns, read_u32, toc, text_lo, text_hi):
                             b = [x.strip() for x in w2.operands.split(',')]
                             if not b or b[0] != _mid:
                                 continue
-                            if w2.mnemonic in ('lwz', 'ld') and len(b) == 2 and '(r2)' in b[1]:
+                            _is_toc = (w2.mnemonic in ('lwz', 'ld') and len(b) == 2 and '(r2)' in b[1])
+                            # In the widened pass only a TOC load counts as the
+                            # definition: a `ld r30,-0x10(r11)` on an early-return
+                            # path is the epilogue RESTORE of the callee-saved
+                            # base, not its definition, and taking it (nearest
+                            # def wins) left Uncharted's func_0068D918 switch at
+                            # 0x68E134 unresolved -- r30 is loaded once from the
+                            # TOC in the prologue (0x68D924), 0x800 bytes above.
+                            if _pass and not _is_toc:
+                                continue
+                            if _is_toc:
                                 disp = mem_disp(b[1]); r_base = cand
                                 base_is_ld = (w2.mnemonic == 'ld')
                                 disp2 = _d2; disp2_is_ld = _d2_is_ld
-                            _resolved = True    # nearest def wins, TOC load or not
+                            _resolved = True    # nearest def wins (window pass: TOC load or not)
                             break
                         if _resolved or _pass:
                             break
-                        _lo = 0
-                        for _k in range(i - 1, -1, -1):
-                            if all_insns[_k].mnemonic == 'blr':
-                                _lo = _k + 1
-                                break
+                        # Bound by the enclosing PROLOGUE (`stdu/stwu r1,-N(r1)`),
+                        # not by the nearest blr: a big function has early
+                        # returns (blr) between its prologue and a switch far
+                        # below, and the blr bound hid the base load. Uncharted
+                        # func_0068D918 (a 2842-insn text parser): r30 loaded at
+                        # +0xC, a blr at +0x1F0, the dispatcher at +0x81C -> the
+                        # scan stopped at the blr, the two-level table went
+                        # unresolved, the `bctr` lifted to an indirect call and
+                        # every `b top` of the parse loop nested one level
+                        # deeper until the runtime's recursion cap (4000) cut
+                        # the parse short: "Audio prototypes loaded; 0 total",
+                        # and the guest stack pointer never came back. The blr
+                        # stays as the fallback when no prologue is found within
+                        # 8000 insns (frameless function).
+                        _lo = 0; _hit_pro = False
+                        for _k in range(i - 1, max(-1, i - 8000), -1):
+                            _mn = all_insns[_k].mnemonic
+                            if _mn in ('stdu', 'stwu'):
+                                _ops = [x.strip() for x in all_insns[_k].operands.split(',')]
+                                if _ops and _ops[0] == 'r1' and len(_ops) == 2 and '(r1)' in _ops[1]:
+                                    _lo = _k; _hit_pro = True
+                                    break
+                        if not _hit_pro:
+                            for _k in range(i - 1, -1, -1):
+                                if all_insns[_k].mnemonic == 'blr':
+                                    _lo = _k + 1
+                                    break
                         _scan = all_insns[_lo:i]
                 break                           # first definition of cand wins/loses
             if disp is not None:
