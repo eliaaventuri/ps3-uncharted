@@ -182,6 +182,10 @@ static const char* hle_nome(uint32_t nid)
     return "(non registrato)";
 }
 
+/* Armato dalla prima stampa TTY che soddisfa PS3_TTY_BT (lv2_register.c,
+ * ppu_loader.cpp): da li' in poi PS3_HLE_TID_TRACE stampa. */
+extern "C" int g_hle_trace_armed = 0;
+
 extern "C" void ppu_hle_dump_ring(void)
 {
     fprintf(stderr, "[hle-ring] ultimi import chiamati, dal piu' vecchio:\n");
@@ -732,6 +736,16 @@ extern "C" void ps3_hle_call(uint32_t nid, ppu_context* ctx)
                     (uint32_t)ctx->gpr[3],(uint32_t)ctx->gpr[4],(uint32_t)ctx->gpr[5],
                     (uint32_t)ctx->gpr[6],(uint32_t)ctx->gpr[7],(uint32_t)ctx->gpr[8]);
     }
+    /* PS3_HLE_TID_TRACE=<tid guest>: ogni import chiamato da quel thread, ma
+     * solo da quando una stampa TTY ha soddisfatto PS3_TTY_BT (che arma
+     * g_hle_trace_armed). Cosi' si vede cosa fa un thread nel tratto che
+     * interessa senza le migliaia di chiamate del boot. Max 4000 righe. */
+    { static long s_tid = -2; if (s_tid == -2) { const char* e2 = getenv("PS3_HLE_TID_TRACE"); s_tid = e2 ? strtol(e2, 0, 10) : -1; }
+      if (s_tid >= 0 && g_hle_trace_armed && (long)ctx->thread_id == s_tid) {
+          static int _n = 0; if (_n++ < 4000)
+              fprintf(stderr, "[hle-tid%ld] %s lr=0x%08X r3=0x%08X r4=0x%08X r5=0x%08X\n", s_tid,
+                      e->name ? e->name : "?", (uint32_t)ctx->lr, (uint32_t)ctx->gpr[3],
+                      (uint32_t)ctx->gpr[4], (uint32_t)ctx->gpr[5]); } }
     hle_generic fn = (hle_generic)e->handler;
     uint64_t r = fn(ctx->gpr[3], ctx->gpr[4], ctx->gpr[5], ctx->gpr[6],
                     ctx->gpr[7], ctx->gpr[8], ctx->gpr[9], ctx->gpr[10]);

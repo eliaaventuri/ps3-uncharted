@@ -72,6 +72,15 @@ senza uscita" e "run out of memory" a zero. Ora il main loop gira a ~30
 fotogrammi/s ma vuoti (stato NDI/menu): e' il fronte della sessione 26.
 Dettagli in "Sessione 25".
 
+**Dalla sessione 26 il gioco arriva al menu principale.** I fotogrammi vuoti
+erano un'attesa di input (`LBP_AUTOPRESS=1` preme CROSS/START); poi il
+filmato dei loghi (cellVdec riscritto con l'API vera, immagini nere), i
+moduli SPU dei job riliftati con il ritorno via registro (`ret_link`), e il
+titolo carica il menu e prefetcha il livello `jungle-a-1`. Nel menu pero'
+disegna zero e non reagisce ai tasti: i materiali del menu falliscono la
+registrazione ("Technique index 0 already exists") e `cellSaveDataListAutoLoad`
+manca. Dettagli in "Sessione 26".
+
 Quanto arriva a fare, dal log:
 
 - supera `sys_initialize_tls` (dove il boot upstream si fermava);
@@ -365,6 +374,84 @@ La lista dei comandi ora viene percorsa fino in fondo — sei coppie
 risultati in memoria principale.** Non era mai successo in nessuna sessione.
 Riproducibile: **tre corse su tre**, identiche -- 14 comandi, un overlay
 residente, zero microstep, cinque stall e due interrupt per corsa.
+
+## Sessione 26 — dal caricamento al menu principale: il gioco aspettava un tasto
+
+### 1. I fotogrammi vuoti erano un'attesa di input
+
+`LBP_AUTOPRESS=1` (impulsi di CROSS e START ogni 240 letture del pad, gia'
+nel runtime) sblocca lo stato "main-menu-ndi": il titolo avvia il filmato dei
+loghi (`starting movie sce-ndi-logos`, `movie1/sce-ndi-logos.m2v`, MPEG-2 via
+libvdec) e disegna i primi quad veri (`DRAW_INDEX_ARRAY` con texture 1280x720
+fmt 0xA5). Nessuno premeva niente: da qui in poi le corse vanno fatte con
+`LBP_AUTOPRESS=1`.
+
+### 2. cellVdec: riscritto con l'API vera
+
+`libs/codec/cellVdec.{c,h}` avevano firme e layout inventati (Open con
+cbFunc/cbArg separati invece del puntatore a `CellVdecCb`, GetPicture con
+`picItem**`, msgType AUDONE=0, codec MPEG2=2...) e chiamavano la callback
+guest come puntatore host: crash `UNTRANSLATED GUEST POINTER 0x0FEFF970` alla
+prima DecodeAu. Ora: layout RPCS3 (documentati nell'header), callback via
+`ps3_invoke_guest` (sincrona, dentro DecodeAu/EndSeq), `cellVdecQueryAttr`
+(NID 0xFF6F6EBE, era non registrato), PicItem + Mpeg2Info scritti nella
+memoria della `CellVdecResource` del titolo (0x2B7C8000+0x10000), coda FIFO di
+256 descrittori (il titolo manda ~110 AU di fila e poi ritira con
+GetPicItem una per una: con un solo slot girava su GetPicItem per sempre --
+misurato con `PS3_HLE_TID_TRACE`: 3785 chiamate), dimensione dal sequence
+header MPEG-2 (1280x720), immagine nera nel formato chiesto (fmt 0 =
+ARGB32, scritta direttamente in VRAM 0xC16D0000). Il filmato arriva a
+`Close`, poi il titolo carica il **menu** (`'menu': loaded 20.04 Mb`,
+`main-menu-menu`) e prefetcha `jungle-a-1` e `dive-boat-movie-intro`.
+
+### 3. I moduli SPU dei job erano liftati senza SPU_RETLINK
+
+`[SPU] BRANCH-TO-0 unresolved pc=0x0D3F0 image=2` + `[spu-smc] microstep
+UNKNOWN word 0x3F830484` (un `rotqbyi`): il job `jobmod_00931cc0` a LS 0xD3C0
+chiama 0xEE00, che rientra con `bi $r39` = ritorno via registro; il modulo era
+stato liftato PRIMA che il lifter salvasse `ret_link` attorno alle chiamate
+(0 siti nei 28 moduli contro 85 nelle immagini spu_lifted), quindi il ritorno
+diventava un salto indiretto a un indirizzo che non e' un ingresso e finiva
+nell'interprete di ripiego. Rilift dei 28 moduli con `tools/lift_jobmods.py`
+(1765 siti ret_link): zero `BRANCH-TO-0`, zero `wws-jobentry`.
+
+### Strumenti nuovi
+
+- `PS3_HLE_TID_TRACE=<tid guest>` + `PS3_TTY_BT='testo'`: da quando il titolo
+  stampa quel testo, ogni import HLE chiamato da quel thread (nome, lr,
+  r3-r5; max 4000 righe). E' quello che ha mostrato il ciclo su GetPicItem.
+- `RSX_FRAMESTAT=<n>` conta i draw negli ultimi n fotogrammi presentati.
+
+### Dove si ferma adesso
+
+Nel menu principale: ~60 fotogrammi/s **vuoti** (0 draw, nessuna CALL), il
+titolo legge il pad a ogni frame (`cellPadGetData` una volta per frame) ma non
+reagisce agli impulsi di CROSS/START per minuti. Due sospetti:
+
+1. `ERROR: Technique N of material 'General/menu/...': Technique index 0
+   already exists` (26 volte, tutti i materiali del menu: menu-logo,
+   shot-chapters, shot-movies, menu-map...): la registrazione delle tecniche
+   (`func_00483F90`, test di bit su una maschera a 64 bit letta con
+   `vm_read64` e `srd`) assegna indice 0 a tutte le tecniche. Se i materiali
+   del menu non si registrano, il menu non ha niente da disegnare e forse il
+   suo script aspetta qualcosa che non arriva. Appare anche una volta durante
+   GameInit. Da capire se e' un errore di lift (bitfield 64 bit) o di dati.
+2. `[hle] unresolved NID 0x21425307` = `cellSaveDataListAutoLoad` (thread
+   "Save/Load Game Thread", che poi termina). L'implementazione esistente in
+   `libs/system/cellSaveData.c` chiama le callback guest come puntatori host:
+   va rifatta con `ps3_invoke_guest` come cellVdec. Non e' certo che blocchi
+   il menu.
+
+### Il prossimo passo
+
+1. Capire la tecnica con indice 0 (leggere `func_00483F90` intorno a
+   0x484260-0x484408 con il disassemblato originale, `show_func.py --asm`).
+2. `cellSaveDataListAutoLoad` con callback guest vere (funcList con lista
+   vuota -> il titolo decide).
+3. Se il menu reagisce all'input: `dive-boat-movie-intro` e il livello
+   `jungle-a-1` sono gia' in prefetch -- il gioco vero e' dietro l'angolo.
+4. Ripristinare gli screenshot (la finestra non si trova da questa shell).
+
 
 ## Sessione 25 — il walker era innocente: due thread scrivevano nello stesso command buffer, per un salto mal liftato
 

@@ -171,7 +171,7 @@ static int64_t sys_tty_write(ppu_context* ctx)
               int hit = 0; { const char* p = s_bt; while (*p && !hit) { const char* q = strchr(p, '|'); size_t L = q ? (size_t)(q - p) : strlen(p);
                   char pat[128]; if (L >= sizeof pat) L = sizeof pat - 1; memcpy(pat, p, L); pat[L] = 0;
                   if (L && strstr(tmp, pat)) hit = 1; p = q ? q + 1 : p + strlen(p); } }
-              if (hit) {
+              if (hit) { extern int g_hle_trace_armed; g_hle_trace_armed = 1;
                   fprintf(stderr, "[tty-bt] \"%.60s\" lr=0x%08X\n", tmp, (uint32_t)ctx->lr);
                   extern void ppu_guest_callstack(const char*); ppu_guest_callstack("tty");
               } } }

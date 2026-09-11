@@ -130,6 +130,7 @@ extern "C" void ps3_install_guest_ptr_trap(void)
 
 extern "C" uint32_t ppu_vm_size;   /* defined below; the handler needs it */
 extern "C" PPU_THREAD_LOCAL ppu_context* g_active_ctx;   /* likewise */
+extern "C" int g_hle_trace_armed;                        /* ppu_hle.cpp: PS3_HLE_TID_TRACE armato da PS3_TTY_BT */
 
 static struct sigaction s_prev_segv, s_prev_bus;
 
@@ -2381,7 +2382,7 @@ extern "C" void lv2_syscall(ppu_context* ctx)
                   int hit = 0; { const char* p = s_bt; while (*p && !hit) { const char* q = strchr(p, '|'); size_t L = q ? (size_t)(q - p) : strlen(p);
                       char pat[128]; if (L >= sizeof pat) L = sizeof pat - 1; memcpy(pat, p, L); pat[L] = 0;
                       if (L && strstr(tty, pat)) hit = 1; p = q ? q + 1 : p + strlen(p); } }
-                  if (hit) {
+                  if (hit) { g_hle_trace_armed = 1;
                       fprintf(stderr, "[tty-bt] \"%.60s\" lr=0x%08X\n", tty, (uint32_t)ctx->lr);
                       ppu_guest_callstack("tty");
                   } } }
