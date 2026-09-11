@@ -1,6 +1,6 @@
 # Stato del progetto
 
-Ultimo aggiornamento: **11 settembre 2026** — sessione 23.
+Ultimo aggiornamento: **12 settembre 2026** — sessione 27.
 
 ## Dove siamo
 
@@ -80,6 +80,21 @@ titolo carica il menu e prefetcha il livello `jungle-a-1`. Nel menu pero'
 disegna zero e non reagisce ai tasti: i materiali del menu falliscono la
 registrazione ("Technique index 0 already exists") e `cellSaveDataListAutoLoad`
 manca. Dettagli in "Sessione 26".
+
+**Dalla sessione 27 il main loop disegna.** In tutti gli stati del main loop
+(schermata autosave, NDI, menu) i fotogrammi erano VUOTI (0 draw): il
+renderer del fotogramma (`func_00092C48`, chiamato da `BigLoop`) usciva
+subito perche' il controllo "la matrice della camera ha NaN?"
+(`func_0015E308`, `vcmpeqfp.` + `blt cr6`) leggeva un CR6 mai scritto: il
+lifter non aggiornava CR6 per le forme con punto dei confronti vettoriali
+(`vcmpeqfp.`, `vcmpgefp.`, `vcmpgtfp.`, `vcmpequ{b,h,w}.`, `vcmpbfp.`).
+Corretto in `tools/ppu_lifter.py`: da 0 a **~12 draw per fotogramma** dalla
+schermata autosave in poi (passaggi fuori schermo + 4 sul display). L'immagine
+e' ancora un fotogramma verde uniforme: tutti i vertici escono dal clip con
+w negativo (x[-3.4 -2.0] y[-6.7 -5.5] w[-4.0 -2.7]) -- e' il fronte aperto.
+Gli errori "Technique index 0 already exists" sono dati veri del titolo
+(maschere di tag identiche in memoria, lette con `PS3_TTY_DUMP`), non un
+difetto nostro. Dettagli in "Sessione 27".
 
 Quanto arriva a fare, dal log:
 
@@ -374,6 +389,94 @@ La lista dei comandi ora viene percorsa fino in fondo — sei coppie
 risultati in memoria principale.** Non era mai successo in nessuna sessione.
 Riproducibile: **tre corse su tre**, identiche -- 14 comandi, un overlay
 residente, zero microstep, cinque stall e due interrupt per corsa.
+
+## Sessione 27 — il main loop non disegnava: CR6 mai scritto dai confronti vettoriali
+
+### Il percorso
+
+1. `RSX_FRAMESTAT=30`: nel main loop 0 draw in TUTTI gli stati (autosave,
+   NDI, menu); i draw visti finora erano la moneta (thread "Init") e il
+   filmato (player MPEG). Quindi il problema non era del menu.
+2. Il menu si disegna sul PPU in modalita' immediata (`GAMEMENU::Drawer::
+   PushToIce` 0x63E928 -> `menudrawer DrawQuad()` 0x63ED20: Begin(QUADS),
+   4 vertici, End). Catena diretta da `BigLoop` (0x4D238): 0x92C48 ->
+   0x64B1F8 -> 0x643240 -> 0x63E288 -> 0x63DE08 -> `DrawerItem::Draw`
+   (callgraph: `tools/callgraph.py recomp --why func_0063DE08`).
+3. `FLOW_WVAL` con gli indirizzi di ritorno lungo la catena (ora con tetto
+   per valore e armato da `PS3_TTY_BT`): `BigLoop` chiama 0x92C48 ogni
+   fotogramma, ma 0x92C48 non arriva mai a 0x93444 (menu) ne' a 0x939CC
+   (pipeline 3D). Bisezione: esce a 0x930C0 dopo `bl 0x15E308(camera)`.
+4. `func_0015E308` = "la matrice della camera (+0x190..+0x1CF) contiene NaN?":
+   `vspltw` + `vcmpeqfp. v0,v0,v0` + `blt cr6`. La matrice e' sana
+   (`PS3_TTY_DUMP=...>1DBC+190:0x40`), ma il C liftato di `vcmpeqfp.`
+   calcolava solo la maschera e NON scriveva CR6: il `blt cr6` leggeva un
+   valore stantio (0) = "c'e' un NaN" = niente rendering.
+
+### La correzione (`tools/ppu_lifter.py`)
+
+Le forme con punto di `vcmpeqfp/vcmpgefp/vcmpgtfp`, `vcmpequb/h/w` e
+`vcmpbfp` ora scrivono CR6 (8 = tutte le corsie vere, 2 = tutte false;
+`vcmpbfp.`: 2 = tutte dentro i limiti), come gia' faceva la famiglia
+`vcmpgt{s,u}{b,h,w}`. `vcmpbfp` leggeva anche i float senza byte-swap
+(`float*` sul register file big-endian): ora passa da `ppu_vldf4/ppu_vstu4`.
+315 siti nel solo chunk 000. Rilift completo + `build.sh` (~2 min).
+`tools/test_ppu_lift.py` e `check_ppu_scaffold.py` verdi.
+
+### Misura
+
+`RSX_FRAMESTAT=30`, per 30 fotogrammi: prima `0 0 0 ...` dal fotogramma
+240 in poi; dopo `343 324 360 360 ...` (~12 draw/fotogramma, ~20 fotogrammi
+non vuoti su 30). `RSX_FRAMEDBG=1` al fotogramma 300 (schermata autosave):
+
+```
+superfici: 0x2D50000(1) 0x16D0000(7) 0x7D0000(1) 0x33C0000(1) 0x31E0000(3) 0x3C30000(1) 0x50000(4)  [6 fuori schermo] [display]
+draws=18 (degeneri=15) verts=768 dentro-clip=0  x[-3.36 -1.96] y[-6.67 -5.54] z[-4.46 -3.21] w[-3.98 -2.73]
+```
+
+Sono DRAW_ARRAYS/INDEX (non inline): la pipeline 3D gira (passaggi di post
+processing con texture 2560x720 fmt 0xA5, 1280x720 0xBA). Ma **nessun
+vertice dentro il clip, w negativo**: il fotogramma salvato
+(`RSX_DUMP_FRAME=5`) e' verde uniforme. Prossimo fronte: la trasformazione
+dei vertici (vertex program / costanti / formato degli attributi).
+
+### Altro trovato
+
+- "Technique index 0 already exists": con `PS3_TTY_DUMP` letti i tre
+  technique di `General/menu/menu-logo/Default` in memoria: maschera tag
+  `0x2` (solo "Standard") in tutti e tre, e per `Objects/hero/Hair` i
+  technique 4 e 6 hanno entrambi `0x2000` ("Shadows") e lo stesso +8
+  (`0x00040001`). Sono i dati del pak: il titolo stampa quell'errore anche
+  su PS3. `PushToIce` usa `techniques[0]`, che si registra: innocuo.
+- Assert del titolo (non deterministico, 2 corse su 4):
+  `joblist.cpp(578): pJobHeader->m_jobHeaderCommand == kNoJobYet` sul thread
+  14 `syn_tick_timer_thread` (audio, job list ad anello da 24 slot, wid 7).
+  Il PPU trova uno slot non ancora "kNoJobYet" quando accoda: il job manager
+  SPU non ha consumato/azzerato lo slot in tempo, o la lista e' piena. Il
+  runtime prosegue dopo il trap. Da guardare se l'audio dara' problemi.
+- Nel menu girano solo due moduli SPU per fotogramma: ovl 227
+  (`jobmod_00931cc0`, sintetizzatore audio: stringhe `polarpan.cpp`,
+  `SYN_ASSERT`) e ovl 212 (`jobmod_008cc900`, "CHANCE ASSERTION").
+  Il rendering della scena non passa da job SPU: e' PPU (DRAW_ARRAYS).
+
+### Strumenti nuovi
+
+- `PS3_TTY_DUMP=<spec>[,<spec>]` con `PS3_TTY_BT`: dump di memoria guest a
+  ogni hit. spec = `addr[>off|+off]*:len`; `>off` fa a = read32(a+off),
+  `+off` somma. Es. `0x7CB238>0>-7D48>1DBC+190:0x40` = matrice della camera
+  (r30 di BigLoop = *(0x7CB238); G = *(r30-0x7D48); camera = G->0x1DBC).
+- `PS3_CALLTRACE` ora si arma con `PS3_TTY_BT` (parte dall'hit) e filtra
+  per thread con `PS3_CALLTRACE_TID=<tid>`.
+- `FLOW_WVAL` (64 bit): tetto di 24 stampe PER VALORE e armato da
+  `PS3_TTY_BT`. Con gli indirizzi di ritorno (lr salvato nel prologo) e'
+  una bisezione a costo zero di "fin dove arriva questa funzione".
+- `SPU_JOBTRACE=1`: armato da `PS3_TTY_BT` e con `ovl=<id>` (quale modulo
+  di job gira; id -> nome in `gen/jobmods_register.c`).
+- `RSX_DUMP_SKIP=<m>`: salta i primi m fotogrammi sopra soglia prima di
+  salvare (con `RSX_DUMP_FRAME`/`RSX_DUMP_COUNT`), per fotografare il menu.
+- Nota: `build.sh` NON ricompila il runtime (`runtime/`, `libs/`): quello
+  sta in `build/libps3recomp_runtime.a` e vuole `cmake --build build`
+  prima. Solo `ppu_loader/ppu_hle/ppu_fs/ppu_sysprx/boot_main` sono
+  compilati da `build.sh`.
 
 ## Sessione 26 — dal caricamento al menu principale: il gioco aspettava un tasto
 

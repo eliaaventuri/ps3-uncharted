@@ -1666,10 +1666,14 @@ void spu_indirect_branch(spu_context* ctx)
          * (pc in the job code buffer >= 0x4000) so the cap isn't spent on the
          * PM code the job calls back into -- and keep logging thereafter. */
         static int _armed = 0;
-        if (p >= 0x4000) _armed = 1;
+        /* Con PS3_TTY_BT impostata parte solo dopo l'hit (g_hle_trace_armed):
+         * i moduli che girano per fotogramma nel menu, non i primi del boot. */
+        { extern int g_hle_trace_armed; static int s_gate = -1;
+          if (s_gate < 0) s_gate = getenv("PS3_TTY_BT") ? 1 : 0;
+          if (p >= 0x4000 && (!s_gate || g_hle_trace_armed)) _armed = 1; }
         if (_armed && _n++ < 1500) {
-            fprintf(stderr, "[jobtrace] pc=0x%05X lr=0x%05X%s",
-                    p, ctx->gpr[0]._u32[0] & SPU_LS_MASK,
+            fprintf(stderr, "[jobtrace] ovl=%d pc=0x%05X lr=0x%05X%s",
+                    ctx->resident_ovl, p, ctx->gpr[0]._u32[0] & SPU_LS_MASK,
                     fn ? "" : " (no lift)");
             /* JobApi entries: args r3-r5. Post-job return 0x3308: result r3 +
              * the job's saved GetBufferTag result r80. */

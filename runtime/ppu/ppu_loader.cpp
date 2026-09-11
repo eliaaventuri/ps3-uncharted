@@ -1051,7 +1051,7 @@ static int flow_wval_hit(uint32_t v)
     static uint32_t w[8]; static int nw = -1;
     if (nw < 0) { nw = 0; const char* e = getenv("FLOW_WVAL");
         while (e && *e && nw < 8) { char* q = 0; w[nw++] = (uint32_t)strtoul(e, &q, 16); if (!q || *q != ',') break; e = q + 1; } }
-    for (int i = 0; i < nw; i++) if (v == w[i]) return 1;
+    for (int i = 0; i < nw; i++) if (v == w[i]) return i + 1;
     return 0;
 }
 static uint32_t ydkj_wwatch_len(void)
@@ -1347,7 +1347,12 @@ void vm_write64(uint64_t a, uint64_t v) {
      * the watched value — the blind spot for the vm_write32-only FLOW_WVAL hook. */
     { static int64_t wv=-2; if(wv==-2){const char*e=getenv("FLOW_WVAL"); wv=e?(int64_t)strtoul(e,0,16):-1;}
       if(wv>=0){ uint32_t hi=(uint32_t)(v>>32), lo=(uint32_t)v;
-        if(flow_wval_hit(hi)||flow_wval_hit(lo)){ static int _n=0; if(_n++<24){
+        int _wi = flow_wval_hit(hi) ? flow_wval_hit(hi) : flow_wval_hit(lo);
+        if(_wi){ static int _n[9]={0};
+          /* con PS3_TTY_BT impostata conta solo dopo l'hit (vedi PS3_HLE_TID_TRACE);
+           * il tetto (24) e' per valore, cosi' uno frequente non copre gli altri */
+          static int s_gate=-1; if(s_gate<0) s_gate=getenv("PS3_TTY_BT")?1:0;
+          if((!s_gate||g_hle_trace_armed) && _n[_wi]++<24){
           uint32_t dst=flow_wval_hit(hi)?(uint32_t)a:(uint32_t)a+4;
           uint32_t vtgt = g_vcall_sp>0 ? g_vcall_stk[g_vcall_sp-1] : 0;
           fprintf(stderr,"[WVAL64] write64 0x%08X (poison half @0x%08X) v=0x%016llX  active-vcall=func_%08X (depth %d)\n",(uint32_t)a,dst,(unsigned long long)v,vtgt,g_vcall_sp);
@@ -1744,6 +1749,13 @@ extern "C" void ps3_indirect_call(ppu_context* ctx)
       if (only_to == -2) { const char* e = getenv("PS3_CALLTRACE_TO");
                            only_to = e ? (int64_t)strtoul(e, 0, 16) : -1; }
       if (only_to >= 0 && addr != (uint32_t)only_to) goto skip_calltrace;
+      /* Con PS3_TTY_BT impostata il trace parte solo dopo l'hit (come
+       * PS3_HLE_TID_TRACE); PS3_CALLTRACE_TID=<tid guest> filtra il thread. */
+      { static int s_gate = -1; if (s_gate < 0) s_gate = getenv("PS3_TTY_BT") ? 1 : 0;
+        if (s_gate && !g_hle_trace_armed) goto skip_calltrace;
+        static int64_t only_tid = -2;
+        if (only_tid == -2) { const char* e = getenv("PS3_CALLTRACE_TID"); only_tid = e ? strtol(e, 0, 10) : -1; }
+        if (only_tid >= 0 && (int64_t)ctx->thread_id != only_tid) goto skip_calltrace; }
       static int64_t only_from = -2;
       if (only_from == -2) { const char* e = getenv("PS3_CALLTRACE_FROM");
                              only_from = e ? (int64_t)strtoul(e, 0, 16) : -1; }
@@ -2385,6 +2397,22 @@ extern "C" void lv2_syscall(ppu_context* ctx)
                   if (hit) { g_hle_trace_armed = 1;
                       fprintf(stderr, "[tty-bt] \"%.60s\" lr=0x%08X\n", tty, (uint32_t)ctx->lr);
                       ppu_guest_callstack("tty");
+                      /* PS3_TTY_DUMP=<spec>[,<spec>]: memoria guest a ogni hit
+                       * (max 20). spec = addr[>off|+off]*:len -- `>off` fa
+                       * a = read32(a+off), `+off` somma e basta:
+                       * `0x25E00310>0x10>4:0x20` e' il secondo elemento
+                       * dell'array puntato da +0x10. */
+                      { static const char* s_dp = (const char*)-1; static int s_dn = 0;
+                        if (s_dp == (const char*)-1) s_dp = getenv("PS3_TTY_DUMP");
+                        if (s_dp && s_dn++ < 20) { const char* p = s_dp;
+                            while (*p) { char* e; uint32_t a = (uint32_t)strtoul(p, &e, 16); p = e;
+                                while (*p == '>' || *p == '+') { int deref = (*p == '>'); uint32_t off = (uint32_t)strtoul(p + 1, &e, 16); p = e; a = deref ? vm_read32(a + off) : a + off; }
+                                uint32_t L = (*p == ':') ? (uint32_t)strtoul(p + 1, &e, 16) : 0x20; if (*p == ':') p = e;
+                                if (L > 0x400) L = 0x400;
+                                fprintf(stderr, "[tty-dump] %08X:", a);
+                                for (uint32_t q = 0; q < L; q += 4) fprintf(stderr, "%s%08X", (q % 32) ? " " : "\n   ", vm_read32(a + q));
+                                fprintf(stderr, "\n");
+                                while (*p == ',') p++; } } }
                   } } }
         }
         fflush(out);

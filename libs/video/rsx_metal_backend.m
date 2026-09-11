@@ -1274,14 +1274,18 @@ void rsx_metal_backend_present(void)
          * draw. I fotogrammi pieni durano poche decine di millisecondi e uno
          * screenshot da fuori li manca sistematicamente; questo li prende dal
          * di dentro, nell'istante giusto. */
-        { static int s_df = -2; static int s_done = 0; static int s_dmax = 1;
+        { static int s_df = -2; static int s_done = 0; static int s_dmax = 1; static int s_skip = 0;
           if (s_df == -2) { const char* e = getenv("RSX_DUMP_FRAME");
                             s_df = (e && *e) ? atoi(e) : -1;
                             /* RSX_DUMP_COUNT=<k>: salva i primi k fotogrammi
-                             * che superano la soglia (rsx_frame_<i>.ppm). */
+                             * che superano la soglia (rsx_frame_<i>.ppm).
+                             * RSX_DUMP_SKIP=<m>: salta i primi m sopra soglia
+                             * (per arrivare al menu senza 400 file). */
                             const char* c = getenv("RSX_DUMP_COUNT");
-                            if (c && atoi(c) > 1) s_dmax = atoi(c); }
-          if (s_df > 0 && s_done < s_dmax && (int)s_draw_count > s_df) {
+                            if (c && atoi(c) > 1) s_dmax = atoi(c);
+                            const char* k = getenv("RSX_DUMP_SKIP");
+                            if (k) s_skip = atoi(k); }
+          if (s_df > 0 && s_done < s_dmax && (int)s_draw_count > s_df && s_skip-- <= 0) {
               s_done++;
               MTLTextureDescriptor* sd = [MTLTextureDescriptor
                   texture2DDescriptorWithPixelFormat:MTLPixelFormatBGRA8Unorm

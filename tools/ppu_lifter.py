@@ -753,6 +753,12 @@ class PPULifter:
     # (those set CR1), VMX dot-forms (those set CR6), mt*/mf* specials.
     _CR0_SELF_HANDLED = ("stwcx.", "stdcx.")
 
+    @staticmethod
+    def _vcmp_cr6(t: str, n: int) -> str:
+        """CR6 for a dot-form vector compare: 8 = all lanes true, 2 = all false."""
+        return (f" uint32_t c6=({t}=={n}?8u:0u)|({t}==0?2u:0u); "
+                f"ctx->cr=(ctx->cr & ~(0xFu<<4))|(c6<<4);")
+
     def _translate(self, insn: Instruction, func: LiftedFunction) -> str:
         code = self._translate_op(insn, func)
         mn = insn.mnemonic
@@ -2267,23 +2273,20 @@ class PPULifter:
                     f"d[0]=(a[0]&~c[0])|(b[0]&c[0]); d[1]=(a[1]&~c[1])|(b[1]&c[1]); }}")
 
         # VMX compare (vcmpequw, vcmpeqfp, vcmpgefp, vcmpgtfp)
-        if mn.startswith("vcmpeqfp"):
+        # The dot forms set CR6 (bit0 = 8: all lanes true, bit2 = 2: all
+        # lanes false). Without it a `vcmpeqfp.` NaN check (`blt cr6`) read a
+        # stale CR6: Uncharted's frame renderer took that as "camera matrix
+        # is NaN" and returned before drawing anything (0 draw per frame).
+        vcmpfp_family = {"vcmpeqfp": "==", "vcmpgefp": ">=", "vcmpgtfp": ">"}
+        if mn.rstrip(".") in vcmpfp_family:
+            op = vcmpfp_family[mn.rstrip(".")]
             vd, va, vb = int(ops[0][1:]), int(ops[1][1:]), int(ops[2][1:])
-            return (f"{{ float a[4],b[4]; ppu_vldf4(&ctx->vr[{va}],a); ppu_vldf4(&ctx->vr[{vb}],b); "
-                    f"uint32_t* d=(uint32_t*)&ctx->vr[{vd}]; "
-                    f"for(int i=0;i<4;i++) d[i]=a[i]==b[i]?~0u:0; }}")
-
-        if mn.startswith("vcmpgefp"):
-            vd, va, vb = int(ops[0][1:]), int(ops[1][1:]), int(ops[2][1:])
-            return (f"{{ float a[4],b[4]; ppu_vldf4(&ctx->vr[{va}],a); ppu_vldf4(&ctx->vr[{vb}],b); "
-                    f"uint32_t* d=(uint32_t*)&ctx->vr[{vd}]; "
-                    f"for(int i=0;i<4;i++) d[i]=a[i]>=b[i]?~0u:0; }}")
-
-        if mn.startswith("vcmpgtfp"):
-            vd, va, vb = int(ops[0][1:]), int(ops[1][1:]), int(ops[2][1:])
-            return (f"{{ float a[4],b[4]; ppu_vldf4(&ctx->vr[{va}],a); ppu_vldf4(&ctx->vr[{vb}],b); "
-                    f"uint32_t* d=(uint32_t*)&ctx->vr[{vd}]; "
-                    f"for(int i=0;i<4;i++) d[i]=a[i]>b[i]?~0u:0; }}")
+            body = (f"{{ float a[4],b[4]; ppu_vldf4(&ctx->vr[{va}],a); ppu_vldf4(&ctx->vr[{vb}],b); "
+                    f"uint32_t* d=(uint32_t*)&ctx->vr[{vd}]; int t=0; "
+                    f"for(int i=0;i<4;i++){{ int r=a[i]{op}b[i]; d[i]=r?~0u:0; t+=r; }}")
+            if mn.endswith("."):
+                body += self._vcmp_cr6("t", 4)
+            return body + " }"
 
         # VMX shift (vsldoi) — shift left double by octet immediate
         if mn == "vsldoi":
@@ -2311,15 +2314,21 @@ class PPULifter:
         # VMX integer compare
         if mn.startswith("vcmpequh"):
             vd, va, vb = int(ops[0][1:]), int(ops[1][1:]), int(ops[2][1:])
-            return (f"{{ uint16_t* a=(uint16_t*)&ctx->vr[{va}]; uint16_t* b=(uint16_t*)&ctx->vr[{vb}]; "
-                    f"uint16_t* d=(uint16_t*)&ctx->vr[{vd}]; "
-                    f"for(int i=0;i<8;i++) d[i]=a[i]==b[i]?(uint16_t)~0:0; }}")
+            body = (f"{{ uint16_t* a=(uint16_t*)&ctx->vr[{va}]; uint16_t* b=(uint16_t*)&ctx->vr[{vb}]; "
+                    f"uint16_t* d=(uint16_t*)&ctx->vr[{vd}]; int t=0; "
+                    f"for(int i=0;i<8;i++){{ int r=a[i]==b[i]; d[i]=r?(uint16_t)~0:0; t+=r; }}")
+            if mn.endswith("."):
+                body += self._vcmp_cr6("t", 8)
+            return body + " }"
 
         if mn.startswith("vcmpequw"):
             vd, va, vb = int(ops[0][1:]), int(ops[1][1:]), int(ops[2][1:])
-            return (f"{{ uint32_t* a=(uint32_t*)&ctx->vr[{va}]; uint32_t* b=(uint32_t*)&ctx->vr[{vb}]; "
-                    f"uint32_t* d=(uint32_t*)&ctx->vr[{vd}]; "
-                    f"for(int i=0;i<4;i++) d[i]=a[i]==b[i]?~0u:0; }}")
+            body = (f"{{ uint32_t* a=(uint32_t*)&ctx->vr[{va}]; uint32_t* b=(uint32_t*)&ctx->vr[{vb}]; "
+                    f"uint32_t* d=(uint32_t*)&ctx->vr[{vd}]; int t=0; "
+                    f"for(int i=0;i<4;i++){{ int r=a[i]==b[i]; d[i]=r?~0u:0; t+=r; }}")
+            if mn.endswith("."):
+                body += self._vcmp_cr6("t", 4)
+            return body + " }"
 
         # Vector compare greater-than, signed/unsigned, byte/half/word.
         # Previously unhandled (fell to the TODO catch-all = silently skipped
@@ -2529,19 +2538,30 @@ class PPULifter:
 
         # Compare with Rc (vcmpeqfp., vcmpgefp., etc.)
         if mn.startswith("vcmpbfp"):
+            # Register file is big-endian: read the floats through ppu_vldf4 and
+            # store the flags through ppu_vstu4 (the old float*/uint32_t* path
+            # compared byte-swapped values). Dot form: CR6 bit2 (2) = all lanes
+            # in bounds, bit0 stays 0.
             vd, va, vb = int(ops[0][1:]), int(ops[1][1:]), int(ops[2][1:])
-            return (f"{{ float* a=(float*)&ctx->vr[{va}]; float* b=(float*)&ctx->vr[{vb}]; "
-                    f"uint32_t* d=(uint32_t*)&ctx->vr[{vd}]; "
+            body = (f"{{ float a[4],b[4]; ppu_vldf4(&ctx->vr[{va}],a); ppu_vldf4(&ctx->vr[{vb}],b); "
+                    f"uint32_t d[4]; int t=0; "
                     f"for(int i=0;i<4;i++) {{ uint32_t r=0; "
-                    f"if(a[i]>b[i]) r|=0x80000000u; if(a[i]<-b[i]) r|=0x40000000u; d[i]=r; }} }}")
+                    f"if(!(a[i]<=b[i])) r|=0x80000000u; if(!(a[i]>=-b[i])) r|=0x40000000u; d[i]=r; t+=(r==0); }} "
+                    f"ppu_vstu4(&ctx->vr[{vd}],d);")
+            if mn.endswith("."):
+                body += " ctx->cr=(ctx->cr & ~(0xFu<<4))|((t==4?2u:0u)<<4);"
+            return body + " }"
 
         # ------- Additional VMX integer instructions -------
         # Byte compare equal
         if mn.startswith("vcmpequb"):
             vd, va, vb = int(ops[0][1:]), int(ops[1][1:]), int(ops[2][1:])
-            return (f"{{ uint8_t* d=(uint8_t*)&ctx->vr[{vd}]; uint8_t* a=(uint8_t*)&ctx->vr[{va}]; "
-                    f"uint8_t* b=(uint8_t*)&ctx->vr[{vb}]; "
-                    f"for(int i=0;i<16;i++) d[i]=a[i]==b[i]?0xFFu:0u; }}")
+            body = (f"{{ uint8_t* d=(uint8_t*)&ctx->vr[{vd}]; uint8_t* a=(uint8_t*)&ctx->vr[{va}]; "
+                    f"uint8_t* b=(uint8_t*)&ctx->vr[{vb}]; int t=0; "
+                    f"for(int i=0;i<16;i++){{ int r=a[i]==b[i]; d[i]=r?0xFFu:0u; t+=r; }}")
+            if mn.endswith("."):
+                body += self._vcmp_cr6("t", 16)
+            return body + " }"
 
         # Saturating add
         if mn == "vaddsbs":
