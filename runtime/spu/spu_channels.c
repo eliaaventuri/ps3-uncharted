@@ -147,6 +147,8 @@ void spu_stop(spu_context* ctx)
  * andato bene, e il modulo veniva semplicemente rieseguito al tick dopo. Qui
  * l'indirizzo arriva dal lifter, cosi' si legge QUALE controllo e' fallito.
  * Deduplicato per (immagine, indirizzo) perche' scatta a ogni esecuzione. */
+int g_spu_ls0_watch = -1;
+spu_context* g_spu_trace_lock_ctx = NULL;
 void spu_stop_at(spu_context* ctx, uint32_t addr)
 {
     static uint32_t seen[32]; static int n = 0;
@@ -1674,10 +1676,17 @@ void spu_indirect_branch(spu_context* ctx)
         /* SPU_JOBTRACE_OVL=<id>: solo quel modulo (il sintetizzatore audio
          * da solo riempie il tetto di 1500 righe in due fotogrammi). */
         static int s_only = -2; if (s_only == -2) { const char* e = getenv("SPU_JOBTRACE_OVL"); s_only = e ? atoi(e) : -1; }
-        if (_armed && (s_only < 0 || ctx->resident_ovl == s_only) && _n++ < 1500) {
-            fprintf(stderr, "[jobtrace] ovl=%d pc=0x%05X lr=0x%05X ie=%u%s",
-                    ctx->resident_ovl, p, ctx->gpr[0]._u32[0] & SPU_LS_MASK, ctx->int_enable,
-                    fn ? "" : " (no lift)");
+        /* SPU_JOBTRACE_ONE=1: solo il primo contesto SPU che esegue il modulo
+         * (i job data-parallel girano su 5-6 lane insieme e le righe si
+         * mischiano). */
+        static int s_one = -1; static spu_context* s_lock = NULL;
+        extern spu_context* g_spu_trace_lock_ctx;   /* condiviso con dma-eawin (SPU_DMA_EAWIN_ONE) */
+        if (s_one < 0) s_one = getenv("SPU_JOBTRACE_ONE") ? 1 : 0;
+        if (_armed && (s_only < 0 || ctx->resident_ovl == s_only) && s_one && !s_lock) { s_lock = ctx; g_spu_trace_lock_ctx = ctx; }
+        if (_armed && (s_only < 0 || ctx->resident_ovl == s_only) && (!s_one || s_lock == ctx) && _n++ < 1500) {
+            fprintf(stderr, "[jobtrace] c%04X ovl=%d pc=0x%05X lr=0x%05X ie=%u%s",
+                    (unsigned)(((uintptr_t)ctx >> 12) & 0xFFFF), ctx->resident_ovl, p,
+                    ctx->gpr[0]._u32[0] & SPU_LS_MASK, ctx->int_enable, fn ? "" : " (no lift)");
             /* JobApi entries: args r3-r5. Post-job return 0x3308: result r3 +
              * the job's saved GetBufferTag result r80. */
             if (p == 0x2F30 || p == 0x1700 || p == 0x1770 || p == 0x17C8)

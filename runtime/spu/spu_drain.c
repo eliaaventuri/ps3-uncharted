@@ -246,11 +246,14 @@ void (*spu_take_interrupt(spu_context* ctx,
     } else if (op9 == 0x064) {       /* br i16 (relative to LS 0) */
         target = (((w >> 7) & 0xFFFF) << 2) & SPU_LS_MASK;
     } else {
-        static int _w = 0;
-        if (_w++ < 4)
+        /* Contatore globale atomico: quello locale statico lasciava passare
+         * milioni di righe (10 M in una corsa) con piu' thread SPU. */
+        static int s_noint_warn = 0;
+        if (__atomic_fetch_add(&s_noint_warn, 1, __ATOMIC_RELAXED) < 4)
             fprintf(stderr, "[spu-int] pending (st=0x%X mask=0x%X) but LS0 word "
-                    "0x%08X is no branch -- not taken\n",
-                    ctx->event_status, ctx->event_mask, w);
+                    "0x%08X is no branch -- not taken (img=%d ovl=%d pc=0x%05X)\n",
+                    ctx->event_status, ctx->event_mask, w, ctx->image_id, ctx->resident_ovl,
+                    (uint32_t)ctx->pc & SPU_LS_MASK);
         return tf;
     }
     ctx->srr0 = ctx->pc;             /* resume point for iret */

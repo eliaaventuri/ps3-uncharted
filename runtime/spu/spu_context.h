@@ -496,10 +496,19 @@ static inline u128 spu_ls_read128(const spu_context* ctx, uint32_t lsa)
     return v;
 }
 
+extern int g_spu_ls0_watch;   /* SPU_LS0_WATCH=1 (spu_channels.c): chi scrive LS 0 */
 static inline void spu_ls_write128(spu_context* ctx, uint32_t lsa, u128 val)
 {
     lsa &= SPU_LS_MASK & ~0xFu;
     uint8_t* p = &ctx->ls[lsa];
+    /* SPU_LS0_WATCH=1: i primi 16 store a LS 0 (il vettore di interrupt del
+     * PM). Uncharted, livello dive-boat: LS0 diventava `fsmbi` e l'interrupt
+     * di stall-and-notify non veniva piu' preso. */
+    if (g_spu_ls0_watch < 0) g_spu_ls0_watch = getenv("SPU_LS0_WATCH") ? 1 : 0;
+    if (g_spu_ls0_watch && lsa == 0) { static int _n = 0; if (_n++ < 16)
+        fprintf(stderr, "[ls0-watch] img=%d ovl=%d pc=0x%05X stq LS 0 = %08X %08X %08X %08X\n",
+                ctx->image_id, ctx->resident_ovl, (uint32_t)ctx->pc & SPU_LS_MASK,
+                val._u32[0], val._u32[1], val._u32[2], val._u32[3]); }
     /* WWS code-buffer probe: LBP's ChangeLoadToRunJob dispatches to LS[0x1320]
      * (= lsaJobCodeBuffer in LBP's layout) + entryOffset. When TecRunJob writes
      * that code-buffer LS address, dump the RunJob decision inputs so we can see

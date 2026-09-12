@@ -225,11 +225,18 @@ static inline int mfc_do_transfer(spu_context* spu, uint32_t lsa, uint64_t ea,
                                      const char* c = strchr(e, ':');
                                      s_hi = c ? (long)strtoul(c + 1, 0, 16) : s_lo + 0x100; }
                       else { s_lo = 0; s_hi = 0; } }
-      if (s_hi && (uint32_t)ea < (uint32_t)s_hi && (uint32_t)ea + size > (uint32_t)s_lo) {
+      /* con PS3_TTY_BT impostata conta solo dopo l'hit (come gli altri trace) */
+      extern int g_hle_trace_armed;
+      static int s_gate = -1; if (s_gate < 0) s_gate = getenv("PS3_TTY_BT") ? 1 : 0;
+      /* SPU_DMA_EAWIN_ONE=1: solo il contesto bloccato da SPU_JOBTRACE_ONE */
+      extern spu_context* g_spu_trace_lock_ctx;
+      static int s_one = -1; if (s_one < 0) s_one = getenv("SPU_DMA_EAWIN_ONE") ? 1 : 0;
+      if (s_hi && (!s_gate || g_hle_trace_armed) && (!s_one || g_spu_trace_lock_ctx == spu) &&
+          (uint32_t)ea < (uint32_t)s_hi && (uint32_t)ea + size > (uint32_t)s_lo) {
           static int _n = 0;
           if (_n++ < 100000)
-              fprintf(stderr, "[dma-eawin] img=%d ovl=%d pc=0x%05X %s lsa=0x%05X ea=0x%08X size=0x%X\n",
-                      spu->image_id, spu->resident_ovl, (uint32_t)spu->pc & SPU_LS_MASK,
+              fprintf(stderr, "[dma-eawin] c%04X img=%d ovl=%d pc=0x%05X %s lsa=0x%05X ea=0x%08X size=0x%X\n",
+                      (unsigned)(((uintptr_t)spu >> 12) & 0xFFFF), spu->image_id, spu->resident_ovl, (uint32_t)spu->pc & SPU_LS_MASK,
                       mfc_is_get(cmd) ? "GET" : mfc_is_put(cmd) ? "PUT" : "cmd",
                       lsa, (uint32_t)ea, size);
           /* A 0x6120 (il "manda 16 byte") si arriva con un salto indiretto: il

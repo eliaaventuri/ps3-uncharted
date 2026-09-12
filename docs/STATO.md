@@ -110,8 +110,20 @@ JUMP-a-se-stessi dei buffer scritti dai job SPU (`GCM_PARK_WAIT=1`) e
 attraversare gli zeri (NOP) dentro le CALL, e lo slot di partenza del vertex
 program (`SET_TRANSFORM_PROGRAM_START`). Risultato: ~33 draw per fotogramma
 nel menu, testo (glifi sbagliati), l'icona del tasto X, la voce evidenziata
-in giallo. Manca lo sfondo 3D (i buchi dei draw nei buffer SPU restano NOP)
-e i glifi del testo sono quelli sbagliati. Dettagli in "Sessione 27".
+in giallo. Poi il remap dei canali delle texture (SET_TEXTURE_CONTROL1,
+l'atlante dei caratteri tiene 4 pagine di glifi nei 4 canali) e il menu si
+legge: **"New Game / Options", "(X) SELECT"**. `cellSaveDataListSave2` con le
+callback guest: "New Game" salva (`gamedata/dev_hdd0/.../BCJS30015_NDI_
+UNCHARTED_DF_0`) e parte `dive-boat-movie-intro`: il livello `dive-boat` si
+carica con tutti gli attori (pirati, animazioni, banco audio). Altro bug del
+lifter PPU trovato li': `vminfp/vmaxfp` e diverse op intere VMX leggevano il
+register file big-endian con cast host (il quantizzatore della navmesh
+invertiva min/max e il PPU finiva nello stack). Fronte aperto: nel livello i
+job SPU di rendering (ovl 218 = `jobmod_00903d80`) scrivono a LS 0 attraverso
+un puntatore nullo letto dai propri dati, e la scena 3D non si vede ancora
+(nero: i buchi dei draw nei buffer SPU restano NOP). Tastiera = pad 0 nella
+finestra (frecce, Spazio/X = CROSS, C = CERCHIO, Invio = START); `PAD_SCRIPT`
+per le corse senza nessuno. Dettagli in "Sessione 27".
 
 Quanto arriva a fare, dal log:
 
@@ -541,16 +553,63 @@ RSX_DUMP_SKIP=60`) mostra il menu: righe di testo con i glifi sbagliati, il
 tasto X in un cerchio blu, una voce in giallo. Sfondo nero: i buchi da 8
 parole nei buffer SPU (dove il job di geometria patcha i draw) restano zeri.
 
+### Terza parte: dal menu al primo livello
+
+9. **I glifi.** L'atlante 256x128 (fmt 0x85, ARGB8) e' decodificato bene:
+   ha 4 pagine di glifi nei 4 canali (`RSX_TEX_SAVE_OFF=0601AF00`), e il
+   fragment program sceglie il canale con `dot(texel, tc2)` (tc2 = attr4 =
+   maschera). Il registro remap della texture (SET_TEXTURE_CONTROL1) era
+   0xAA1B, non l'identita' 0xAAE4: senza remap usciva il canale sbagliato.
+   Ora `tex_with_remap()` crea una vista Metal con swizzle (cache per
+   texture+remap). Il menu si legge.
+10. **Input.** `LBP_AUTOPRESS` (CROSS+START ogni 240 letture) fa partire
+    "New Game" a caso; ora `PAD_SCRIPT="45:x"` (pressioni a tempo) e la
+    tastiera della finestra Metal come pad 0 (`rsx_metal_key_down` <-
+    `cellPad.c`): frecce, Spazio/X CROSS, C CERCHIO, Z QUADRATO, V TRIANGOLO,
+    Q/E L1/R1, F/R L2/R2, Invio START, Tab SELECT, WASD/IJKL levette.
+11. **Salvataggio.** "New Game" chiama `cellSaveDataListSave2` (setBuf da
+    480 byte = 10 directory, funcList/funcStat/funcFile). Riscritta con le
+    callback guest (`savedata_list_guest`, anche ListLoad2); le strutture
+    stanno nello scratch HLE (`VM_HLE_INJECT_BASE + 0x8000`: la base fissa
+    0x024E0000 di prima era dentro la memoria del titolo). "SAVE completed",
+    directory `BCJS30015_NDI_UNCHARTED_DF_0` con PARAM.TXT.
+12. **Il livello.** `dive-boat` carica (21 MB), poi crash: SIGBUS a
+    0xD0000000 da `NavMesh::FindNearestPolyL` (0x455268) -> 0x6A0D78 con
+    un puntatore 0xCFFFFFFF. Il rapporto di fault ora stampa tutti i gpr,
+    v0-v3 e lo stack: le coordinate quantizzate del box erano x0=5 > x1=0.
+    Causa: **`vminfp`/`vmaxfp` liftate con `float*` sul register file
+    big-endian** (confronti su byte invertiti). Sistemate insieme alle
+    altre op intere VMX per corsia che facevano lo stesso (vmsumshm,
+    vadduhs/vaddshs/vadduws, vsubsws, vsum2sws, vmulouh/vmuleuh, vpkshss,
+    vmsummbm: ora `ppu_vldu8h/ppu_vstu8h/ppu_vldu4/ppu_vstu4`).
+13. Con quello il livello finisce il login di tutti gli attori ("pir-smg-*",
+    "anim-dive-boat", "Sound bank 'dive-boat'"). Poi:
+    - il PM finiva in `BRANCH-TO-0 pc=0x03528` dopo un interrupt preso
+      nella finestra `brsl $r0,0x3600` (ritorno via `iret` a un indirizzo
+      non registrato): `--extra-funcs 0x3528` in `relift_spu.sh`.
+    - il job ovl 218 (`jobmod_00903d80`, 41 KB, senza stringhe, gira su
+      piu' lane insieme) scrive `(32DF0000 x3, 0)` a **LS 0** (il vettore
+      di interrupt del PM: `bra 0xA2C` installato dal PM stesso a 0x2D74)
+      da pc 0x5CC0 via `stqx $rN, $r3, $rM` con r3 = `*(r3+0x20)` = 0:
+      un puntatore nullo nei suoi dati. Da li' gli interrupt non vengono
+      piu' presi ("LS0 word 0x32DF0000 is no branch"), il PM salta nei
+      propri dati (stopd @0x15B4/0x15EC = area di salvataggio registri) e
+      la FIFO resta parcheggiata ("stuck-get"). Nella traccia del job
+      (`SPU_JOBTRACE_OVL=218 SPU_JOBTRACE_ONE=1`) ci sono anche dispatch
+      "(no lift)" a 0xCBCC/0xCD54/0xCD7C/0xD2F4 = i ritorni di `bisl
+      $r0,$r0` (chiamate indirette a puntatori letti dai dati del job).
+    - `build.sh` non ricompila i moduli SPU liftati quando cambiano SOLO
+      gli header (`spu_context.h`): `rm obj/spu_*.o` prima.
+
 ### Il prossimo passo
 
-1. I glifi: il testo usa attr 0/2/3/4 dai vertici immediati; da capire se
-   sono le coordinate di texture (attributo sbagliato) o la texture stessa
-   (formato dell'atlante 256x128). `RSX_VP_DBG` con `RSX_VP_DBG_FP=0F900401`
-   sulla via inline (oggi stampa solo record_draw).
-2. Lo sfondo 3D: i buchi restano NOP. Chi dovrebbe patcharli (job di
-   geometria ovl 215?) e perche' non lo fa: `SPU_DMA_EAWIN` sui buffer
-   (EA 0x20500000+), `SPU_JOBTRACE_OVL=215`.
-3. Il menu reagisce ai tasti? Con l'immagine si puo' vedere.
+1. Il job 218: da dove vengono i suoi dati (i puntatori nulli). Con
+   `SPU_DMA_EAWIN=0x20000000:0x30000000 SPU_DMA_EAWIN_ONE=1` + il lock di
+   `SPU_JOBTRACE_ONE` si vedono i GET del solo contesto del job; ma il
+   job parte tardi (>180 s): corse da 240 s, o `PAD_SCRIPT` prima.
+2. I ritorni di `bisl $r0,$r0` come ingressi nel lifter SPU
+   (`find_spu_functions.py`: l'istruzione dopo un `bisl` e' un ingresso).
+3. Lo sfondo 3D del menu (i buchi da 8 parole restano NOP): stesso mondo.
 4. Assert non deterministico `joblist.cpp(578)` sul thread audio (tid 14).
 
 ### Strumenti nuovi
