@@ -344,9 +344,17 @@ typedef struct spu_context {
      * 8 slot condivisa fra tutti i thread host: con le lane concorrenti di
      * WwsJob finivano gli slot ("behave as before" = niente ripristino) e
      * due thread si prendevano lo stesso slot. Per contesto, niente corse. */
-    uint32_t irq_save_valid;
-    uint32_t irq_resume_pc;               /* srr0 al momento dell'interrupt */
-    u128     irq_gpr[128];
+    /* Pila di istantanee: il gestore del policy module di WwsJob salva i
+     * registri sullo stack guest (2032 byte per livello) e puo' essere
+     * interrotto a sua volta nella finestra `bie` del suo helper di attesa DMA
+     * -- misurato in Uncharted: due TAKE a srr0=0x2430 di fila. Con una sola
+     * istantanea la seconda sovrascriveva la prima e l'iret esterno
+     * ripristinava i registri del gestore (r4 = 0x24F8 al posto del link). */
+    uint32_t irq_save_valid;              /* = livelli salvati (0..SPU_IRQ_NEST) */
+    uint32_t irq_resume_pc;               /* srr0 del livello piu' interno */
+#define SPU_IRQ_NEST 4
+    uint32_t irq_resume_stack[SPU_IRQ_NEST];
+    u128     irq_gpr[SPU_IRQ_NEST][128];
 
 } spu_context;
 
@@ -513,7 +521,8 @@ static inline void spu_ls_write128(spu_context* ctx, uint32_t lsa, u128 val)
         extern int g_hle_trace_armed;   /* con PS3_TTY_BT parte dall'hit */
         static int s_gate = -1; if (s_gate < 0) s_gate = getenv("PS3_TTY_BT") ? 1 : 0;
         static int s_wovl = -2; if (s_wovl == -2) { const char* e = getenv("SPU_LS_WRITE_WATCH_OVL"); s_wovl = e ? atoi(e) : -1; }
-        static int _n = 0; if ((!s_gate || g_hle_trace_armed) && (s_wovl < 0 || ctx->resident_ovl == s_wovl) && _n++ < 16)
+        static int _n = 0; static int s_wmax = -1; if (s_wmax < 0) { const char* e = getenv("SPU_LS_WRITE_WATCH_MAX"); s_wmax = e ? atoi(e) : 16; }
+        if ((!s_gate || g_hle_trace_armed) && (s_wovl < 0 || ctx->resident_ovl == s_wovl) && _n++ < s_wmax)
         fprintf(stderr, "[ls-watch] c%04X img=%d ovl=%d pc=0x%05X lr=0x%05X stq LS 0x%05X = %08X %08X %08X %08X\n",
                 (unsigned)(((uintptr_t)ctx >> 12) & 0xFFFF), ctx->image_id, ctx->resident_ovl,
                 (uint32_t)ctx->pc & SPU_LS_MASK, ctx->gpr[0]._u32[0] & SPU_LS_MASK, lsa,
@@ -808,12 +817,32 @@ static inline void spu_pcwatch(spu_context* ctx)
  * brsl/bisl frame is live (host_depth>0); at 0 the frame was destroyed (task
  * resume / restack unwind) so dispatch to the link register instead -- faithful
  * to CBEA `bi` (branch to word 0 of RA). pc set unconditionally. */
-#define SPU_RET(ctx) do {                                      \
-        (ctx)->pc = (ctx)->gpr[0]._u32[0];                     \
+/* Un `bi $r0` con r0 DIVERSO dall'indirizzo di ritorno della chiamata corrente
+ * (ret_link, piantato da brsl/bisl) non e' il ritorno di questo frame: e' un
+ * salto calcolato, e va dispatchato come tale. Il policy module di WwsJob fa
+ * `ila $r0, epilogo; br helper` e l'helper finisce con `bi $r0`: preso per
+ * ritorno, saltava l'epilogo (stack e r80-r81 mai ripristinati: il job 218 di
+ * Uncharted usciva senza disegnare). SPU_RET_LOOSE=1 ripristina il vecchio
+ * comportamento. */
+static inline int spu_ret_strict(void)
+{
+    static int s = -1;
+    if (s < 0) s = getenv("SPU_RET_LOOSE") ? 0 : 1;
+    return s;
+}
+#define SPU_RETR(ctx, reg) do {                                \
+        (ctx)->pc = (ctx)->gpr[reg]._u32[0];                   \
         if ((ctx)->host_depth == 0)                            \
             g_spu_trampoline_fn = spu_indirect_branch;         \
+        else if (spu_ret_strict() && (ctx)->ret_link &&        \
+                 (((ctx)->pc & SPU_LS_MASK) != (ctx)->ret_link)) { \
+            static int _n = 0; extern int g_hle_trace_armed;   \
+            if (_n++ < 60) fprintf(stderr, "[spu-ret] salto: r%d=0x%05X ret_link=0x%05X depth=%d img=%d ovl=%d\n", \
+                (reg), (ctx)->pc & SPU_LS_MASK, (ctx)->ret_link, (ctx)->host_depth, (ctx)->image_id, (ctx)->resident_ovl); \
+            g_spu_trampoline_fn = spu_indirect_branch; }       \
         return;                                                \
     } while (0)
+#define SPU_RET(ctx) SPU_RETR(ctx, 0)
 
 #ifdef __cplusplus
 } /* extern "C" */

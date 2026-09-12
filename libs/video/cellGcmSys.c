@@ -694,6 +694,7 @@ static u32 s_sema_offset = 0;   /* NV406E semaphore offset (label window) */
 static u32 s_fifo_getoff  = 0;
 static u32 s_last_ring_off = 0;   /* last offset the walker actually consumed */
 static u32 s_fifo_calloff = 0;
+static u32 s_call_start = 0;   /* inizio del buffer CALLato corrente (per GCM_CALLDUMP) */
 
 /* ---------------------------------------------------------------------------
  * 2D transfer engines (FIFO subchannels != 0).
@@ -1796,6 +1797,24 @@ static void gcm_rsx_process_fifo_unlocked(void)
                     if (pw) { s_parked = 1;
                               { static int _n = 0; if (_n++ < 8)
                                 fprintf(stderr, "[cellGcmSys] FIFO parcheggiata a 0x%08X (put=0x%08X): aspetto la patch\n", tgt, put); }
+                              /* GCM_PARKDUMP=1: i comandi dell'anello DOPO la CALL parcheggiata
+                               * (cosa aspetta dietro il job SPU), primi 3 park dopo l'armo */
+                              { static int pd = -1; static int pn = 0; extern int g_hle_trace_armed;
+                                if (pd < 0) pd = getenv("GCM_PARKDUMP") ? 1 : 0;
+                                if (pd && g_hle_trace_armed && s_fifo_calloff && pn++ < 3) {
+                                    u32 io = s_fifo_calloff; int steps = 0;
+                                    fprintf(stderr, "[parkdump] anello dopo la CALL (da %08X, put=%08X):", io, put);
+                                    while (steps++ < 80 && io != put) { u32 e = gcm_io2ea(io); if (!e) break; u32 wv = vm_read32(e);
+                                        if ((wv >> 29) == 1) { fprintf(stderr, "\n   %08X JUMP -> %08X", wv, wv & 0x1FFFFFFCu); io = wv & 0x1FFFFFFCu; continue; }
+                                        if ((wv & 3) == 2) { fprintf(stderr, "\n   %08X CALL -> %08X", wv, wv & 0x1FFFFFFCu); io += 4; continue; }
+                                        if (wv == 0x00020000u) { fprintf(stderr, "\n   RET"); io += 4; continue; }
+                                        u32 cnt = (wv >> 18) & 0x7FFu, m = wv & 0x1FFCu;
+                                        fprintf(stderr, "\n   %08X m=%04X n=%-3u", wv, m, cnt);
+                                        for (u32 q = 1; q <= cnt && q <= 6; q++) { u32 e2 = gcm_io2ea(io + q * 4); fprintf(stderr, " %08X", e2 ? vm_read32(e2) : 0); }
+                                        if (cnt > 6) fprintf(stderr, " ...");
+                                        if (wv == 0) { io += 4; continue; }
+                                        io += 4 + cnt * 4; }
+                                    fprintf(stderr, "\n"); } }
                               break; } }
                   /* Parked. If the title has meanwhile moved `put` somewhere
                    * else, it has switched to its other segment and left this
@@ -1823,12 +1842,48 @@ static void gcm_rsx_process_fifo_unlocked(void)
               { static int _rd = -1; if (_rd < 0) _rd = getenv("GCM_RECDBG") ? 1 : 0;
                 if (_rd) fprintf(stderr, "[CALL] %08X -> %08X (put=%08X)\n", s_fifo_getoff, tgt, put); }
               s_fifo_calloff = s_fifo_getoff + 4;
-              s_fifo_getoff  = tgt; }
+              s_fifo_getoff  = tgt; s_call_start = tgt; }
             continue;
         }
         if (w == 0x00020000u) {                /* RET */
             { static int _rd = -1; if (_rd < 0) _rd = getenv("GCM_RECDBG") ? 1 : 0;
               if (_rd) fprintf(stderr, "[RET] %08X -> %08X (put=%08X)\n", s_fifo_getoff, s_fifo_calloff, put); }
+            /* GCM_CALLDUMP=<k>: al k-esimo RET (dopo l'armo di PS3_TTY_BT) i
+             * comandi del buffer CALLato, dall'inizio al RET: cosa c'e' nei
+             * buffer scritti dai job SPU (i buchi dei draw sono ancora zeri?). */
+            { static long k = -2; static long nn = 0; extern int g_hle_trace_armed;
+              if (k == -2) { const char* e = getenv("GCM_CALLDUMP"); k = e ? strtol(e, 0, 10) : -1; }
+              /* GCM_CALLSTAT=1: ogni 500 RET, quanti buffer CALLati avevano un
+               * SET_BEGIN_END (0x1808) o un DRAW (0x1824/0x1814) e quanti zeri. */
+              { static int st = -1; static unsigned nb = 0, nd = 0, nz = 0, nw = 0;
+                if (st < 0) st = getenv("GCM_CALLSTAT") ? 1 : 0;
+                if (st && s_call_start) { u32 io = s_call_start; int hasdraw = 0; unsigned z = 0, wds = 0;
+                    while (io < s_fifo_getoff && wds < 4096) { u32 e = gcm_io2ea(io); if (!e) break; u32 wv = vm_read32(e); wds++;
+                        if (wv == 0) { z++; io += 4; continue; }
+                        if ((wv >> 29) == 1 || (wv & 3) == 2) { io += 4; continue; }
+                        u32 m = wv & 0x1FFCu, cnt = (wv >> 18) & 0x7FFu;
+                        if (m == 0x1808 || m == 0x1824 || m == 0x1814) hasdraw = 1;
+                        { static unsigned hist[0x800]; if ((m >> 2) < 0x800) hist[m >> 2]++;
+                          if (nb % 500 == 499 && io + 4 + cnt * 4 >= s_fifo_getoff) { fprintf(stderr, "[callstat] metodi:");
+                              for (u32 k = 0; k < 0x800; k++) if (hist[k]) fprintf(stderr, " %04X:%u", k << 2, hist[k]); fprintf(stderr, "\n"); } }
+                        io += 4 + cnt * 4; }
+                    nb++; nd += hasdraw; nz += z; nw += wds;
+                    if (nb % 500 == 0) fprintf(stderr, "[callstat] %u buffer CALLati: %u con draw, %u parole di cui %u zeri\n", nb, nd, nw, nz); } }
+              if (k >= 0 && g_hle_trace_armed && nn++ == k && s_call_start) {
+                  fprintf(stderr, "[calldump] buffer %08X..%08X (%u parole)", s_call_start, s_fifo_getoff, (s_fifo_getoff - s_call_start) / 4);
+                  u32 io = s_call_start; int steps = 0, zeros = 0;
+                  while (io < s_fifo_getoff && steps++ < 2000) { u32 e = gcm_io2ea(io); if (!e) break; u32 wv = vm_read32(e);
+                      if (wv == 0) { zeros++; io += 4; continue; }
+                      if (zeros) { fprintf(stderr, "\n   [%d zeri]", zeros); zeros = 0; }
+                      if ((wv >> 29) == 1) { fprintf(stderr, "\n   %08X  <- JUMP -> %08X", wv, wv & 0x1FFFFFFCu); io += 4; continue; }
+                      if ((wv & 3) == 2) { fprintf(stderr, "\n   %08X  <- CALL -> %08X", wv, wv & 0x1FFFFFFCu); io += 4; continue; }
+                      u32 cnt = (wv >> 18) & 0x7FFu, m = wv & 0x1FFCu;
+                      fprintf(stderr, "\n   %08X m=%04X n=%-3u", wv, m, cnt);
+                      for (u32 q = 1; q <= cnt && q <= 8; q++) { u32 e2 = gcm_io2ea(io + q * 4); fprintf(stderr, " %08X", e2 ? vm_read32(e2) : 0); }
+                      if (cnt > 8) fprintf(stderr, " ...");
+                      io += 4 + cnt * 4; }
+                  if (zeros) fprintf(stderr, "\n   [%d zeri]", zeros);
+                  fprintf(stderr, "\n"); } }
             s_fifo_getoff = s_fifo_calloff;
             s_fifo_calloff = 0;
             continue;

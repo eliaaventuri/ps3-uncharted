@@ -231,7 +231,10 @@ static inline int mfc_do_transfer(spu_context* spu, uint32_t lsa, uint64_t ea,
       /* SPU_DMA_EAWIN_ONE=1: solo il contesto bloccato da SPU_JOBTRACE_ONE */
       extern spu_context* g_spu_trace_lock_ctx;
       static int s_one = -1; if (s_one < 0) s_one = getenv("SPU_DMA_EAWIN_ONE") ? 1 : 0;
+      /* SPU_DMA_EAWIN_OVL=<n>: solo i contesti con quel modulo di job residente */
+      static int s_ovl = -2; if (s_ovl == -2) { const char* e = getenv("SPU_DMA_EAWIN_OVL"); s_ovl = e ? atoi(e) : -1; }
       if (s_hi && (!s_gate || g_hle_trace_armed) && (!s_one || g_spu_trace_lock_ctx == spu) &&
+          (s_ovl < 0 || spu->resident_ovl == s_ovl) &&
           (uint32_t)ea < (uint32_t)s_hi && (uint32_t)ea + size > (uint32_t)s_lo) {
           static int _n = 0;
           if (_n++ < 100000)
@@ -251,10 +254,27 @@ static inline int mfc_do_transfer(spu_context* spu, uint32_t lsa, uint64_t ea,
            * DMA e' partito non basta, serve il valore che porta. */
           if (_n <= 100000 && mfc_is_put(cmd)) {
               const unsigned char* _p = &spu->ls[lsa & SPU_LS_MASK];
-              fprintf(stderr, "            dati: %02X%02X%02X%02X %02X%02X%02X%02X\n",
+              fprintf(stderr, "            dati: %02X%02X%02X%02X %02X%02X%02X%02X",
                       _p[0], _p[1], _p[2], _p[3], _p[4], _p[5], _p[6], _p[7]);
+              /* SPU_DMA_EAWIN_FULL=1: tutto il trasferimento (max 64 parole) */
+              static int s_full = -1; if (s_full < 0) s_full = getenv("SPU_DMA_EAWIN_FULL") ? 1 : 0;
+              if (s_full) for (uint32_t i = 8; i + 4 <= size && i < 256; i += 4)
+                  fprintf(stderr, "%s%02X%02X%02X%02X", (i % 32) ? " " : "\n                  ", _p[i], _p[i+1], _p[i+2], _p[i+3]);
+              fprintf(stderr, "\n");
           }
       } }
+    /* SPU_DMA_PUTVAL=<hex>: ogni PUT i cui dati contengono quella parola a 32
+     * bit (allineata): chi scrive un certo puntatore in memoria principale. */
+    { static long s_pv = -1;
+      if (s_pv < 0) { const char* e = getenv("SPU_DMA_PUTVAL"); s_pv = e ? (long)strtoul(e, 0, 16) : 0; }
+      if (s_pv && mfc_is_put(cmd) && size >= 4) {
+          const unsigned char* _p = &spu->ls[lsa & SPU_LS_MASK];
+          for (uint32_t i = 0; i + 4 <= size && i < 0x4000; i += 4) {
+              uint32_t w = ((uint32_t)_p[i] << 24) | ((uint32_t)_p[i+1] << 16) | ((uint32_t)_p[i+2] << 8) | _p[i+3];
+              if (w == (uint32_t)s_pv) { static int _n = 0; if (_n++ < 40)
+                  fprintf(stderr, "[dma-putval] c%04X img=%d ovl=%d pc=0x%05X PUT lsa=0x%05X ea=0x%08X size=0x%X: parola a +0x%X, ritorno a 0x%05X\n",
+                          (unsigned)(((uintptr_t)spu >> 12) & 0xFFFF), spu->image_id, spu->resident_ovl, (uint32_t)spu->pc & SPU_LS_MASK,
+                          lsa, (uint32_t)ea, size, i, spu->gpr[0]._u32[0] & SPU_LS_MASK); break; } } } }
     /* SPU_DMA_DUMP_EA=<hex>: il contenuto di ogni GET che parte da quell'EA.
      * Il dump generico si ferma a 64 byte, e le strutture che contano qui non
      * ci stanno: il job manager di WwsJob legge 256 byte dalla sua struttura di

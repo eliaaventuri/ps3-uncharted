@@ -333,11 +333,25 @@ int rsx_process_method(rsx_state* state, u32 method, u32 data)
      * offset, 0x1D70 back-end release, 0x1D74 texture-read release). */
     { static int s_sd = -1; if (s_sd < 0) s_sd = getenv("GCM_SEMDBG") ? 1 : 0;
       static int s_sn = 0;
-      if (s_sd && s_sn < 60 && (method == 0x0060 || method == 0x1D6C || method == 0x1D70 || method == 0x1D74)) { s_sn++;
+      if (s_sd && (method == 0x0060 || method == 0x01A4 || (s_sn < 60 && (method == 0x1D6C || method == 0x1D70 || method == 0x1D74)))) { s_sn++;
           fprintf(stderr, "[semdbg] method=0x%04X data=0x%08X\n", method, data); } }
+    /* GCM_DATAWATCH=lo:hi (hex): ogni metodo il cui argomento (24 bit bassi)
+     * cade in [lo,hi): chi scrive in una zona di memoria (report, semafori). */
+    { static long s_lo = -1, s_hi = 0; static int s_n = 0;
+      if (s_lo < 0) { const char* e = getenv("GCM_DATAWATCH"); s_lo = 0; s_hi = 0;
+          if (e) { s_lo = strtol(e, 0, 16); const char* c = strchr(e, ':'); s_hi = c ? strtol(c + 1, 0, 16) : s_lo + 0x100; } }
+      /* GCM_DATAWATCH_M=<hex>: solo quel metodo */
+      static long s_m = -2; if (s_m == -2) { const char* e = getenv("GCM_DATAWATCH_M"); s_m = e ? strtol(e, 0, 16) : -1; }
+      if (s_hi && (s_m < 0 || (long)method == s_m) && (long)(data & 0xFFFFFFu) >= s_lo && (long)(data & 0xFFFFFFu) < s_hi && s_n++ < 4000)
+          fprintf(stderr, "[datawatch] method=0x%04X data=0x%08X\n", method, data); }
     { static u32 s_sem_off = 0;
       if (method == 0x1D6C) { s_sem_off = data; return 0; }
-      if (method == 0x1D70) {
+      /* 0x1D74 NV4097_TEXTURE_READ_SEMAPHORE_RELEASE: stessa scrittura del
+       * back-end release, con lo stesso scambio di byte (RPCS3 fa lo stesso).
+       * Uncharted usa SOLO questa: i buffer di comandi dei job SPU finiscono
+       * con SET_SEMAPHORE_OFFSET 0x480.. + questa release, e il job di
+       * geometria (ovl 215) aspetta che qualcuno scriva quei label. */
+      if (method == 0x1D70 || method == 0x1D74) {
         extern void vm_write32(uint32_t a, uint32_t v);
         /* The RSX back-end semaphore write swaps bytes 0<->2 of the value (hw
          * quirk); libgcm's cellGcmSetWriteBackEndLabel PRE-swaps to compensate

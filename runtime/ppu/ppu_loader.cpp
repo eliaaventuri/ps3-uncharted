@@ -1207,7 +1207,10 @@ void vm_write32(uint64_t a, uint32_t v) { barrier_watch_hit((uint32_t)a, v, 4, _
          * gia' -- il ramo a 64 bit la usava, questo no. */
         { void* ra = __builtin_return_address(0);
           fprintf(stderr,"[WWATCH] write32 0x%08X = 0x%08X  ra=%p guest-fn=0x%08X\n",
-                  ea, v, ra, ppu_prof_resolve_host(ra)); }
+                  ea, v, ra, ppu_prof_resolve_host(ra));
+          /* YDKJ_WWATCH_BT=1: catena guest anche per le write32 (prime 4) */
+          { static int s_bt = -1; static int s_n = 0; if (s_bt < 0) s_bt = getenv("YDKJ_WWATCH_BT") ? 1 : 0;
+            if (s_bt && s_n++ < 4) ppu_guest_callstack("wwatch32"); } }
 #endif
       } } }
 
@@ -2430,6 +2433,28 @@ extern "C" void lv2_syscall(ppu_context* ctx)
                        * a = read32(a+off), `+off` somma e basta:
                        * `0x25E00310>0x10>4:0x20` e' il secondo elemento
                        * dell'array puntato da +0x10. */
+                      /* PS3_TTY_POKE=<addr>:<byte>[,<addr>:<byte>]: a ogni hit scrive quei
+                       * byte in memoria guest (esperimenti: spegnere un flag del titolo). */
+                      { static const char* s_pk = (const char*)-1;
+                        if (s_pk == (const char*)-1) s_pk = getenv("PS3_TTY_POKE");
+                        if (s_pk) { const char* p = s_pk;
+                            while (*p) { char* e; uint32_t a = (uint32_t)strtoul(p, &e, 16); p = e;
+                                uint32_t v = (*p == ':') ? (uint32_t)strtoul(p + 1, &e, 16) : 0; if (*p == ':') p = e;
+                                vm_write8(a, (uint8_t)v);
+                                { static int _n = 0; if (_n++ < 4) fprintf(stderr, "[tty-poke] %08X <- %02X\n", a, v & 0xFF); }
+                                if (*p == ',') p++; else break; } } }
+                      /* PS3_TTY_SCAN=<hex32>[:<mask>]: al primo hit cerca quella parola
+                       * (allineata a 4, (w & mask) == valore) in tutta la memoria guest
+                       * mappata e stampa fino a 24 indirizzi con le 3 parole seguenti. */
+                      { static int s_sc = -1; static uint32_t s_sv = 0, s_sm = 0xFFFFFFFFu;
+                        if (s_sc < 0) { const char* e = getenv("PS3_TTY_SCAN"); s_sc = 0;
+                            if (e) { char* q = 0; s_sv = (uint32_t)strtoul(e, &q, 16); if (q && *q == ':') s_sm = (uint32_t)strtoul(q + 1, 0, 16); s_sc = 1; } }
+                        if (s_sc == 1) { s_sc = 2; int n = 0;
+                            for (uint32_t a = 0x00010000u; a + 16 <= ppu_vm_size && n < 24; a += 4) {
+                                uint32_t w; memcpy(&w, vm_base + a, 4); w = __builtin_bswap32(w);
+                                if ((w & s_sm) == s_sv) { n++;
+                                    fprintf(stderr, "[tty-scan] %08X: %08X %08X %08X %08X\n", a, w, vm_read32(a + 4), vm_read32(a + 8), vm_read32(a + 12)); } }
+                            fprintf(stderr, "[tty-scan] fine: %d risultati\n", n); } }
                       { static const char* s_dp = (const char*)-1; static int s_dn = 0;
                         if (s_dp == (const char*)-1) s_dp = getenv("PS3_TTY_DUMP");
                         if (s_dp && s_dn++ < 20) { const char* p = s_dp;

@@ -913,7 +913,9 @@ class SPULifter:
                     or addr in self.link_return:
                 # SPU_RET: host return while a matched brsl frame is live
                 # (host_depth>0); at 0 the frame was destroyed -> dispatch to r0.
-                return f"{_ied}SPU_RET(ctx);"
+                # SPU_RETR: il registro di collegamento e' quello del `bi`
+                # (r78 nei ritorni `brsl $r78` del policy module), non sempre r0.
+                return f"{_ied}SPU_RETR(ctx, {int(tgt_reg)});"
             # Computed indirect tail: set pc + trampoline to the dispatcher, unwind.
             return (f"{_ied}ctx->pc = {g(tgt_reg)}._u32[0]; "
                     f"g_spu_trampoline_fn = spu_indirect_branch; return;")
@@ -933,20 +935,25 @@ class SPULifter:
             # Indirect call: nested dispatch bracketed like brsl (host_depth +
             # SPU_DRAIN + image save/restore) so the callee's tail-chains drain
             # here and its `bi $r0` returns via host return.
-            return (f"{g(link_rt)} = spu_link(0x{addr + 4:X}); "
-                    f"{{ int32_t _si = (int32_t)ctx->image_id; "
+            # The target is read BEFORE the link is written: `bisl $r0,$r0`
+            # (job 218 of Uncharted calling its API table through r0) otherwise
+            # "calls" its own return address and the callee never runs.
+            return (f"{{ uint32_t _tg = {g(tgt_reg)}._u32[0]; "
+                    f"{g(link_rt)} = spu_link(0x{addr + 4:X}); "
+                    f"int32_t _si = (int32_t)ctx->image_id; "
                     f"uint32_t _rl = ctx->ret_link; ctx->ret_link = 0x{addr + 4:X}u; "
-                    f"{_ied}ctx->pc = {g(tgt_reg)}._u32[0]; ctx->host_depth++; "
+                    f"{_ied}ctx->pc = _tg; ctx->host_depth++; "
                     f"spu_indirect_branch(ctx); SPU_DRAIN(ctx); "
                     f"ctx->host_depth--; ctx->ret_link = _rl; spu_img_restore(ctx, _si); }}")
         # bisled: set link, branch to RA only if an external event is pending.
         if mn in ("bisled",):
             link_rt = insn.raw & 0x7F            # rt = link; ra (last) = target
             tgt_reg = _reg(ops[-1])
-            return (f"{g(link_rt)} = spu_splat_u32(0x{addr + 4:X}); "
+            return (f"{{ uint32_t _tg = {g(tgt_reg)}._u32[0]; "
+                    f"{g(link_rt)} = spu_splat_u32(0x{addr + 4:X}); "
                     f"if ((ctx->event_status & ctx->event_mask) != 0) {{ "
-                    f"{_ied}ctx->pc = {g(tgt_reg)}._u32[0]; "
-                    f"g_spu_trampoline_fn = spu_indirect_branch; return; }}")
+                    f"{_ied}ctx->pc = _tg; "
+                    f"g_spu_trampoline_fn = spu_indirect_branch; return; }} }}")
         # biz/binz/bihz/bihnz: ops[0] = condition reg, ops[1] = target reg.
         if mn in ("biz", "binz", "bihz", "bihnz"):
             cond = self._cond(mn[1:], _reg(ops[0]))   # strip leading 'b' -> iz/inz...
@@ -958,7 +965,7 @@ class SPULifter:
             # land on an unregistered mid-function PC.
             if (tgt_reg == "0" and addr not in self.bi_r0_jump) \
                     or addr in self.link_return:
-                return f"if ({cond}) {{ {_ied}SPU_RET(ctx); }}"
+                return f"if ({cond}) {{ {_ied}SPU_RETR(ctx, {int(tgt_reg)}); }}"
             return (f"if ({cond}) {{ {_ied}ctx->pc = {g(tgt_reg)}._u32[0]; "
                     f"g_spu_trampoline_fn = spu_indirect_branch; return; }}")
 

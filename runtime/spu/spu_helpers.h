@@ -215,15 +215,20 @@ static inline u128 spu_rotqbii(u128 a, int sh) { sh&=7; if(!sh) return a;
 static inline u128 spu_fa(u128 a, u128 b) { u128 r; for(int i=0;i<4;i++) r._f32[i]=a._f32[i]+b._f32[i]; return r; }
 static inline u128 spu_fs(u128 a, u128 b) { u128 r; for(int i=0;i<4;i++) r._f32[i]=a._f32[i]-b._f32[i]; return r; }
 
-/* Float<->int conversions with scale (RI8). rpcs3/HW scale-table semantics:
- * scale[x] = 2^(x-155); cflts/cfltu use x=173-i8, csflt/cuflt use x=155-i8. */
-static inline u128 spu_cflts(u128 a, int i8){ u128 r; float f=exp2f((float)(173-i8)-155.0f);
+/* Float<->int conversions with scale (RI8). CBEA: cflts/cfltu multiply by
+ * 2^(173-I8), csflt/cuflt by 2^(I8-155) (rpcs3: scale[173-i8] / scale[i8-155]
+ * with scale[x] = 2^x). The previous formula subtracted a further 155 and had
+ * the csflt sign flipped: with the usual encodings (cflts 173, csflt 155) every
+ * conversion multiplied by 2^-155 = 0.0f -- Uncharted's SPU triangle culling
+ * (job 215, `cflts $r,$r,172` on the projected vertices) saw every triangle as
+ * degenerate and drew nothing. */
+static inline u128 spu_cflts(u128 a, int i8){ u128 r; float f=exp2f((float)(173-i8));
     for(int i=0;i<4;i++){ double v=(double)a._f32[i]*f; if(v>2147483647.0)v=2147483647.0; if(v<-2147483648.0)v=-2147483648.0; r._s32[i]=(int32_t)v; } return r; }
-static inline u128 spu_cfltu(u128 a, int i8){ u128 r; float f=exp2f((float)(173-i8)-155.0f);
+static inline u128 spu_cfltu(u128 a, int i8){ u128 r; float f=exp2f((float)(173-i8));
     for(int i=0;i<4;i++){ double v=(double)a._f32[i]*f; if(v<0)v=0; if(v>4294967295.0)v=4294967295.0; r._u32[i]=(uint32_t)v; } return r; }
-static inline u128 spu_csflt(u128 a, int i8){ u128 r; float f=exp2f((float)(155-i8)-155.0f);
+static inline u128 spu_csflt(u128 a, int i8){ u128 r; float f=exp2f((float)(i8-155));
     for(int i=0;i<4;i++) r._f32[i]=(float)a._s32[i]*f; return r; }
-static inline u128 spu_cuflt(u128 a, int i8){ u128 r; float f=exp2f((float)(155-i8)-155.0f);
+static inline u128 spu_cuflt(u128 a, int i8){ u128 r; float f=exp2f((float)(i8-155));
     for(int i=0;i<4;i++) r._f32[i]=(float)a._u32[i]*f; return r; }
 static inline u128 spu_fm(u128 a, u128 b) { u128 r; for(int i=0;i<4;i++) r._f32[i]=a._f32[i]*b._f32[i]; return r; }
 static inline u128 spu_fma(u128 a, u128 b, u128 c)  { u128 r; for(int i=0;i<4;i++) r._f32[i]=a._f32[i]*b._f32[i]+c._f32[i]; return r; }

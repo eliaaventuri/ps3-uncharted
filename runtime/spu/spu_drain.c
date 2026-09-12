@@ -202,9 +202,16 @@ unsigned spu_sn_defer_ticks(void)
  * until iret). */
 static void spu_irq_regs_save(spu_context* ctx)
 {
+    if (ctx->irq_save_valid >= SPU_IRQ_NEST) {
+        static int _n = 0;
+        if (_n++ < 4) fprintf(stderr, "[spu-int] annidamento oltre %d livelli: istantanea persa\n", SPU_IRQ_NEST);
+        return;
+    }
+    uint32_t d = ctx->irq_save_valid;
+    ctx->irq_resume_stack[d] = ctx->srr0;
+    memcpy(ctx->irq_gpr[d], ctx->gpr, sizeof ctx->irq_gpr[d]);
     ctx->irq_resume_pc = ctx->srr0;
-    memcpy(ctx->irq_gpr, ctx->gpr, sizeof ctx->irq_gpr);
-    ctx->irq_save_valid = 1;
+    ctx->irq_save_valid = d + 1;
 }
 
 /* Called from spu_indirect_branch on every dispatch. Restores + clears when
@@ -221,8 +228,10 @@ int spu_irq_regs_maybe_restore(spu_context* ctx)
     if (!ctx->irq_save_valid) return 0;
     if ((ctx->pc & SPU_LS_MASK) == (ctx->irq_resume_pc & SPU_LS_MASK) &&
         ctx->int_enable) {
-        memcpy(ctx->gpr, ctx->irq_gpr, sizeof ctx->irq_gpr);
-        ctx->irq_save_valid = 0;
+        uint32_t d = ctx->irq_save_valid - 1;
+        memcpy(ctx->gpr, ctx->irq_gpr[d], sizeof ctx->irq_gpr[d]);
+        ctx->irq_save_valid = d;
+        ctx->irq_resume_pc = d ? ctx->irq_resume_stack[d - 1] : 0;
         return 1;
     }
     return 0;
@@ -251,8 +260,9 @@ void (*spu_take_interrupt(spu_context* ctx,
         static int s_noint_warn = 0;
         if (__atomic_fetch_add(&s_noint_warn, 1, __ATOMIC_RELAXED) < 4)
             fprintf(stderr, "[spu-int] pending (st=0x%X mask=0x%X) but LS0 word "
-                    "0x%08X is no branch -- not taken (img=%d ovl=%d pc=0x%05X)\n",
-                    ctx->event_status, ctx->event_mask, w, ctx->image_id, ctx->resident_ovl,
+                    "0x%08X is no branch -- not taken (c%04X img=%d ovl=%d pc=0x%05X)\n",
+                    ctx->event_status, ctx->event_mask, w,
+                    (unsigned)(((uintptr_t)ctx >> 12) & 0xFFFF), ctx->image_id, ctx->resident_ovl,
                     (uint32_t)ctx->pc & SPU_LS_MASK);
         return tf;
     }

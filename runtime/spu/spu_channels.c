@@ -1009,6 +1009,9 @@ void spu_overlay_note_get(spu_context* ctx, uint32_t ea, const uint8_t* ls, uint
         if (hit) {
             if (ctx->resident_ovl != o->image_id) {
                 ctx->resident_ovl = o->image_id;
+                { static uint8_t _seen[256]; int img = o->image_id; if (img >= 0 && img < 256 && !_seen[img]) { _seen[img] = 1;
+                      struct timespec _ts; clock_gettime(CLOCK_MONOTONIC, &_ts);
+                      fprintf(stderr, "[spu-ovl] primo uso del modulo %d (t=%ld s)\n", img, (long)_ts.tv_sec); } }
                 { static int _n = 0; if (_n++ < 32)
                     fprintf(stderr, "[spu-ovl] img=%d streamed overlay src=0x%08X "
                             "-> LS 0x%05X size=%u -> resident ovl image %d%s\n",
@@ -1356,8 +1359,10 @@ void spu_indirect_branch(spu_context* ctx)
      * of a computed pointer (e.g. a packed handle like 0x7a028803) are ignored.
      * Without this, any indirect branch through such a value fails the lookup
      * and falls into branch-to-0. All lifted funcs live below SPU_LS_SIZE, so
-     * masking is a no-op for already-valid targets. */
-    ctx->pc &= SPU_LS_MASK;
+     * masking is a no-op for already-valid targets. The low two bits are
+     * ignored by the hardware too: Uncharted's geometry job (ovl 215) keeps
+     * a flag in bit 0 of its jump-table selector (`bi $r82` = 0x12231). */
+    ctx->pc &= SPU_LS_MASK & ~3u;
     /* Interrupt-return register restore (see spu_drain.c spu_irq_regs_save):
      * the WWS handler's save/restore shim lives at unlifted top-of-LS, so we
      * enforce the preserve-all-registers hardware contract here -- the first
@@ -1590,6 +1595,10 @@ void spu_indirect_branch(spu_context* ctx)
             if (img) {
                 if (ctx->resident_ovl != img) {
                     ctx->resident_ovl = img;
+                    /* prima volta che ogni modulo diventa residente (max 64 moduli) */
+                    { static uint8_t _seen[256]; if (img >= 0 && img < 256 && !_seen[img]) { _seen[img] = 1;
+                          struct timespec _ts; clock_gettime(CLOCK_MONOTONIC, &_ts);
+                          fprintf(stderr, "[spu-ovl] primo uso del modulo %d (t=%ld s)\n", img, (long)_ts.tv_sec); } }
                     static int _n = 0; if (_n++ < 32)
                         fprintf(stderr, "[spu-ovl] WWS job module resident: codeBase=0x%05X "
                                 "pc=0x%05X -> overlay image %d\n", codeBase, ctx->pc & SPU_LS_MASK, img);
@@ -1683,10 +1692,32 @@ void spu_indirect_branch(spu_context* ctx)
         extern spu_context* g_spu_trace_lock_ctx;   /* condiviso con dma-eawin (SPU_DMA_EAWIN_ONE) */
         if (s_one < 0) s_one = getenv("SPU_JOBTRACE_ONE") ? 1 : 0;
         if (_armed && (s_only < 0 || ctx->resident_ovl == s_only) && s_one && !s_lock) { s_lock = ctx; g_spu_trace_lock_ctx = ctx; }
-        if (_armed && (s_only < 0 || ctx->resident_ovl == s_only) && (!s_one || s_lock == ctx) && _n++ < 1500) {
+        static int s_max = -1; if (s_max < 0) { const char* e = getenv("SPU_JOBTRACE_MAX"); s_max = e ? atoi(e) : 1500; }
+        if (_armed && (s_only < 0 || ctx->resident_ovl == s_only) && (!s_one || s_lock == ctx) && _n++ < s_max) {
             fprintf(stderr, "[jobtrace] c%04X ovl=%d pc=0x%05X lr=0x%05X ie=%u%s",
                     (unsigned)(((uintptr_t)ctx >> 12) & 0xFFFF), ctx->resident_ovl, p,
                     ctx->gpr[0]._u32[0] & SPU_LS_MASK, ctx->int_enable, fn ? "" : " (no lift)");
+            /* SPU_JOBTRACE_REGS=1: r3-r5 (slot preferito + r3 intero) a ogni dispatch */
+            { static int s_rg = -1; if (s_rg < 0) s_rg = getenv("SPU_JOBTRACE_REGS") ? 1 : 0;
+              if (s_rg) fprintf(stderr, " r3=%08X.%08X.%08X.%08X r4=%08X.%08X.%08X.%08X r5=%08X r0=%08X r2=%08X r1=%08X r80=%08X.%08X.%08X.%08X r81=%08X.%08X.%08X.%08X",
+                                ctx->gpr[3]._u32[0], ctx->gpr[3]._u32[1], ctx->gpr[3]._u32[2], ctx->gpr[3]._u32[3],
+                                ctx->gpr[4]._u32[0], ctx->gpr[4]._u32[1], ctx->gpr[4]._u32[2], ctx->gpr[4]._u32[3],
+                                ctx->gpr[5]._u32[0], ctx->gpr[0]._u32[0], ctx->gpr[2]._u32[0], ctx->gpr[1]._u32[0],
+                                ctx->gpr[80]._u32[0], ctx->gpr[80]._u32[1], ctx->gpr[80]._u32[2], ctx->gpr[80]._u32[3],
+                                ctx->gpr[81]._u32[0], ctx->gpr[81]._u32[1], ctx->gpr[81]._u32[2], ctx->gpr[81]._u32[3]); }
+            /* SPU_JOBTRACE_DUMP=pc:lsaddr:len[,pc:lsaddr:len]* (hex, max 4): al dispatch di quel pc stampa len byte di LS */
+            { static int s_dp = -1; static uint32_t s_dpc[4], s_dla[4], s_dln[4];
+              if (s_dp < 0) { const char* e = getenv("SPU_JOBTRACE_DUMP"); s_dp = 0;
+                  /* lsaddr puo' essere "r3".."r9": si usa lo slot 0 di quel registro al dispatch */
+                  while (e && *e && s_dp < 4 && (sscanf(e, "%x:%x:%x", &s_dpc[s_dp], &s_dla[s_dp], &s_dln[s_dp]) == 3 ||
+                         (sscanf(e, "%x:r%u:%x", &s_dpc[s_dp], &s_dla[s_dp], &s_dln[s_dp]) == 3 && (s_dla[s_dp] |= 0x80000000u)))) {
+                      s_dp++; e = strchr(e, ','); if (e) e++; } }
+              for (int k = 0; k < s_dp; k++) if (p == s_dpc[k]) {
+                  uint32_t base = (s_dla[k] & 0x80000000u) ? ctx->gpr[s_dla[k] & 0x7F]._u32[0] : s_dla[k];
+                  for (uint32_t i = 0; i < s_dln[k] && i < 256; i += 16) {
+                      const uint32_t* q = (const uint32_t*)(ctx->ls + ((base + i) & SPU_LS_MASK & ~15u));
+                      fprintf(stderr, "\n   LS %05X: %08X %08X %08X %08X", (base + i) & SPU_LS_MASK,
+                              __builtin_bswap32(q[0]), __builtin_bswap32(q[1]), __builtin_bswap32(q[2]), __builtin_bswap32(q[3])); } } }
             /* JobApi entries: args r3-r5. Post-job return 0x3308: result r3 +
              * the job's saved GetBufferTag result r80. */
             if (p == 0x2F30 || p == 0x1700 || p == 0x1770 || p == 0x17C8)
@@ -1867,8 +1898,8 @@ void spu_indirect_branch(spu_context* ctx)
       unsigned img = (ctx->image_id >= 0 && ctx->image_id < BT0_MAX_IMG)
                      ? (unsigned)ctx->image_id : 0;
       if (_bt0[img]++ < BT0_PER_IMG)
-        fprintf(stderr, "[SPU] BRANCH-TO-0 unresolved pc=0x%05X image=%d lr=0x%05X\n",
-                ctx->pc, ctx->image_id, ctx->gpr[0]._u32[0] & SPU_LS_MASK); }
+        fprintf(stderr, "[SPU] BRANCH-TO-0 unresolved pc=0x%05X image=%d ovl=%d lr=0x%05X ret_link=0x%05X\n",
+                ctx->pc, ctx->image_id, ctx->resident_ovl, ctx->gpr[0]._u32[0] & SPU_LS_MASK, ctx->ret_link); }
     /* One-shot: the FMOD null-handler DSP node carries a PPU descriptor EA at
      * node+0x14 (observed 0x93C3C0). Dump it to identify which plugin/unit
      * type never got its SPU code streamed (env LBP_DSPDESC=<hex ea>). */

@@ -1,6 +1,6 @@
 # Stato del progetto
 
-Ultimo aggiornamento: **12 settembre 2026** — sessione 27.
+Ultimo aggiornamento: **13 settembre 2026** — sessione 27 (quarta parte).
 
 ## Dove siamo
 
@@ -618,7 +618,125 @@ parole nei buffer SPU (dove il job di geometria patcha i draw) restano zeri.
 15. `find_spu_functions.py`: l'istruzione dopo ogni `bisl` e' un ingresso
     (i "(no lift)" a 0xCBCC/0xCD54/0xCD7C/0xD2F4 sono spariti).
 
+### Quarta parte (notte 12→13 settembre): i primi draw dei job SPU
+
+Il filo era "perche' il job 218 riceve buffer a zero"; la risposta e' stata
+una catena di bug del lifter/runtime SPU, tutti corretti e misurati.
+
+16. **`bisl $rN,$rN` chiamava se stesso.** Il lifter scriveva il link nel
+    registro PRIMA di leggere il bersaglio: `bisl $r0,$r0` (il job 218 chiama
+    la sua tabella di API attraverso r0, 11 casi nel modulo) saltava a
+    `pc+4`. Per questo la seconda `GetBufferTag(set 1, buf 0)` non veniva
+    mai eseguita e il "risultato" era `andi $r3,$r2,4` = (4,0,0,0) rimasto
+    in r3: handle 0 → store a LS 0 (`stqx` in 0x5C48 con base
+    `LS[0xECA0]=0x00100000`). Stessa cosa per `bisled`. Il PM ora restituisce
+    (0x01000000, 0x98004000, ...) = pagina 0x98 → LS 0x26000, giusto.
+17. **`bi $r82` con bit 0 acceso.** Il job 215 (geometria) tiene un flag nel
+    bit 0 del selettore della sua tabella di salto (`bi $r82` = 0x12231):
+    `spu_indirect_branch` ora maschera `~3` come l'hardware (prima:
+    BRANCH-TO-0 a pc=0x12231 e stack del job sopra 0x3E000 → assert del PM a
+    0x15F0/0x165C, magic 0x71077345 sporcato).
+18. **`bi $r0` con r0 != indirizzo di ritorno non e' un ritorno.** Il PM fa
+    `ila $r0,epilogo; br helper` e l'helper finisce con `bi $r0`; SPU_RET lo
+    prendeva per ritorno del frame host e saltava l'epilogo (r1, r80, r81
+    mai ripristinati: il job 218 usciva senza disegnare, e nel job 227 audio
+    tutto il codice dopo 0xFFAC non girava mai). Ora `SPU_RETR(ctx, reg)`
+    confronta con `ret_link` (piantato da brsl/bisl): se diverso, dispatch.
+    `SPU_RET_LOOSE=1` ripristina il vecchio comportamento. Il registro e'
+    quello del `bi` (`bi $r78` del PM: prima SPU_RET leggeva r0).
+19. **Interrupt annidati.** Con (18) il gestore di interrupt del PM (0xA2C)
+    arriva alla finestra `bie` del suo helper (0x2430) con l'evento ancora
+    pendente: TAKE annidato (misurato: due TAKE a srr0=0x2430 di fila). Il
+    runtime ne teneva UNA istantanea di registri: la seconda sovrascriveva
+    la prima e l'iret esterno ripristinava i registri del gestore
+    (`r4=0x24F8` al posto del link 0x2E18 → loop 0x2430/0x2438/0x24F8 con
+    r1 = spazzatura, gioco fermo dopo 'world-1'). Ora e' una pila di 4
+    (`irq_gpr[SPU_IRQ_NEST]`): l'hardware vero salva 2032 byte per livello
+    sullo stack guest, quindi l'annidamento e' previsto dal PM.
+20. **`cflts/cfltu/csflt/cuflt`: fattore di scala sbagliato.** Il runtime
+    faceva `2^((173-i8)-155)` e `2^((155-i8)-155)`: con le codifiche normali
+    (cflts 173, csflt 155) OGNI conversione float↔int moltiplicava per
+    2^-155 = 0. Giusto (CBEA, rpcs3 `scale[173-i8]`/`scale[i8-155]` con
+    scale[x]=2^x): `2^(173-i8)` e `2^(i8-155)`. Il culling dei triangoli
+    del job 215 (funzione 0x10300, `cflts $r,$r,172` sui vertici proiettati)
+    vedeva tutto degenere: `ctx+0x114` (numero di indici) sempre 0 →
+    `brz $r13, 0x8E20` a 0x8B44 saltava l'emissione del draw, e il pacchetto
+    restava intestazione (1710/1680/181C/1820) + buco di zeri + semaforo.
+    Verificato con un test host (`cflts 173: 1.5→1, 100→100; csflt 144:
+    32768→16`).
+21. **`NV4097_TEXTURE_READ_SEMAPHORE_RELEASE` (0x1D74)** ora scrive il label
+    come 0x1D70 (stesso scambio di byte; rpcs3 fa lo stesso). Uncharted usa
+    SOLO questo: i pacchetti dei job finiscono con `SET_SEMAPHORE_OFFSET
+    0x480..0x4C0 + release`, e il job 215 legge i label 0x500004A0.. con
+    GET da 4 byte (anello dei vertex buffer).
+
+**Misura** (`run_s27_c140.log`, 80 s, con `PS3_TTY_POKE=100ADC80:0`, vedi
+sotto): **133 buffer CALLati con draw su 3000** (`[callstat]`: 1808×266,
+1824×142) — i primi draw dei job SPU. A schermo: un rettangolo nero su
+verde (`c141_160.png`). Senza il poke: 0 draw (il job aspetta i report).
+
+**Il blocco che resta: i report di occlusione.** Il job 215, per ogni
+oggetto, aspetta (`0x86F4`, GET da 16 byte a 0x21014410/420/470/480/530)
+che la parola +8 dello slot sia != -1 (`0x8754`: 0 → flag "occluso" →
+0x8CD8; altro → disegna). Sono **report RSX in memoria principale**
+(`SET_CONTEXT_DMA_REPORT=0xFEED0001`, tabella di 4096 slot da 16 byte a IO
+0x14400 = EA 0x21014400, `{timestamp, timestamp, valore, 0}`). Il PPU in
+SwapBuffers (0x14F7F4) scrive -1 nel +8 di TUTTI i 4096 slot a ogni
+fotogramma se il bool `*(0x100ADC80)` (statico = 1, tabella a 0x100ADC60 di
+descrittori+flag) e' acceso. Chi li scrive? Non i job SPU (nessun modulo
+costruisce 0x1800; i buffer CALLati non ne contengono), non il PPU (i suoi
+`GET_REPORT` per fotogramma — `func_00703068(ctx,type,off)`, 16 chiamanti —
+vanno a 0x244E0-0x24550, cioe' base+0x10000, e all'avvio una volta a
+0x144B0-0x14530). `NV4097_GET_REPORT` (0x1800) non e' implementato nel
+walker. Ipotesi: doppia pagina di report (0x14400 / 0x24400) e il flip non
+avviene, oppure il PPU la resetta a ogni fotogramma solo in questo build.
+Il **poke** `PS3_TTY_POKE=100ADC80:0` (spegne il reset) sblocca il job: i
+valori restano 0 (memset) → path "occluso" per molti, ma 133 disegnano.
+Da fare: implementare GET_REPORT (valore != 0 per ZPASS finche' non c'e'
+l'occlusion query in Metal) e capire il flip.
+
+**Altre cose viste stanotte:** il livello ora si carica da solo a ~50 s
+senza premere X (`PAD_SCRIPT` resta per sicurezza); la finestra si trova
+con `CGWindowListCopyWindowInfo(.optionAll)` (con `.optionOnScreenOnly` non
+si vede: `scratchpad/winid.swift` + `snaprun.sh <log> <prefix> <t1,t2,..>`
+in `/private/tmp/claude-501/.../scratchpad`); il job 206 scrive i buffer
+"vuoti" (zeri + RET), 217 il park, 215 il pacchetto; 218 (ICE vertex) gira
+solo ~8 volte al caricamento del livello.
+
 ### Il prossimo passo
+
+1. `NV4097_GET_REPORT` nel walker (0x1800: `(type<<24)|offset`, contesto
+   0xFEED0001 = IO → EA con `gcm_io2ea`; scrivere {ts,ts,valore,0}, valore
+   = 1 per ZPASS finche' non c'e' l'occlusion query) e poi capire perche' i
+   report per gli oggetti (0x14410..) non vengono emessi: guardare il record
+   a LS 0x1F600 del job 215 (`+0x18` = EA dello slot) e chi lo costruisce
+   (217, `[dma-putval]` a `SPU_DMA_PUTVAL=21014410`).
+2. Il rettangolo nero: `RSX_DRAWLIST` su un fotogramma con i draw dei job
+   (VP/FP/texture/blend), depth test nel backend Metal.
+3. Assert non deterministico `joblist.cpp(578)` sul thread audio (tid 14).
+
+### Strumenti nuovi (quarta parte)
+
+- `SPU_JOBTRACE_REGS=1` (r0-r5, r80, r81 a ogni dispatch),
+  `SPU_JOBTRACE_MAX=<n>` (tetto, default 1500),
+  `SPU_JOBTRACE_DUMP=pc:addr:len[,..]` (max 4; `addr` puo' essere `rN` =
+  slot 0 di quel registro): dump di LS al dispatch di quel pc.
+- `SPU_DMA_EAWIN_OVL=<id>`, `SPU_DMA_EAWIN_FULL=1` (tutto il PUT, 64
+  parole), `SPU_DMA_PUTVAL=<hex>` (i PUT che contengono quella parola),
+  `SPU_LS_WRITE_WATCH_MAX=<n>`.
+- `GCM_CALLDUMP=<k>` (il k-esimo buffer CALLato al RET, comandi decodificati),
+  `GCM_CALLSTAT=1` (ogni 500 RET: quanti buffer con draw, zeri, istogramma
+  dei metodi), `GCM_PARKDUMP=1` (l'anello dopo una CALL parcheggiata),
+  `GCM_DATAWATCH=lo:hi` [+ `GCM_DATAWATCH_M=<metodo>`] (metodi con argomento
+  in quell'intervallo), `GCM_SEMDBG` ora stampa anche 0x0060/0x01A4.
+- `PS3_TTY_SCAN=<hex32>[:mask]` (cerca una parola in tutta la memoria guest
+  al primo hit), `PS3_TTY_POKE=addr:byte[,..]` (scrive byte a ogni hit),
+  `YDKJ_WWATCH_BT` anche per le write32.
+- `[spu-ovl] primo uso del modulo N (t=..)`, `[spu-ret] salto:` (i `bi $rN`
+  non-ritorno), `[spu-int] pending ... (cXXXX ...)`, BRANCH-TO-0 con
+  `ovl=` e `ret_link=`.
+
+### Il prossimo passo (prima della quarta parte, superato)
 
 1. Il job 218: perche' le API get-buffer del PM gli danno 0. Guardare i
    `[wws-res] bufferSetArray read` e i load command del job (`[wws-batch]`)
