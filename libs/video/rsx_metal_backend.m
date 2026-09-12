@@ -1344,6 +1344,9 @@ void rsx_metal_backend_shutdown(void)
     }
 }
 
+static uint8_t s_keys[256];
+int rsx_metal_key_down(unsigned keycode) { return keycode < 256 ? s_keys[keycode] : 0; }
+
 int rsx_metal_backend_pump_messages(void)
 {
 #if !TARGET_OS_IPHONE
@@ -1358,6 +1361,14 @@ int rsx_metal_backend_pump_messages(void)
                                                 inMode:NSDefaultRunLoopMode
                                                dequeue:YES];
             if (!ev) break;
+            /* La tastiera come pad (sessione 27): i tasti si registrano qui e
+             * cellPad li legge (rsx_metal_key_down); non si inoltrano alla
+             * finestra, che altrimenti suona il "bip" del tasto ignorato. */
+            if (ev.type == NSEventTypeKeyDown || ev.type == NSEventTypeKeyUp) {
+                unsigned short kc = ev.keyCode;
+                if (kc < 256) s_keys[kc] = (ev.type == NSEventTypeKeyDown) ? 1 : 0;
+                continue;
+            }
             [NSApp sendEvent:ev];
         }
         if (s_window && ![s_window isVisible]) s_closed = 1;

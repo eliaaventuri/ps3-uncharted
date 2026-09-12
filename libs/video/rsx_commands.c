@@ -329,6 +329,12 @@ int rsx_process_method(rsx_state* state, u32 method, u32 data)
      * for the frequency divisor (instancing). Captured for read_vp_vertex. */
     if (method == 0x00001FC0) { state->frequency_divider_op = data; return 0; }
 
+    /* GCM_SEMDBG=1: i metodi dei semafori NV4097 (0x0060 context DMA, 0x1D6C
+     * offset, 0x1D70 back-end release, 0x1D74 texture-read release). */
+    { static int s_sd = -1; if (s_sd < 0) s_sd = getenv("GCM_SEMDBG") ? 1 : 0;
+      static int s_sn = 0;
+      if (s_sd && s_sn < 60 && (method == 0x0060 || method == 0x1D6C || method == 0x1D70 || method == 0x1D74)) { s_sn++;
+          fprintf(stderr, "[semdbg] method=0x%04X data=0x%08X\n", method, data); } }
     { static u32 s_sem_off = 0;
       if (method == 0x1D6C) { s_sem_off = data; return 0; }
       if (method == 0x1D70) {

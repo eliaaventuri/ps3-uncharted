@@ -201,6 +201,17 @@ static inline int mfc_do_transfer(spu_context* spu, uint32_t lsa, uint64_t ea,
                               " size=%u covers 0x%08X\n",
                       (uint32_t)spu->pc & SPU_LS_MASK, cmd, lsa, (uint32_t)ea, size,
                       (uint32_t)s_w); } }
+    /* SPU_DMA_LSWATCH=<hex>: ogni GET (verso la local store) la cui finestra
+     * LS copre quell'indirizzo -- per trovare chi sovrascrive il codice del
+     * policy module (Uncharted: LS 0x3528 clobberata durante il livello). */
+    { static long s_lw = -1; if (s_lw < 0) { const char* e = getenv("SPU_DMA_LSWATCH");
+        s_lw = e && *e ? (long)strtoul(e, 0, 16) : 0; }
+      if (s_lw && mfc_is_get(cmd) && lsa <= (uint32_t)s_lw && lsa + size > (uint32_t)s_lw) {
+          static int _n = 0;
+          if (_n++ < 32)
+              fprintf(stderr, "[dma-lswatch] img=%d ovl=%d pc=0x%05X GET lsa=0x%05X size=0x%X ea=0x%08X copre LS 0x%05X\n",
+                      spu->image_id, spu->resident_ovl, (uint32_t)spu->pc & SPU_LS_MASK, lsa, size,
+                      (uint32_t)ea, (uint32_t)s_lw); } }
     /* SPU_DMA_EAWIN=<lo>:<hi> -- ogni trasferimento la cui finestra di memoria
      * principale tocca [lo,hi). Serve quando la domanda non e' "cosa fa questa
      * immagine" ma "qualcuno arriva mai fin qui": il job manager di WwsJob
@@ -871,10 +882,11 @@ static inline int mfc_submit(mfc_engine* mfc, spu_context* spu, uint32_t cmd)
           if (++s_rep >= s_limit) {
               s_rep = 0;   /* re-arm: the chain may run this job again */
               extern void spu_halt(spu_context*);
-              fprintf(stderr, "[spu-dma] img=%d pc=0x%05X: %u identical "
-                      "transfers to ea=0x%08X -- halting the SPU\n",
-                      spu->image_id, (uint32_t)spu->pc & SPU_LS_MASK, s_limit,
-                      (uint32_t)ea);
+              fprintf(stderr, "[spu-dma] img=%d ovl=%d pc=0x%05X: %u identical "
+                      "%s transfers lsa=0x%05X ea=0x%08X size=0x%X -- halting the SPU\n",
+                      spu->image_id, spu->resident_ovl, (uint32_t)spu->pc & SPU_LS_MASK, s_limit,
+                      mfc_is_get(cmd) ? "GET" : mfc_is_put(cmd) ? "PUT" : "cmd", lsa,
+                      (uint32_t)ea, size);
               fflush(stderr);
               spu_halt(spu);
           }

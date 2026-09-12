@@ -110,6 +110,15 @@ static inline void ppu_vstu4(void* v, const uint32_t in[4]) {
     uint8_t* p = (uint8_t*)v;
     for (int i = 0; i < 4; i++) { uint32_t b = ppu_vbswap32(in[i]); memcpy(p + i*4, &b, 4); }
 }
+/* Halfword lanes (big-endian in the register file). */
+static inline void ppu_vldu8h(const void* v, uint16_t o[8]) {
+    const uint8_t* p = (const uint8_t*)v;
+    for (int i = 0; i < 8; i++) o[i] = (uint16_t)(((uint16_t)p[i*2] << 8) | p[i*2+1]);
+}
+static inline void ppu_vstu8h(void* v, const uint16_t in[8]) {
+    uint8_t* p = (uint8_t*)v;
+    for (int i = 0; i < 8; i++) { p[i*2] = (uint8_t)(in[i] >> 8); p[i*2+1] = (uint8_t)in[i]; }
+}
 
 /* The guest timebase (mftb/mftbu): one global monotonic clock scaled to the
  * PS3's 79.8 MHz, provided by the runtime (runtime/syscalls/sys_timer.c). */
@@ -173,6 +182,11 @@ extern "C" void ps3_indirect_call(ppu_context* ctx);
  * instead of running the literal `load OPD ptr; bctrl` trampoline (whose import
  * pointer table the recomp never fills). See --hle-stubs. */
 extern "C" void ps3_hle_call(unsigned int nid, ppu_context* ctx);
+
+/* Trap incondizionato del guest (`tw 31, rX, rX`): il break del debugger
+ * dell'idioma di assert del titolo. Riporta e prosegue -- serve a non lasciare
+ * passare in silenzio un assert del gioco. */
+extern "C" void ppu_guest_trap(ppu_context* ctx, unsigned int addr);
 
 /* Trampoline function pointer for cross-fragment branches (TLS).
  * PPU_THREAD_LOCAL comes from ppu_recomp.h, included above. */

@@ -123,15 +123,20 @@ static int dir_exists(const char* path)
  * at a time, so a bump allocator is sufficient.
  * -----------------------------------------------------------------------*/
 
-#define SAVEDATA_SCRATCH_BASE  0x024E0000u
-#define SAVEDATA_SCRATCH_SIZE  0x00020000u  /* 128 KB */
+/* Sessione 27: la base fissa 0x024E0000 stava DENTRO la memoria di Uncharted.
+ * Ora e' la coda della finestra HLE (VM_HLE_INJECT_BASE + 0x8000, 32 KB: i
+ * primi 0x8000 li usano import, controllo GCM e tabelle IO), che per
+ * costruzione il titolo non tocca mai. */
+#define SAVEDATA_SCRATCH_BASE  (VM_HLE_INJECT_BASE + 0x8000u)
+#define SAVEDATA_SCRATCH_SIZE  0x00008000u  /* 32 KB */
 
-static uint32_t s_scratch_next = SAVEDATA_SCRATCH_BASE;
+static uint32_t s_scratch_next = 0;
 
 static void scratch_reset(void) { s_scratch_next = SAVEDATA_SCRATCH_BASE; }
 
 static uint32_t scratch_alloc(uint32_t size)
 {
+    if (!s_scratch_next) s_scratch_next = SAVEDATA_SCRATCH_BASE;
     /* 16-byte align */
     size = (size + 0xF) & ~0xFu;
     if (s_scratch_next + size > SAVEDATA_SCRATCH_BASE + SAVEDATA_SCRATCH_SIZE)
@@ -772,22 +777,27 @@ static void sd_read_str(u32 ea, char* out, u32 max)
 static s32 savedata_list_guest(int is_save, u32 setList_ea, u32 setBuf_ea, u32 funcList,
                                u32 funcStat, u32 funcFile, u32 userdata)
 {
+    printf("[cellSaveData] %s(setList=0x%08X setBuf=0x%08X funcList=0x%08X funcStat=0x%08X funcFile=0x%08X userdata=0x%08X)\n",
+           is_save ? "ListSave2" : "ListLoad2", setList_ea, setBuf_ea, funcList, funcStat, funcFile, userdata);
     if (!setList_ea || !setBuf_ea || !funcList || !funcStat)
         return CELL_SAVEDATA_ERROR_PARAM;
     u32 buf = vm_read32(setBuf_ea + 36), bufSize = vm_read32(setBuf_ea + 32);
     u32 dirMax = vm_read32(setBuf_ea + 0);
-    if (!buf || bufSize < 0x1000)
+    printf("[cellSaveData]   setBuf: dirListMax=%u fileListMax=%u bufSize=%u buf=0x%08X\n", dirMax, vm_read32(setBuf_ea + 4), bufSize, buf);
+    if (!buf || bufSize < 48)
         return CELL_SAVEDATA_ERROR_PARAM;
 
-    /* le strutture delle callback: 2 KB in fondo al buffer del titolo */
-    u32 top = (buf + bufSize - 0x800) & ~15u;
+    /* le strutture delle callback nello scratch HLE (il buffer del titolo e'
+     * dimensionato per la sola lista: Uncharted da' 480 byte = 10 directory) */
+    scratch_reset();
+    u32 top = scratch_alloc(0x800);
+    if (!top) return CELL_SAVEDATA_ERROR_INTERNAL;
     u32 cbres = top, listGet = top + 0x20, listSet = top + 0x40, statSet = top + 0x60,
         fileGet = top + 0x80, fileSet = top + 0xD0, statGet = top + 0x100;   /* +1640 < 0x800 */
-    for (u32 o = 0; o < 0x800; o += 4) vm_write32(top + o, 0);
 
-    /* la lista delle directory esistenti (prefisso) in testa al buffer */
+    /* la lista delle directory esistenti (prefisso) nel buffer del titolo */
     char prefix[64]; sd_read_str(vm_read32(setList_ea + 8), prefix, sizeof prefix);
-    u32 maxEntries = (top - buf) / 48; if (dirMax && dirMax < maxEntries) maxEntries = dirMax;
+    u32 maxEntries = bufSize / 48; if (dirMax && dirMax < maxEntries) maxEntries = dirMax;
     CellSaveDataDirList* tmp = (CellSaveDataDirList*)calloc(maxEntries ? maxEntries : 1, sizeof(CellSaveDataDirList));
     u32 count = enumerate_save_dirs(prefix, tmp, maxEntries);
     for (u32 i = 0; i < count; i++) {

@@ -239,6 +239,15 @@ static inline void ppu_vstu4(void* v, const uint32_t in[4]) {
     uint8_t* p = (uint8_t*)v;
     for (int i = 0; i < 4; i++) { uint32_t b = ppu_vbswap32(in[i]); memcpy(p + i*4, &b, 4); }
 }
+/* Halfword lanes (big-endian in the register file). */
+static inline void ppu_vldu8h(const void* v, uint16_t o[8]) {
+    const uint8_t* p = (const uint8_t*)v;
+    for (int i = 0; i < 8; i++) o[i] = (uint16_t)(((uint16_t)p[i*2] << 8) | p[i*2+1]);
+}
+static inline void ppu_vstu8h(void* v, const uint16_t in[8]) {
+    uint8_t* p = (uint8_t*)v;
+    for (int i = 0; i < 8; i++) { p[i*2] = (uint8_t)(in[i] >> 8); p[i*2+1] = (uint8_t)in[i]; }
+}
 
 /* The guest timebase (mftb/mftbu): one global monotonic clock scaled to the
  * PS3's 79.8 MHz, provided by the runtime (runtime/syscalls/sys_timer.c). */
@@ -2305,11 +2314,11 @@ class PPULifter:
             va = int(ops[1][1:])
             vb = int(ops[2][1:])
             vc = int(ops[3][1:])
-            return (f"{{ int16_t* a=(int16_t*)&ctx->vr[{va}]; "
-                    f"int16_t* b=(int16_t*)&ctx->vr[{vb}]; "
-                    f"int32_t* c=(int32_t*)&ctx->vr[{vc}]; "
-                    f"int32_t* d=(int32_t*)&ctx->vr[{vd}]; "
-                    f"for(int i=0;i<4;i++) d[i]=c[i]+(int32_t)a[i*2]*(int32_t)b[i*2]+(int32_t)a[i*2+1]*(int32_t)b[i*2+1]; }}")
+            # lanes are big-endian in vr[]: go through the halfword/word loaders
+            return (f"{{ uint16_t a[8],b[8]; uint32_t c[4],d[4]; ppu_vldu8h(&ctx->vr[{va}],a); ppu_vldu8h(&ctx->vr[{vb}],b); "
+                    f"ppu_vldu4(&ctx->vr[{vc}],c); "
+                    f"for(int i=0;i<4;i++) d[i]=(uint32_t)((int32_t)c[i]+(int32_t)(int16_t)a[i*2]*(int32_t)(int16_t)b[i*2]+(int32_t)(int16_t)a[i*2+1]*(int32_t)(int16_t)b[i*2+1]); "
+                    f"ppu_vstu4(&ctx->vr[{vd}],d); }}")
 
         # VMX integer compare
         if mn.startswith("vcmpequh"):
@@ -2454,13 +2463,15 @@ class PPULifter:
                             f"for(int k=0;k<{w};k++) o[i*{w}+k]=(uint8_t)((({ty})r)>>(8*({w}-1-k))); }} "
                             f"memcpy(&ctx->vr[{vd}], o, 16); }}")
 
-        # Float min/max
+        # Float min/max. The register file is BIG-ENDIAN: comparing through a
+        # raw float* compared byte-swapped garbage, so every clamp came out
+        # wrong (Uncharted's nav-mesh box quantizer clamped min > max and the
+        # PPU walked a grid row off into the stack guard page).
         if mn == "vmaxfp" or mn == "vminfp":
             vd, va, vb = int(ops[0][1:]), int(ops[1][1:]), int(ops[2][1:])
             cmp = ">" if mn == "vmaxfp" else "<"
-            return (f"{{ float* d=(float*)&ctx->vr[{vd}]; float* a=(float*)&ctx->vr[{va}]; "
-                    f"float* b=(float*)&ctx->vr[{vb}]; "
-                    f"for(int i=0;i<4;i++) d[i]=a[i]{cmp}b[i]?a[i]:b[i]; }}")
+            return (f"{{ float a[4],b[4],d[4]; ppu_vldf4(&ctx->vr[{va}],a); ppu_vldf4(&ctx->vr[{vb}],b); "
+                    f"for(int i=0;i<4;i++) d[i]=a[i]{cmp}b[i]?a[i]:b[i]; ppu_vstf4(&ctx->vr[{vd}],d); }}")
 
         # Splat immediate (vspltisb/h/w) — splat a 5-bit signed immediate
         if mn in ("vspltisb", "vspltish", "vspltisw"):
@@ -2569,28 +2580,29 @@ class PPULifter:
             return (f"{{ int8_t* d=(int8_t*)&ctx->vr[{vd}]; int8_t* a=(int8_t*)&ctx->vr[{va}]; "
                     f"int8_t* b=(int8_t*)&ctx->vr[{vb}]; "
                     f"for(int i=0;i<16;i++){{int32_t r=(int32_t)a[i]+(int32_t)b[i]; d[i]=(int8_t)(r>127?127:r<-128?-128:r);}} }}")
+        # (halfword/word lanes are big-endian in vr[]: loaders, not raw casts)
         if mn == "vadduhs":
             vd, va, vb = int(ops[0][1:]), int(ops[1][1:]), int(ops[2][1:])
-            return (f"{{ uint16_t* d=(uint16_t*)&ctx->vr[{vd}]; uint16_t* a=(uint16_t*)&ctx->vr[{va}]; "
-                    f"uint16_t* b=(uint16_t*)&ctx->vr[{vb}]; "
-                    f"for(int i=0;i<8;i++){{uint32_t r=(uint32_t)a[i]+(uint32_t)b[i]; d[i]=(uint16_t)(r>65535u?65535u:r);}} }}")
+            return (f"{{ uint16_t a[8],b[8],d[8]; ppu_vldu8h(&ctx->vr[{va}],a); ppu_vldu8h(&ctx->vr[{vb}],b); "
+                    f"for(int i=0;i<8;i++){{uint32_t r=(uint32_t)a[i]+(uint32_t)b[i]; d[i]=(uint16_t)(r>65535u?65535u:r);}} "
+                    f"ppu_vstu8h(&ctx->vr[{vd}],d); }}")
         if mn == "vaddshs":
             vd, va, vb = int(ops[0][1:]), int(ops[1][1:]), int(ops[2][1:])
-            return (f"{{ int16_t* d=(int16_t*)&ctx->vr[{vd}]; int16_t* a=(int16_t*)&ctx->vr[{va}]; "
-                    f"int16_t* b=(int16_t*)&ctx->vr[{vb}]; "
-                    f"for(int i=0;i<8;i++){{int32_t r=(int32_t)a[i]+(int32_t)b[i]; d[i]=(int16_t)(r>32767?32767:r<-32768?-32768:r);}} }}")
+            return (f"{{ uint16_t a[8],b[8],d[8]; ppu_vldu8h(&ctx->vr[{va}],a); ppu_vldu8h(&ctx->vr[{vb}],b); "
+                    f"for(int i=0;i<8;i++){{int32_t r=(int32_t)(int16_t)a[i]+(int32_t)(int16_t)b[i]; d[i]=(uint16_t)(int16_t)(r>32767?32767:r<-32768?-32768:r);}} "
+                    f"ppu_vstu8h(&ctx->vr[{vd}],d); }}")
         if mn == "vadduws":
             vd, va, vb = int(ops[0][1:]), int(ops[1][1:]), int(ops[2][1:])
-            return (f"{{ uint32_t* d=(uint32_t*)&ctx->vr[{vd}]; uint32_t* a=(uint32_t*)&ctx->vr[{va}]; "
-                    f"uint32_t* b=(uint32_t*)&ctx->vr[{vb}]; "
-                    f"for(int i=0;i<4;i++){{uint64_t r=(uint64_t)a[i]+(uint64_t)b[i]; d[i]=(uint32_t)(r>0xFFFFFFFFu?0xFFFFFFFFu:r);}} }}")
+            return (f"{{ uint32_t a[4],b[4],d[4]; ppu_vldu4(&ctx->vr[{va}],a); ppu_vldu4(&ctx->vr[{vb}],b); "
+                    f"for(int i=0;i<4;i++){{uint64_t r=(uint64_t)a[i]+(uint64_t)b[i]; d[i]=(uint32_t)(r>0xFFFFFFFFu?0xFFFFFFFFu:r);}} "
+                    f"ppu_vstu4(&ctx->vr[{vd}],d); }}")
 
         # Subtract saturate
         if mn == "vsubsws":
             vd, va, vb = int(ops[0][1:]), int(ops[1][1:]), int(ops[2][1:])
-            return (f"{{ int32_t* d=(int32_t*)&ctx->vr[{vd}]; int32_t* a=(int32_t*)&ctx->vr[{va}]; "
-                    f"int32_t* b=(int32_t*)&ctx->vr[{vb}]; "
-                    f"for(int i=0;i<4;i++){{int64_t r=(int64_t)a[i]-(int64_t)b[i]; d[i]=(int32_t)(r>0x7FFFFFFFLL?0x7FFFFFFFLL:r<-0x80000000LL?-0x80000000LL:r);}} }}")
+            return (f"{{ uint32_t a[4],b[4],d[4]; ppu_vldu4(&ctx->vr[{va}],a); ppu_vldu4(&ctx->vr[{vb}],b); "
+                    f"for(int i=0;i<4;i++){{int64_t r=(int64_t)(int32_t)a[i]-(int64_t)(int32_t)b[i]; d[i]=(uint32_t)(int32_t)(r>0x7FFFFFFFLL?0x7FFFFFFFLL:r<-0x80000000LL?-0x80000000LL:r);}} "
+                    f"ppu_vstu4(&ctx->vr[{vd}],d); }}")
 
         if mn == "vsububs":  # subtract unsigned byte, saturate to [0,255]
             vd, va, vb = int(ops[0][1:]), int(ops[1][1:]), int(ops[2][1:])
@@ -2604,12 +2616,13 @@ class PPULifter:
             # (word index = BE element, matching the VMX handlers above.) temp
             # buffer so vD may alias vA/vB.
             vd, va, vb = int(ops[0][1:]), int(ops[1][1:]), int(ops[2][1:])
-            return (f"{{ int32_t* a=(int32_t*)&ctx->vr[{va}]; int32_t* b=(int32_t*)&ctx->vr[{vb}]; "
+            return (f"{{ uint32_t ua[4],ub[4]; ppu_vldu4(&ctx->vr[{va}],ua); ppu_vldu4(&ctx->vr[{vb}],ub); "
+                    f"int32_t* a=(int32_t*)ua; int32_t* b=(int32_t*)ub; "
                     f"int64_t s0=(int64_t)a[0]+a[1]+b[1]; int64_t s1=(int64_t)a[2]+a[3]+b[3]; "
-                    f"int32_t r[4]={{0,0,0,0}}; "
-                    f"r[1]=(int32_t)(s0>0x7FFFFFFFLL?0x7FFFFFFFLL:s0<-0x80000000LL?-0x80000000LL:s0); "
-                    f"r[3]=(int32_t)(s1>0x7FFFFFFFLL?0x7FFFFFFFLL:s1<-0x80000000LL?-0x80000000LL:s1); "
-                    f"memcpy(&ctx->vr[{vd}], r, 16); }}")
+                    f"uint32_t r[4]={{0,0,0,0}}; "
+                    f"r[1]=(uint32_t)(int32_t)(s0>0x7FFFFFFFLL?0x7FFFFFFFLL:s0<-0x80000000LL?-0x80000000LL:s0); "
+                    f"r[3]=(uint32_t)(int32_t)(s1>0x7FFFFFFFLL?0x7FFFFFFFLL:s1<-0x80000000LL?-0x80000000LL:s1); "
+                    f"ppu_vstu4(&ctx->vr[{vd}], r); }}")
 
             # The vector register file holds BIG-ENDIAN data. Reading it through
             # a host int16_t*/int32_t* and writing the result back the same way
@@ -2702,18 +2715,12 @@ class PPULifter:
         # (vmaxsw handled above by the generic vmax/vmin loop)
 
         # Integer multiply (odd/even halfword)
-        if mn == "vmulouh":
+        if mn == "vmulouh" or mn == "vmuleuh":
             vd, va, vb = int(ops[0][1:]), int(ops[1][1:]), int(ops[2][1:])
-            return (f"{{ uint32_t* d=(uint32_t*)&ctx->vr[{vd}]; uint16_t* a=(uint16_t*)&ctx->vr[{va}]; "
-                    f"uint16_t* b=(uint16_t*)&ctx->vr[{vb}]; "
-                    f"d[0]=(uint32_t)a[1]*(uint32_t)b[1]; d[1]=(uint32_t)a[3]*(uint32_t)b[3]; "
-                    f"d[2]=(uint32_t)a[5]*(uint32_t)b[5]; d[3]=(uint32_t)a[7]*(uint32_t)b[7]; }}")
-        if mn == "vmuleuh":
-            vd, va, vb = int(ops[0][1:]), int(ops[1][1:]), int(ops[2][1:])
-            return (f"{{ uint32_t* d=(uint32_t*)&ctx->vr[{vd}]; uint16_t* a=(uint16_t*)&ctx->vr[{va}]; "
-                    f"uint16_t* b=(uint16_t*)&ctx->vr[{vb}]; "
-                    f"d[0]=(uint32_t)a[0]*(uint32_t)b[0]; d[1]=(uint32_t)a[2]*(uint32_t)b[2]; "
-                    f"d[2]=(uint32_t)a[4]*(uint32_t)b[4]; d[3]=(uint32_t)a[6]*(uint32_t)b[6]; }}")
+            off = 1 if mn == "vmulouh" else 0
+            return (f"{{ uint16_t a[8],b[8]; uint32_t d[4]; ppu_vldu8h(&ctx->vr[{va}],a); ppu_vldu8h(&ctx->vr[{vb}],b); "
+                    f"for(int i=0;i<4;i++) d[i]=(uint32_t)a[2*i+{off}]*(uint32_t)b[2*i+{off}]; "
+                    f"ppu_vstu4(&ctx->vr[{vd}],d); }}")
         # vmsumshs / vsumsws -- the two instructions an IDCT is actually built
         # from, and both were emitted as "/* TODO */" no-ops. 32 sites, ALL of
         # them inside ps1_netemu's MDEC decode function (func_000E90B4), so the
@@ -2808,18 +2815,19 @@ class PPULifter:
         # Pack signed halfword signed saturate
         if mn == "vpkshss":
             vd, va, vb = int(ops[0][1:]), int(ops[1][1:]), int(ops[2][1:])
-            return (f"{{ int8_t* d=(int8_t*)&ctx->vr[{vd}]; int16_t* a=(int16_t*)&ctx->vr[{va}]; "
-                    f"int16_t* b=(int16_t*)&ctx->vr[{vb}]; "
-                    f"for(int i=0;i<8;i++){{int32_t v=a[i]; d[i]=(int8_t)(v>127?127:v<-128?-128:v);}} "
-                    f"for(int i=0;i<8;i++){{int32_t v=b[i]; d[8+i]=(int8_t)(v>127?127:v<-128?-128:v);}} }}")
+            return (f"{{ uint16_t a[8],b[8]; int8_t d[16]; ppu_vldu8h(&ctx->vr[{va}],a); ppu_vldu8h(&ctx->vr[{vb}],b); "
+                    f"for(int i=0;i<8;i++){{int32_t v=(int16_t)a[i]; d[i]=(int8_t)(v>127?127:v<-128?-128:v);}} "
+                    f"for(int i=0;i<8;i++){{int32_t v=(int16_t)b[i]; d[8+i]=(int8_t)(v>127?127:v<-128?-128:v);}} "
+                    f"memcpy(&ctx->vr[{vd}], d, 16); }}")
 
         # vmsummbm (VA-form, 4 operands)
         if mn == "vmsummbm":
             vd = int(ops[0][1:]); va = int(ops[1][1:]); vb = int(ops[2][1:]); vc = int(ops[3][1:])
-            return (f"{{ int32_t* d=(int32_t*)&ctx->vr[{vd}]; int8_t* a=(int8_t*)&ctx->vr[{va}]; "
-                    f"uint8_t* ub=(uint8_t*)&ctx->vr[{vb}]; int32_t* cc=(int32_t*)&ctx->vr[{vc}]; "
-                    f"for(int i=0;i<4;i++) d[i]=(int32_t)a[4*i]*(int32_t)ub[4*i]+(int32_t)a[4*i+1]*(int32_t)ub[4*i+1]"
-                    f"+(int32_t)a[4*i+2]*(int32_t)ub[4*i+2]+(int32_t)a[4*i+3]*(int32_t)ub[4*i+3]+cc[i]; }}")
+            return (f"{{ uint32_t d[4],cc[4]; int8_t* a=(int8_t*)&ctx->vr[{va}]; "
+                    f"uint8_t* ub=(uint8_t*)&ctx->vr[{vb}]; ppu_vldu4(&ctx->vr[{vc}],cc); "
+                    f"for(int i=0;i<4;i++) d[i]=(uint32_t)((int32_t)a[4*i]*(int32_t)ub[4*i]+(int32_t)a[4*i+1]*(int32_t)ub[4*i+1]"
+                    f"+(int32_t)a[4*i+2]*(int32_t)ub[4*i+2]+(int32_t)a[4*i+3]*(int32_t)ub[4*i+3]+(int32_t)cc[i]); "
+                    f"ppu_vstu4(&ctx->vr[{vd}],d); }}")
 
         # Merge high halfword / low halfword (vmrghh, vmrglh — already in vmrg* handler above)
 

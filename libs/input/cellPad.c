@@ -229,6 +229,40 @@ static void pad_poll_sdl2(void)
                 SDL_GameControllerClose(gc);
                 s_sdl_controllers[i] = NULL;
             }
+#ifdef __APPLE__
+            /* Senza controller, la tastiera della finestra Metal e' il pad 0
+             * (sessione 27): frecce = croce direzionale, Spazio/X = CROSS,
+             * C = CERCHIO, Z = QUADRATO, V = TRIANGOLO, Q/E = L1/R1, F/R =
+             * L2/R2, Invio = START, Tab = SELECT, WASD = levetta sinistra,
+             * IJKL = levetta destra. Codici tasto virtuali di macOS. */
+            if (i == 0) {
+                extern int rsx_metal_key_down(unsigned keycode);
+                #define K(c) rsx_metal_key_down(c)
+                u16 btns = 0;
+                if (K(126)) btns |= CELL_PAD_CTRL_UP;    if (K(125)) btns |= CELL_PAD_CTRL_DOWN;
+                if (K(123)) btns |= CELL_PAD_CTRL_LEFT;  if (K(124)) btns |= CELL_PAD_CTRL_RIGHT;
+                if (K(49) || K(7)) btns |= CELL_PAD_CTRL_CROSS;
+                if (K(8))  btns |= CELL_PAD_CTRL_CIRCLE; if (K(6))  btns |= CELL_PAD_CTRL_SQUARE;
+                if (K(9))  btns |= CELL_PAD_CTRL_TRIANGLE;
+                if (K(12)) btns |= CELL_PAD_CTRL_L1;     if (K(14)) btns |= CELL_PAD_CTRL_R1;
+                if (K(3))  btns |= CELL_PAD_CTRL_L2;     if (K(15)) btns |= CELL_PAD_CTRL_R2;
+                if (K(36)) btns |= CELL_PAD_CTRL_START;  if (K(48)) btns |= CELL_PAD_CTRL_SELECT;
+                PadHostState* h = &s_host_state[0];
+                h->buttons = btns;
+                h->analog_lx = K(0) ? 0 : K(2) ? 255 : 128;   /* A / D */
+                h->analog_ly = K(13) ? 0 : K(1) ? 255 : 128;  /* W / S */
+                h->analog_rx = K(38) ? 0 : K(37) ? 255 : 128; /* J / L */
+                h->analog_ry = K(34) ? 0 : K(40) ? 255 : 128; /* I / K */
+                h->trigger_l2 = K(3) ? 255 : 0; h->trigger_r2 = K(15) ? 255 : 0;
+                h->press_up = K(126) ? 255 : 0; h->press_down = K(125) ? 255 : 0;
+                h->press_left = K(123) ? 255 : 0; h->press_right = K(124) ? 255 : 0;
+                h->press_cross = (K(49) || K(7)) ? 255 : 0; h->press_circle = K(8) ? 255 : 0;
+                h->press_square = K(6) ? 255 : 0; h->press_triangle = K(9) ? 255 : 0;
+                h->press_l1 = K(12) ? 255 : 0; h->press_r1 = K(14) ? 255 : 0;
+                h->connected = 1;
+                #undef K
+            }
+#endif
             continue;
         }
 
@@ -482,6 +516,33 @@ skip_inject: ;
           else if (ph >= 120 && ph < 132)
               data->button[CELL_PAD_BTN_OFFSET_DIGITAL1] |= 0x08;   /* START */
       } }
+
+    /* PAD_SCRIPT="<sec>:<tasto>[,<sec>:<tasto>...]": pressioni programmate
+     * (0.4 s l'una) dal primo poll del pad: x o s t (croce cerchio quadrato
+     * triangolo), start select up down left right l1 r1. Per le corse senza
+     * nessuno alla tastiera: "75:x" = CROSS a 75 secondi ("New Game"). */
+    { static int s_ps = -1; static struct { double t; u16 b; } s_ev[32]; static int s_nev = 0;
+      static unsigned long long s_t0 = 0;
+      if (s_ps < 0) { const char* e = getenv("PAD_SCRIPT"); s_ps = 0;
+          while (e && *e && s_nev < 32) { char* q = 0; double t = strtod(e, &q); if (!q || *q != ':') break;
+              const char* nm = q + 1; const char* end = strchr(nm, ','); size_t L = end ? (size_t)(end - nm) : strlen(nm);
+              u16 b = 0;
+              if (L == 1 && nm[0] == 'x') b = 0x4000; else if (L == 1 && nm[0] == 'o') b = 0x2000;
+              else if (L == 1 && nm[0] == 's') b = 0x8000; else if (L == 1 && nm[0] == 't') b = 0x1000;
+              else if (!strncmp(nm, "start", L) && L == 5) b = 0x0008; else if (!strncmp(nm, "select", L) && L == 6) b = 0x0001;
+              else if (!strncmp(nm, "up", L) && L == 2) b = 0x0010; else if (!strncmp(nm, "right", L) && L == 5) b = 0x0020;
+              else if (!strncmp(nm, "down", L) && L == 4) b = 0x0040; else if (!strncmp(nm, "left", L) && L == 4) b = 0x0080;
+              else if (!strncmp(nm, "l1", L) && L == 2) b = 0x0400; else if (!strncmp(nm, "r1", L) && L == 2) b = 0x0800;
+              s_ev[s_nev].t = t; s_ev[s_nev].b = b; s_nev++; s_ps = 1;
+              e = end ? end + 1 : nm + L; } }
+      if (s_ps && port_no == 0) {
+          extern unsigned long long ps3_ms_now(void);
+          unsigned long long now = ps3_ms_now(); if (!s_t0) s_t0 = now;
+          double el = (double)(now - s_t0) / 1000.0;
+          for (int k = 0; k < s_nev; k++) if (el >= s_ev[k].t && el < s_ev[k].t + 0.4) {
+              data->button[CELL_PAD_BTN_OFFSET_DIGITAL1] |= (u16)(s_ev[k].b & 0xFF);
+              data->button[CELL_PAD_BTN_OFFSET_DIGITAL2] |= (u16)(s_ev[k].b >> 8);
+              static int s_said[32]; if (!s_said[k]) { s_said[k] = 1; fprintf(stderr, "[PAD_SCRIPT] %.1fs: tasto %04X\n", s_ev[k].t, s_ev[k].b); } } } }
 
     /* Analog sticks */
     /* PAD_STICK="lx,ly,rx,ry" (0-255, 128 = centred): hold the analog sticks at

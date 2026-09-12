@@ -135,6 +135,12 @@ extern "C" int g_hle_trace_armed;                        /* ppu_hle.cpp: PS3_HLE
 static struct sigaction s_prev_segv, s_prev_bus;
 
 /* Async-signal-safe enough: format into a static buffer, write(2) it out. */
+static void ppu_vldf4_host(const void* v, float o[4])
+{
+    const uint8_t* b = (const uint8_t*)v;
+    for (int i = 0; i < 4; i++) { uint32_t w = ((uint32_t)b[i*4] << 24) | ((uint32_t)b[i*4+1] << 16) | ((uint32_t)b[i*4+2] << 8) | b[i*4+3];
+                                  memcpy(&o[i], &w, 4); }
+}
 static void ps3_fault_report(int sig, siginfo_t* si, void* uctx)
 {
     static volatile int reported = 0;
@@ -186,6 +192,25 @@ static void ps3_fault_report(int sig, siginfo_t* si, void* uctx)
                 (uint32_t)g_active_ctx->gpr[5], (uint32_t)g_active_ctx->gpr[6],
                 (uint32_t)g_active_ctx->gpr[30], (uint32_t)g_active_ctx->gpr[31]);
             if (n > 0) { ssize_t w = write(2, buf, (size_t)n); (void)w; }
+            /* Tutti i gpr, v0-v3 come float e 32 parole di stack: un puntatore
+             * assurdo (0xCFFFFFFF) nasce quasi sempre da un numero sbagliato
+             * qualche istruzione prima, e senza i registri non si risale. */
+            { int p = 0; char b2[2400];
+              for (int i = 0; i < 32; i++) p += snprintf(b2 + p, sizeof b2 - p, "%s r%-2d=%08X", (i % 6) ? "" : "\n     ", i, (uint32_t)g_active_ctx->gpr[i]);
+              for (int v = 0; v < 4; v++) { float f[4]; ppu_vldf4_host(&g_active_ctx->vr[v], f);
+                  p += snprintf(b2 + p, sizeof b2 - p, "\n      v%d=(%g %g %g %g)", v, f[0], f[1], f[2], f[3]); }
+              uint32_t sp = (uint32_t)g_active_ctx->gpr[1];
+              if (vm_base && sp >= 0x10000u && sp + 0x100 < (ppu_vm_size ? ppu_vm_size : 0xE0000000u)) {
+                  for (int i = 0; i < 32; i++) { uint32_t w; memcpy(&w, vm_base + sp + i * 4, 4);
+                      p += snprintf(b2 + p, sizeof b2 - p, "%s%08X", (i % 8) ? " " : (i ? "\n      " : "\n      sp: "), __builtin_bswap32(w)); } }
+              /* e 16 parole da r29, r30, r31: gli oggetti del chiamante */
+              for (int r = 29; r <= 31; r++) { uint32_t a = (uint32_t)g_active_ctx->gpr[r];
+                  if (!vm_base || a < 0x10000u || a + 0x40 >= (ppu_vm_size ? ppu_vm_size : 0xE0000000u) || (a >= 0xD0000000u)) continue;
+                  p += snprintf(b2 + p, sizeof b2 - p, "\n      [r%d]:", r);
+                  for (int i = 0; i < 16; i++) { uint32_t w; memcpy(&w, vm_base + a + i * 4, 4);
+                      p += snprintf(b2 + p, sizeof b2 - p, " %08X", __builtin_bswap32(w)); } }
+              p += snprintf(b2 + p, sizeof b2 - p, "\n");
+              if (p > 0) { ssize_t w = write(2, b2, (size_t)p); (void)w; } }
         }
     }
 
@@ -1342,7 +1367,10 @@ void vm_write64(uint64_t a, uint64_t v) {
     { static int64_t w=-2; if (w==-2) { const char* e=getenv("YDKJ_WWATCH"); w = e?(int64_t)strtoul(e,0,0):-1; }
       if (w>=0) { uint32_t ea=(uint32_t)a; if (ydkj_wwatch_hit(ea)) {
         void* ra=__builtin_return_address(0); char* mb=(char*)GetModuleHandleA(NULL);
-        fprintf(stderr,"[WWATCH] write64 0x%08X = 0x%016llX  ra_rva=0x%llX guest-fn=0x%08X\n", ea, (unsigned long long)v, (unsigned long long)((char*)ra-mb), ppu_prof_resolve_host(ra)); } } }
+        fprintf(stderr,"[WWATCH] write64 0x%08X = 0x%016llX  ra_rva=0x%llX guest-fn=0x%08X\n", ea, (unsigned long long)v, (unsigned long long)((char*)ra-mb), ppu_prof_resolve_host(ra));
+        /* YDKJ_WWATCH_BT=1: la catena guest delle prime 4 scritture (chi chiama il memset) */
+        { static int s_bt = -1; static int s_n = 0; if (s_bt < 0) s_bt = getenv("YDKJ_WWATCH_BT") ? 1 : 0;
+          if (s_bt && s_n++ < 4) ppu_guest_callstack("wwatch"); } } } }
     /* FLOW_WVAL (64-bit): catch a 64-bit store whose HIGH or LOW 32-bit half equals
      * the watched value — the blind spot for the vm_write32-only FLOW_WVAL hook. */
     { static int64_t wv=-2; if(wv==-2){const char*e=getenv("FLOW_WVAL"); wv=e?(int64_t)strtoul(e,0,16):-1;}
