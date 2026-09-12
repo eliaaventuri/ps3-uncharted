@@ -309,6 +309,31 @@ static void rsx_inline_latch(rsx_state* state)
     s_inline_count++;
 }
 
+/* Ultimo valore scritto per ogni slot di report (tabella aperta, chiave = EA):
+ * lo legge spu_dma.h quando una GET SPU trova lo slot ancora a -1 (v. la). */
+#define RSX_REPORT_SHADOW_N 16384
+static u32 s_rsh_ea[RSX_REPORT_SHADOW_N], s_rsh_val[RSX_REPORT_SHADOW_N];
+static int s_rsh_on = -1;
+static void rsx_report_shadow_set(u32 ea, u32 val)
+{
+    if (s_rsh_on < 0) { const char* e = getenv("RSX_REPORT_LAG"); s_rsh_on = (e && *e == '0') ? 0 : 1; }
+    if (!s_rsh_on) return;
+    u32 h = (ea >> 4) & (RSX_REPORT_SHADOW_N - 1);
+    for (u32 i = 0; i < RSX_REPORT_SHADOW_N; i++, h = (h + 1) & (RSX_REPORT_SHADOW_N - 1))
+        if (s_rsh_ea[h] == ea || s_rsh_ea[h] == 0) { s_rsh_ea[h] = ea; s_rsh_val[h] = val; return; }
+}
+int rsx_report_shadow_get(u32 ea, u32* val)
+{
+    if (s_rsh_on <= 0) return 0;
+    u32 h = (ea >> 4) & (RSX_REPORT_SHADOW_N - 1);
+    for (u32 i = 0; i < RSX_REPORT_SHADOW_N; i++, h = (h + 1) & (RSX_REPORT_SHADOW_N - 1)) {
+        if (s_rsh_ea[h] == ea) { *val = s_rsh_val[h]; return 1; }
+        if (s_rsh_ea[h] == 0) return 0; }
+    return 0;
+}
+static u32 s_report_ctx = 0xFEED0001u;   /* NV4097_SET_CONTEXT_DMA_REPORT */
+extern u32 cellGcmResolveLocated(int local, u32 offset);
+extern unsigned long long ps3_ms_now(void);
 int rsx_process_method(rsx_state* state, u32 method, u32 data)
 {
     /* YDKJ_RSXTRACE=<N>: trace the first N methods (bare "1" keeps the old 250).
@@ -344,6 +369,33 @@ int rsx_process_method(rsx_state* state, u32 method, u32 data)
       static long s_m = -2; if (s_m == -2) { const char* e = getenv("GCM_DATAWATCH_M"); s_m = e ? strtol(e, 0, 16) : -1; }
       if (s_hi && (s_m < 0 || (long)method == s_m) && (long)(data & 0xFFFFFFu) >= s_lo && (long)(data & 0xFFFFFFu) < s_hi && s_n++ < 4000)
           fprintf(stderr, "[datawatch] method=0x%04X data=0x%08X\n", method, data); }
+    /* Report (NV4097_GET_REPORT 0x1800): la RSX scrive 16 byte
+     * {timestamp(8), valore(4), 0} all'offset dato, nel contesto scelto da
+     * NV4097_SET_CONTEXT_DMA_REPORT (0x01A8): 0xFEED0001 = memoria principale
+     * (offset IO -> EA), 0xFEED0000 = locale, 0x66626660 = area report locale.
+     * Uncharted (ICE) mette 8192 report in memoria principale a IO 0x14400: il
+     * PPU emette `GET_REPORT slot; CLEAR_REPORT_VALUE; CALL <buffer del job>`
+     * per ogni oggetto (occlusion query con ZPASS_PIXEL_CNT), il job SPU 215
+     * il fotogramma dopo aspetta che il +8 dello slot non sia piu' -1 (che il
+     * PPU ci scrive in SwapBuffers) e con valore 0 salta il disegno. Non c'e'
+     * ancora un'occlusion query in Metal: il conteggio ZPASS e' un valore
+     * fisso non nullo (RSX_ZPASS_COUNT, default 0x1000 = "visibile"). */
+    if (method == 0x01A8) { s_report_ctx = data; return 0; }
+    if (method == 0x17C8) { return 0; }             /* CLEAR_REPORT_VALUE */
+    if (method == 0x1800) {
+        extern void vm_write32(uint32_t a, uint32_t v);
+        u32 type = data >> 24, off = data & 0x00FFFFFFu, ea = 0;
+        if (s_report_ctx == 0xFEED0001u || s_report_ctx == 0xBAD68000u) ea = cellGcmResolveLocated(0, off);
+        else if (s_report_ctx == 0xFEED0000u) ea = cellGcmResolveLocated(1, off);
+        else ea = cellGcmResolveLocated(1, 0x1400000u + off);      /* 0x66626660: area report locale */
+        static long s_zp = -1; if (s_zp < 0) { const char* e = getenv("RSX_ZPASS_COUNT"); s_zp = e ? strtol(e, 0, 16) : 0x1000; }
+        u32 val = (type == 1) ? (u32)s_zp : 0;
+        if (ea) { unsigned long long ts = ps3_ms_now() * 1000ull;
+            vm_write32(ea, (u32)(ts >> 32)); vm_write32(ea + 4, (u32)ts); vm_write32(ea + 8, val); vm_write32(ea + 12, 0);
+            rsx_report_shadow_set(ea, val); }
+        { static int _n = 0; if (_n++ < 4 || getenv("RSX_REPORT_DBG")) fprintf(stderr, "[RSX] report tipo %u offset 0x%06X -> ea 0x%08X = %u (ctx 0x%08X)\n", type, off, ea, val, s_report_ctx); }
+        return 0;
+    }
     { static u32 s_sem_off = 0;
       if (method == 0x1D6C) { s_sem_off = data; return 0; }
       /* 0x1D74 NV4097_TEXTURE_READ_SEMAPHORE_RELEASE: stessa scrittura del

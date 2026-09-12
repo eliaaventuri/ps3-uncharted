@@ -703,7 +703,39 @@ in `/private/tmp/claude-501/.../scratchpad`); il job 206 scrive i buffer
 "vuoti" (zeri + RET), 217 il park, 215 il pacchetto; 218 (ICE vertex) gira
 solo ~8 volte al caricamento del livello.
 
+22. **`NV4097_GET_REPORT` (0x1800) e `SET_CONTEXT_DMA_REPORT` (0x01A8).** Il
+    walker scrive {timestamp, valore, 0} all'EA del report (IO -> EA per
+    0xFEED0001); il conteggio ZPASS e' fisso `RSX_ZPASS_COUNT` (default
+    0x1000: "visibile") finche' non c'e' l'occlusion query in Metal. Trovato
+    con `PS3_TTY_SCAN=01014400:FFFFFF00` (con il poke attivo): il PPU emette
+    `GET_REPORT slot k; CLEAR_REPORT_VALUE; CALL <buffer del job k>` per ogni
+    oggetto del passaggio principale, e il job 215 del fotogramma dopo legge
+    lo slot (passaggio ombre compreso, che nell'anello viene PRIMA). Sul
+    ferro funziona perche' la GPU sta un fotogramma dietro il PPU: il -1 di
+    SwapBuffers viene ricoperto dalla GET_REPORT del fotogramma prima. Il
+    walker sincrono aveva gia' scritto il valore che il PPU cancellava, e il
+    job si bloccava sul park. Rete di sicurezza in `spu_dma.h`: una GET SPU da
+    16 byte che trova -1 in uno slot gia' scritto dal walker riceve l'ultimo
+    valore (`rsx_report_shadow_get`, `RSX_REPORT_LAG=0` lo spegne); nella
+    corsa di misura non e' mai scattata.
+
+**Misura (`run_s27_c149.log`, 200 s, nessun poke):** 104-123 buffer con draw
+ogni 500 CALLati, ~18 draw/fotogramma in piu' del post-processing, e **la
+prima scena 3D**: la sagoma della barca del livello 'dive-boat' con la scia,
+nera su verde, in basso a sinistra (`docs/img_s27_prima_scena_3d.png`).
+Manca tutto il resto: illuminazione/texture (i draw dei job escono neri),
+posizione/viewport (la scena occupa il quadrante in basso a sinistra, un
+rettangolo nero in alto a sinistra), depth test.
+
 ### Il prossimo passo
+
+1. Il rettangolo nero e la scena nel quadrante: `RSX_DRAWLIST=<frame>` su un
+   fotogramma con i draw dei job (VP hash/FP/superficie/viewport/scissor) e
+   confronto con i draw del post-processing; depth test nel backend Metal.
+2. Perche' i draw escono neri: FP dei job (texture non caricate? costanti?).
+3. Assert non deterministico `joblist.cpp(578)` sul thread audio (tid 14).
+
+### Il prossimo passo (prima del punto 22, superato)
 
 1. `NV4097_GET_REPORT` nel walker (0x1800: `(type<<24)|offset`, contesto
    0xFEED0001 = IO → EA con `gcm_io2ea`; scrivere {ts,ts,valore,0}, valore

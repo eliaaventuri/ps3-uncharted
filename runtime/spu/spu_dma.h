@@ -647,6 +647,21 @@ static inline int mfc_do_transfer(spu_context* spu, uint32_t lsa, uint64_t ea,
          * functions resident for this context. */
         { extern void spu_overlay_note_get(spu_context*, uint32_t, const uint8_t*, uint32_t);
           spu_overlay_note_get(spu, (uint32_t)ea, (const uint8_t*)ls_ptr, size); }
+        /* Report RSX "in ritardo": sul ferro la GPU e' un fotogramma dietro il
+         * PPU, cosi' il -1 che SwapBuffers scrive nel +8 di ogni slot di report
+         * viene RICOPERTO dal valore della GET_REPORT del fotogramma prima. Il
+         * nostro walker e' sincrono: aveva gia' scritto il valore, il PPU lo ha
+         * cancellato, e il job SPU (215) che legge lo slot aspetta per sempre
+         * (e blocca il park della CALL dietro cui sta la prossima GET_REPORT).
+         * Se una GET da 16 byte trova -1 in uno slot che il walker ha gia'
+         * scritto, gli si consegna l'ultimo valore scritto (RSX_REPORT_LAG=0
+         * lo spegne). */
+        if (size == 16 && ((uint32_t)ea & 15) == 0) {
+            extern int rsx_report_shadow_get(uint32_t ea, uint32_t* val);
+            uint8_t* q = (uint8_t*)ls_ptr; uint32_t v;
+            if (q[8] == 0xFF && q[9] == 0xFF && q[10] == 0xFF && q[11] == 0xFF && rsx_report_shadow_get((uint32_t)ea, &v)) {
+                q[8] = (uint8_t)(v >> 24); q[9] = (uint8_t)(v >> 16); q[10] = (uint8_t)(v >> 8); q[11] = (uint8_t)v;
+                { static int _n = 0; if (_n++ < 4) fprintf(stderr, "[mfc] report a 0x%08X ancora -1: consegnato l'ultimo valore RSX %u\n", (uint32_t)ea, v); } } }
         /* LBP_SPU_WATCH: a DMA GET landing on a watched LS line is how the PPU
          * delivers commands into the SPU's queue (bypasses spu_ls_write128). */
         { int _n; unsigned* _w = spu_ls_watch_list(&_n);
