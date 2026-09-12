@@ -261,9 +261,12 @@ static inline int mfc_do_transfer(spu_context* spu, uint32_t lsa, uint64_t ea,
      * sincronizzazione, ed e' esattamente li' che si vede se la coda ha lavoro
      * o e' vuota. Senza guardarci dentro, "il manager gira ma non carica
      * niente" resta una frase. */
-    { static long s_de = -1;
+    { static long s_de = -1; static uint32_t s_del[4]; static int s_den = 0;
       if (s_de < 0) { const char* e = getenv("SPU_DMA_DUMP_EA");
-                      s_de = e && *e ? (long)strtoul(e, 0, 16) : 0; }
+                      s_de = e && *e ? (long)strtoul(e, 0, 16) : 0;
+                      /* fino a 4 EA separati da virgola */
+                      while (e && *e && s_den < 4) { char* q = 0; s_del[s_den++] = (uint32_t)strtoul(e, &q, 16); if (!q || *q != ',') break; e = q + 1; } }
+      int _de_hit = 0; for (int _k = 0; _k < s_den; _k++) if ((uint32_t)ea == s_del[_k]) _de_hit = 1;
       /* SPU_DMA_DUMP_NZ=<off>: stampa solo quando la parola a quell'offset non
        * e' zero. Una struttura che passa la vita vuota riempie il log di zeri e
        * nasconde l'unico momento che interessa -- quello in cui il gioco ci ha
@@ -278,10 +281,10 @@ static inline int mfc_do_transfer(spu_context* spu, uint32_t lsa, uint64_t ea,
           memcpy(&w, vm_base + (uint32_t)ea + off, 4);
           _nz_ok = (w != 0);
       }
-      if (s_de && mfc_is_get(cmd) && (uint32_t)ea == (uint32_t)s_de && _nz_ok &&
+      if (s_de && mfc_is_get(cmd) && _de_hit && _nz_ok &&
           vm_base && mfc_ea_range_committed(ea, size)) {
           static int _n = 0;
-          if (_n++ < 12) {
+          if (_n++ < 24) {
               const uint8_t* m = vm_base + (uint32_t)ea;
               uint32_t n = size > 256 ? 256 : size;
               char b[1400];

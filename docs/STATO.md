@@ -601,16 +601,33 @@ parole nei buffer SPU (dove il job di geometria patcha i draw) restano zeri.
     - `build.sh` non ricompila i moduli SPU liftati quando cambiano SOLO
       gli header (`spu_context.h`): `rm obj/spu_*.o` prima.
 
+14. **Il job 218 e' il job di geometria di ICE** (`SPU_DMA_DUMP_EA=
+    2B053CE0,2B053CD0,25EEEC10`): la sua lista DMA (0x60 byte, coppie
+    size/EA) carica in LS 0x16000+ un blocco parametri da 16 byte
+    (`07000930 0 0 60`), sei coppie di record (0xA0 + 0xC0 byte: descrittori
+    di stream di vertici ICE -- `00160008 000C0020...`, half 0x3C00) e un
+    blocco da 0x400. Lo store a LS 0 sta nella funzione 0x5C48: `rotqby
+    $r9, $r4, $r3` sceglie una corsia di r4 (una quadword di **indirizzi
+    LS di buffer**, quelli che il job chiede al PM con le API 0x1C20/
+    0x1BDC/0x1D20 = get-buffer), `a $r3,$r9,$r3`, `lqd $r3, 0x20($r3)`,
+    poi `stqx` da r3. Con r4 = 0 (buffer non assegnati) r3 = 0. Il job non
+    scrive mai a LS 0x16030 (`SPU_LS_WRITE_WATCH=16030
+    SPU_LS_WRITE_WATCH_OVL=218`), quindi non e' un campo patchato dal job.
+    Sospetto: la nostra esecuzione del PM restituisce buffer nulli a questo
+    job (bufferSetArray / load commands del suo descrittore).
+15. `find_spu_functions.py`: l'istruzione dopo ogni `bisl` e' un ingresso
+    (i "(no lift)" a 0xCBCC/0xCD54/0xCD7C/0xD2F4 sono spariti).
+
 ### Il prossimo passo
 
-1. Il job 218: da dove vengono i suoi dati (i puntatori nulli). Con
-   `SPU_DMA_EAWIN=0x20000000:0x30000000 SPU_DMA_EAWIN_ONE=1` + il lock di
-   `SPU_JOBTRACE_ONE` si vedono i GET del solo contesto del job; ma il
-   job parte tardi (>180 s): corse da 240 s, o `PAD_SCRIPT` prima.
-2. I ritorni di `bisl $r0,$r0` come ingressi nel lifter SPU
-   (`find_spu_functions.py`: l'istruzione dopo un `bisl` e' un ingresso).
-3. Lo sfondo 3D del menu (i buchi da 8 parole restano NOP): stesso mondo.
-4. Assert non deterministico `joblist.cpp(578)` sul thread audio (tid 14).
+1. Il job 218: perche' le API get-buffer del PM gli danno 0. Guardare i
+   `[wws-res] bufferSetArray read` e i load command del job (`[wws-batch]`)
+   nel tratto dopo "'dive-boat': loaded" (corse da 240 s: il job parte a
+   ~200 s con `PAD_SCRIPT=45:x`); confrontare con un job che funziona (227,
+   audio, stesse API).
+2. Lo sfondo 3D del menu (i buchi da 8 parole restano NOP): stesso mondo.
+3. Assert non deterministico `joblist.cpp(578)` sul thread audio (tid 14).
+4. Backend Metal: manca il depth test (serve appena la scena 3D arriva).
 
 ### Strumenti nuovi
 

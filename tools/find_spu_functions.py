@@ -414,6 +414,22 @@ def collect_ila_continuation_targets(insns, code_start, code_end):
     return targets
 
 
+def collect_bisl_return_targets(insns):
+    """The instruction after an indirect call (`bisl $rL, $rT`) is a resume
+    point the callee reaches with `bi $rL`. The lifter brackets a bisl in a
+    nested dispatch so a recognised link-return unwinds to the host frame,
+    but a callee whose return is NOT recognised (a function pointer into a
+    table, code the lift did not see) dispatches to that address instead --
+    and with no entry there the job fell into the microstep interpreter
+    (Uncharted's ovl 218 render job: `lqd $r0,0($r82); bisl $r0,$r0` at
+    0xCBC8, dispatch "(no lift)" at 0xCBCC). Seed every bisl's return."""
+    targets = set()
+    for ins in insns:
+        if ins.mnemonic in ("bisl", "bisled"):
+            targets.add(ins.addr + 4)
+    return targets
+
+
 def collect_duff_targets(insns, code_start, code_end, window=12, span=64):
     """Mid-ladder entries of a Duff's device (computed jump into an unrolled
     loop). Sony's SPU job CRT clears BSS with one:
@@ -620,6 +636,7 @@ def detect_functions(buf, base_override=None, verbose=True, raw=False):
     fptr_targets = collect_function_pointer_tables(
         buf, elf["phs"], code_start, code_end, insns_by_addr)
     for t in (collect_link_register_targets(insns)
+              | collect_bisl_return_targets(insns)
               | collect_computed_branch_targets(insns)
               | collect_jump_table_targets(insns, code, code_start, code_end)
               | collect_ila_continuation_targets(insns, code_start, code_end)

@@ -504,10 +504,19 @@ static inline void spu_ls_write128(spu_context* ctx, uint32_t lsa, u128 val)
     /* SPU_LS0_WATCH=1: i primi 16 store a LS 0 (il vettore di interrupt del
      * PM). Uncharted, livello dive-boat: LS0 diventava `fsmbi` e l'interrupt
      * di stall-and-notify non veniva piu' preso. */
-    if (g_spu_ls0_watch < 0) g_spu_ls0_watch = getenv("SPU_LS0_WATCH") ? 1 : 0;
-    if (g_spu_ls0_watch && lsa == 0) { static int _n = 0; if (_n++ < 16)
-        fprintf(stderr, "[ls0-watch] img=%d ovl=%d pc=0x%05X stq LS 0 = %08X %08X %08X %08X\n",
-                ctx->image_id, ctx->resident_ovl, (uint32_t)ctx->pc & SPU_LS_MASK,
+    /* SPU_LS0_WATCH=1 guarda LS 0; SPU_LS_WRITE_WATCH=<hex> un altro indirizzo
+     * (allineato a 16). g_spu_ls0_watch: -1 = da leggere, 0 = spento, altrimenti
+     * l'indirizzo+1. */
+    if (g_spu_ls0_watch < 0) { const char* e = getenv("SPU_LS_WRITE_WATCH");
+        g_spu_ls0_watch = e ? (int)(strtoul(e, 0, 16) & ~0xFu) + 1 : (getenv("SPU_LS0_WATCH") ? 1 : 0); }
+    if (g_spu_ls0_watch && lsa == (uint32_t)(g_spu_ls0_watch - 1)) {
+        extern int g_hle_trace_armed;   /* con PS3_TTY_BT parte dall'hit */
+        static int s_gate = -1; if (s_gate < 0) s_gate = getenv("PS3_TTY_BT") ? 1 : 0;
+        static int s_wovl = -2; if (s_wovl == -2) { const char* e = getenv("SPU_LS_WRITE_WATCH_OVL"); s_wovl = e ? atoi(e) : -1; }
+        static int _n = 0; if ((!s_gate || g_hle_trace_armed) && (s_wovl < 0 || ctx->resident_ovl == s_wovl) && _n++ < 16)
+        fprintf(stderr, "[ls-watch] c%04X img=%d ovl=%d pc=0x%05X lr=0x%05X stq LS 0x%05X = %08X %08X %08X %08X\n",
+                (unsigned)(((uintptr_t)ctx >> 12) & 0xFFFF), ctx->image_id, ctx->resident_ovl,
+                (uint32_t)ctx->pc & SPU_LS_MASK, ctx->gpr[0]._u32[0] & SPU_LS_MASK, lsa,
                 val._u32[0], val._u32[1], val._u32[2], val._u32[3]); }
     /* WWS code-buffer probe: LBP's ChangeLoadToRunJob dispatches to LS[0x1320]
      * (= lsaJobCodeBuffer in LBP's layout) + entryOffset. When TecRunJob writes
