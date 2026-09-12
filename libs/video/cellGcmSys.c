@@ -652,8 +652,19 @@ void cellGcmTickVBlank(void) { s_vblank_count++; GCM_PENDING_SET(1); }
  * the callback IS the flip interrupt -- no flip, no callback. */
 void cellGcmTickFlip(void)
 {
-    if (s_flip_status == CELL_GCM_FLIP_STATUS_WAITING)
-        GCM_PENDING_SET(2);
+    if (s_flip_status != CELL_GCM_FLIP_STATUS_WAITING) return;
+    /* GCM_FLIP_FIFO=1: il flip si completa solo quando il walker ha consumato
+     * tutto fino a `put` (come la RSX vera, che esegue il flip in coda al
+     * fotogramma). Senza, il titolo crede che la GPU abbia finito e riusa la
+     * memoria dei programmi/vertici del fotogramma che il walker sta ancora
+     * aspettando ai park: Uncharted ricompilava il tonemap da un ring gia'
+     * sovrascritto (programma di una istruzione, schermo nero). Vale anche
+     * come freno: il PPU aspetta i job SPU invece di correre avanti. */
+    { static int need = -1;
+      if (need < 0) { const char* e = getenv("GCM_FLIP_FIFO"); need = (e && *e && *e != '0') ? 1 : 0; }
+      if (need) { u32 put = vm_read32(GCM_CONTROL_GUEST_ADDR + 0);
+                  if (s_fifo_getoff != put) return; } }
+    GCM_PENDING_SET(2);
 }
 
 /* Drain the game's GCM FIFO into the RSX backend. Called from the present thread
@@ -1267,6 +1278,13 @@ static int s_in_put_hook = 0;
 static int s_parked = 0;
 /* Ultimo JUMP preso: da li' comincia il segmento in cui si sta camminando. */
 static u32 s_last_jump_tgt = 0;
+
+/* Il present del backend legge la lista dei draw che il walker riempie: va
+ * fatto sotto lo stesso lock, altrimenti il ticker codifica un fotogramma
+ * mentre il thread guest ci aggiunge draw (misurato con MTL_DEBUG_LAYER:
+ * blocchi di costanti oltre la fine del buffer). */
+void cellGcm_fifo_lock(void)   { AcquireSRWLockExclusive(&s_gcm_fifo_lock); }
+void cellGcm_fifo_unlock(void) { ReleaseSRWLockExclusive(&s_gcm_fifo_lock); }
 
 void cellGcm_rsx_process_fifo(void)
 {

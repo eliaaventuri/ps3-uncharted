@@ -524,6 +524,7 @@ def collect_function_pointer_tables(buf, phs, code_start, code_end,
         seg = buf[off:off + fsz]
         skew = (-vaddr) & 3                 # keep words on the LS 4-byte grid
         run = []
+        zeros = 0
         def _flush(r):
             if len(r) >= min_run and len(set(r)) >= 2:
                 targets.update(r)
@@ -531,11 +532,15 @@ def collect_function_pointer_tables(buf, phs, code_start, code_end,
         while i + 4 <= len(seg):
             w = int.from_bytes(seg[i:i + 4], "big")
             if (w & 3) == 0 and code_start <= w < code_end and w in insns_by_addr:
-                run.append(w)
+                run.append(w); zeros = 0
                 if len(run) >= max_run:
                     _flush(run); run = []
+            elif w == 0 and run and zeros < 1:
+                # Uncharted's geometry job keeps {addr, 0} pairs (0x15FF0:
+                # 13330 0 123A0 0 ...): a single zero does not break the run.
+                zeros += 1
             else:
-                _flush(run); run = []
+                _flush(run); run = []; zeros = 0
             i += 4
         _flush(run)
     return targets

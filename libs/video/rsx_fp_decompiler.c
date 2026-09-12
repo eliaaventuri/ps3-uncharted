@@ -390,6 +390,7 @@ static void dest_mask(u32 op0, char* m)
 /* CELL_GCM_SHADER_CONTROL_32_BITS_EXPORTS: when set, fragment output is fp32
  * (color = r0); when clear, output is fp16 (color = h0). Matches RPCS3
  * FragmentProgramDecompiler::BuildCode (gcm_enums.h). */
+static int s_fp_mrt;
 #define FP_CTRL_32BIT_EXPORTS 0x40u
 
 int rsx_fp_decompile(const u8* ucode, u32 max_bytes, u32 ctrl, char* out, u32 out_size)
@@ -428,7 +429,7 @@ static int rsx_fp_decompile_internal(
             "#include <metal_stdlib>\n"
             "using namespace metal;\n"
             "struct PSInput {\n"
-            "    float4 position [[position]]; float4 col0; float4 col1;\n"
+            "    float4 position [[position, invariant]]; float4 col0; float4 col1;\n"
             "    float4 fog;\n"
             "    float4 tc0; float4 tc1; float4 tc2; float4 tc3;\n"
             "    float4 tc4; float4 tc5; float4 tc6; float4 tc7;\n"
@@ -449,7 +450,22 @@ static int rsx_fp_decompile_internal(
     if (msl) {
         /* Metal takes the resource bindings as function parameters, so the
          * banks and the constant buffers are all part of one signature. */
-        out_puts(&o, "fragment float4 rsx_fp_main(PSInput input [[stage_in]]");
+        /* SHADER_CONTROL bit 0xE (DEPTH_EXPORT): il programma scrive anche la
+         * profondita' del frammento, in r1.z (rpcs3: "gl_FragDepth = r1.z").
+         * Uncharted lo usa nel quad che ricopia il depth risolto nel buffer
+         * principale prima del passaggio di colore (test EQUAL). */
+        {
+            int dep = (ctrl != RSX_FP_CTRL_AUTO && (ctrl & 0xEu)) ? 1 : 0;
+            int mrt = (s_fp_mrt > 1) ? s_fp_mrt : 1;
+            if (dep || mrt > 1) {
+                char hdr[320]; int n = snprintf(hdr, sizeof hdr, "struct RsxFpOut { float4 color [[color(0)]];");
+                for (int k = 1; k < mrt; k++) n += snprintf(hdr + n, sizeof hdr - n, " float4 color%d [[color(%d)]];", k, k);
+                if (dep) n += snprintf(hdr + n, sizeof hdr - n, " float depth [[depth(any)]];");
+                snprintf(hdr + n, sizeof hdr - n, " };\nfragment RsxFpOut rsx_fp_main(PSInput input [[stage_in]]");
+                out_puts(&o, hdr);
+            } else
+                out_puts(&o, "fragment float4 rsx_fp_main(PSInput input [[stage_in]]");
+        }
         if (tex_cube_mask == 0) {
             out_puts(&o, ",\n    array<texture2d<float>, 16> rsx_tex [[texture(0)]]");
         } else {
@@ -710,11 +726,11 @@ static int rsx_fp_decompile_internal(
             if (is_never) {
                 rhs[0] = '\0';
             } else if (is_uncond) {
-                out_puts(&o, "    discard;\n");
+                out_puts(&o, msl ? "    discard_fragment();\n" : "    discard;\n");
             } else {
                 char kil[128];
                 snprintf(kil, sizeof(kil),
-                         msl ? "    if (any(cc%u.%s %s 0.0f)) discard;\n"
+                         msl ? "    if (any(cc%u.%s %s 0.0f)) discard_fragment();\n"
                              : "    if (any(cc%u.%s %s (float4)0)) discard;\n",
                          cc_read, cswz, cmp_op);
                 out_puts(&o, kil);
@@ -835,6 +851,16 @@ static int rsx_fp_decompile_internal(
         if (ctrl == RSX_FP_CTRL_AUTO) {
             /* No control word (standalone tests): legacy heuristic. */
             out_puts(&o, (wrote_r0 || !wrote_h0) ? ret_r : ret_h);
+        } else if (msl && ((ctrl & 0xEu) || s_fp_mrt > 1)) {
+            int r32 = (ctrl & FP_CTRL_32BIT_EXPORTS) ? 1 : 0;
+            char ep[640]; int n = snprintf(ep, sizeof ep, "    float4 _o = %s[0];\n    RsxFpOut _out; _out.color = select(float4(0), _o, _o == _o);\n", r32 ? "r" : "h");
+            /* color1..3 <- r2/r3/r4 (32 bit) oppure h2/h4/h6 (16 bit) */
+            for (int k = 1; k < s_fp_mrt; k++)
+                n += snprintf(ep + n, sizeof ep - n, "    { float4 _c = %s[%d]; _out.color%d = select(float4(0), _c, _c == _c); }\n",
+                              r32 ? "r" : "h", r32 ? (k + 1) : (2 * k), k);
+            if (ctrl & 0xEu) n += snprintf(ep + n, sizeof ep - n, "    _out.depth = clamp(r[1].z, 0.0f, 1.0f);\n");
+            snprintf(ep + n, sizeof ep - n, "    return _out;\n}\n");
+            out_puts(&o, ep);
         } else {
             out_puts(&o, (ctrl & FP_CTRL_32BIT_EXPORTS) ? ret_r : ret_h);
         }
@@ -1074,6 +1100,10 @@ u32 rsx_fp_code_hash(const u8* ucode, u32 max_bytes)
     }
     return h;
 }
+
+/* Numero di bersagli di colore (MRT) per la prossima decompilazione MSL:
+ * 1..4. La RSX esporta color1..3 da r2/r3/r4 (h2/h4/h6 a 16 bit). */
+void rsx_fp_set_mrt_count(int n) { s_fp_mrt = (n < 1) ? 1 : (n > 4) ? 4 : n; }
 
 int rsx_fp_decompile_lang(
     const u8* ucode, u32 max_bytes, u32 ctrl, u32 tex_cube_mask, int buffered,

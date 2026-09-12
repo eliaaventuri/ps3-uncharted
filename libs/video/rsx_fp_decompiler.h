@@ -116,6 +116,7 @@ int rsx_fp_decompile_buffered_ex(
  * RSX_FP_LANG_MSL it is a Metal fragment function named rsx_fp_main, taking
  * the texture/sampler banks at [[texture(0)]]/[[sampler(0)]] and, when
  * buffered, the constants at [[buffer(1)]] and the alpha ref at [[buffer(2)]]. */
+void rsx_fp_set_mrt_count(int n);
 int rsx_fp_decompile_lang(
     const u8* ucode, u32 max_bytes, u32 ctrl, u32 tex_cube_mask, int buffered,
     rsx_fp_lang lang, char* out, u32 out_size, u32* out_constant_count);

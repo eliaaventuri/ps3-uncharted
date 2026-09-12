@@ -205,6 +205,8 @@ extern "C" int  rsx_d3d12_backend_pump_messages(void);
 #elif defined(__APPLE__)
 extern "C" int  rsx_metal_backend_init(uint32_t w, uint32_t h, const char* title);
 extern "C" void rsx_metal_backend_present(void);
+extern "C" void cellGcm_fifo_lock(void);
+extern "C" void cellGcm_fifo_unlock(void);
 extern "C" int  rsx_metal_backend_pump_messages(void);
 #  define rsx_backend_init    rsx_metal_backend_init
 #  define rsx_backend_present rsx_metal_backend_present
@@ -298,7 +300,7 @@ static DWORD WINAPI vblank_ticker(LPVOID)
              * writes and showed empty or mixed batches. */
             {
                 if (rsx_ok && cellGcm_take_flip_pending()) {
-                    rsx_backend_present();
+                    cellGcm_fifo_lock(); rsx_backend_present(); cellGcm_fifo_unlock();
                     last_flip = cellGcm_flip_request_count();
                 }
             }
@@ -317,7 +319,7 @@ static DWORD WINAPI vblank_ticker(LPVOID)
          * The real RSX writes those fences in microseconds. */
         if (rsx_ok) {
             if (cellGcm_take_flip_pending()) {
-                rsx_backend_present();
+                cellGcm_fifo_lock(); rsx_backend_present(); cellGcm_fifo_unlock();
                 last_flip = cellGcm_flip_request_count();
             }
             cellGcm_rsx_process_fifo();
@@ -335,7 +337,7 @@ static DWORD WINAPI vblank_ticker(LPVOID)
             if (getenv("YDKJ_PACETRACE")) {
                 static ULONGLONG s_win=0; static int s_pf=0, s_pres=0; static ULONGLONG s_presms=0;
                 s_pf += fired; s_pres++;
-                ULONGLONG t0=GetTickCount64(); rsx_backend_present(); ULONGLONG t1=GetTickCount64();
+                ULONGLONG t0=GetTickCount64(); cellGcm_fifo_lock(); rsx_backend_present(); cellGcm_fifo_unlock(); ULONGLONG t1=GetTickCount64();
                 s_presms += (t1-t0);
                 if (s_win==0) s_win=now;
                 if (now - s_win >= 1000) {
@@ -352,7 +354,7 @@ static DWORD WINAPI vblank_ticker(LPVOID)
                  * during boot. */
                 unsigned fc = cellGcm_flip_request_count();
                 if (fc != last_flip || fc == 0) {
-                    rsx_backend_present();
+                    cellGcm_fifo_lock(); rsx_backend_present(); cellGcm_fifo_unlock();
                     last_flip = fc;
                 }
             }
