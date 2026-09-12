@@ -818,11 +818,26 @@ Non-problemi verificati: `Technique index 0 already exists` (dati del pak,
 gia' in sessione 27); `Unknown semantic 0x25` / `Lost 1 shader parameter`
 (stampe del titolo).
 
+**Stallo FIOS RISOLTO (`run_s27_c257b..c260b`, 4/4 corse caricano
+`sky-dive-boat`, prima ~1 su 2).** Con `sample` sul processo fermo
+(`tools/stallcatch.sh`): un media thread FIOS era fermo per sempre in
+`cellSpursEventFlagWait` (flag 0x2A870C80, bit 1) mentre teneva il mutex 52
+(`PS3_MUTEX_DBG=1` lo denuncia dopo 3 s), e l'altro media thread aspettava
+quel mutex. Il flag lo mette il **task SPURS edge-zlib** (taskset
+0x2A86F380, task 0, segnalato con `SendSignal` per ogni chunk da 1 MB) con
+GETLLAR/PUTLLC; il PPU, al risveglio, faceva il clear AUTO come
+read-modify-write NON atomica (`current & ~received` scritto con
+`vm_write16`): se il PUTLLC del chunk dopo atterrava fra la lettura e la
+scrittura, il PPU cancellava il bit appena messo e aspettava per sempre.
+Ora il clear (e `TryWait`/`Clear`) rilegge e scrive sotto
+`spu_atomic_line_lock` (lo stesso lock del commit del PUTLLC). In piu'
+`cellSpursRemoveWorkload` ora dimentica il contesto persistente del PM
+(`spurs_pm_forget`): Uncharted rimuove e ri-aggiunge il wid 12 ~700 volte
+sempre con la stessa coda, e il kernel vero ricarica il modulo.
+
 ### Il prossimo passo (quinta parte)
 
-1. Lo stallo FIOS su `sky-dive-boat.pak`: `PS3_SCTRACE_TID=7,11` con
-   timestamp intorno all'`OpenAsync` che non completa; confrontare con un
-   pacchetto che passa (open→pread→close in 50 ms).
+1. (fatto: stallo FIOS, vedi sopra)
 2. Occlusion query vere nel backend Metal (`MTLVisibilityResultMode`) o
    almeno un conteggio realistico: taglia i draw per fotogramma e forse
    l'assert `joblist.cpp(578)`.
@@ -848,6 +863,12 @@ gia' in sessione 27); `Unknown semantic 0x25` / `Lost 1 shader parameter`
   watchdog delle GET identiche, `MapMainMemory -> io=`.
 - `PS3_SCTRACE_TID=<tid>[,..]` + timestamp `t=..ms` in `[sc]`.
 - `SPURS_IDLE_MAX=<n>` (esponente massimo del backoff del kernel SPURS).
+- `PS3_MUTEX_DBG=1` (un `sys_mutex_lock` che aspetta piu' di 3 s stampa
+  mutex, proprietario, lr dell'ultimo lock e catena del thread in attesa).
+- `tools/stallcatch.sh <log> [VAR=..]`: corsa che aspetta la richiesta
+  di `sky-dive-boat`, e se dopo 45 s non e' caricato campiona il processo
+  con `sample` (le pile di TUTTI i thread: e' cosi' che si e' visto il
+  thread fermo nell'event flag).
 - lldb sul processo vivo: `lldb --batch -o "command script import bp.py"
   -o "script bp.run(lldb.debugger, <pid>, <s>)"`; i simboli `func_XXXX`
   esistono (C++ mangled), `ctx` e' in x0, `gpr[n]` a x0+8n, `fpr[n]` a

@@ -57,6 +57,7 @@ tools/gen_hle_nids.py        genera la tabella NID per il port (--all)
 tools/check_ppu_scaffold.py  ratchet del boot
 tools/spu_disasm.py, ppu_disasm.py  disassemblatori
 tools/lldb_guest_bp.py       breakpoint lldb sui func_XXXX del port vivo (r3-r5, f1, catena)
+tools/stallcatch.sh          corsa Uncharted che campiona il processo se il caricamento si ferma
 tests/                       torture e conformance del runtime
 lbp/, wave/                  altri port (riferimento, non toccare)
 fw_spu/                      job/prx firmware liftati (audio, sre)

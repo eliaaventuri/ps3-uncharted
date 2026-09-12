@@ -58,6 +58,7 @@ typedef struct sys_mutex_info {
     int      recursive;
     uint64_t owner_tid;   /* thread_id of current owner (for recursive/error checking) */
     int      lock_count;  /* recursive lock count */
+    uint32_t owner_lr;    /* lr guest dell'ultimo lock (PS3_MUTEX_DBG) */
 
 #ifdef _WIN32
     CRITICAL_SECTION cs;

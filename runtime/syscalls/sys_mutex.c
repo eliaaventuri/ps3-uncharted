@@ -8,6 +8,8 @@
 #include "../memory/vm.h"
 #include <string.h>
 #include <stdio.h>
+#include <stdlib.h>
+#include <errno.h>
 
 /* ---------------------------------------------------------------------------
  * Globals
@@ -220,7 +222,24 @@ int64_t sys_mutex_lock(ppu_context* ctx)
     }
 #else
     if (timeout_us == 0) {
-        pthread_mutex_lock(&m->mtx);
+        /* PS3_MUTEX_DBG=1: un lock senza timeout che aspetta piu' di 3 s viene
+         * denunciato (mutex, proprietario, lr del suo ultimo lock, catena del
+         * thread in attesa) e poi continua ad aspettare. Serve per lo stallo
+         * FIOS: un thread fermo per sempre in sys_mutex_lock. */
+        static int s_dbg = -1; if (s_dbg < 0) s_dbg = getenv("PS3_MUTEX_DBG") ? 1 : 0;
+        if (!s_dbg) pthread_mutex_lock(&m->mtx);
+        else {
+            int reported = 0;
+            for (;;) {
+                struct timespec ts; clock_gettime(CLOCK_REALTIME, &ts); ts.tv_sec += 3;
+                if (pthread_mutex_timedlock(&m->mtx, &ts) != ETIMEDOUT) break;
+                if (!reported) { reported = 1;
+                    fprintf(stderr, "[mutex-dbg] tid=%llu aspetta da 3 s il mutex %u '%.8s' (rec=%d): proprietario tid=%llu count=%d lr=0x%08X; waiter lr=0x%08X\n",
+                            (unsigned long long)caller_tid, mutex_id, m->name, m->recursive,
+                            (unsigned long long)m->owner_tid, m->lock_count, m->owner_lr, (uint32_t)ctx->lr);
+                    { extern void ppu_guest_callstack(const char*); ppu_guest_callstack("mutex-dbg"); } }
+            }
+        }
     } else {
         struct timespec ts;
         clock_gettime(CLOCK_REALTIME, &ts);
@@ -239,6 +258,7 @@ int64_t sys_mutex_lock(ppu_context* ctx)
 
     m->owner_tid = caller_tid;
     m->lock_count++;
+    m->owner_lr = (uint32_t)ctx->lr;
     return CELL_OK;
 }
 
@@ -295,6 +315,7 @@ int64_t sys_mutex_trylock(ppu_context* ctx)
 
     m->owner_tid = caller_tid;
     m->lock_count++;
+    m->owner_lr = (uint32_t)ctx->lr;
     return CELL_OK;
 }
 

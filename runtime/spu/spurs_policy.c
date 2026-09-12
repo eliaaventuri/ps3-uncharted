@@ -97,6 +97,22 @@ static void spurs_pm_wd_disarm(uint32_t wid, uint32_t spu_num)
     s_pm_wd[wid][spu_num].ctx = 0;
 }
 
+/* Dati (EA della coda) con cui il contesto persistente di ogni (workload,
+ * SPU virtuale) e' stato avviato l'ultima volta: se cambiano, LS fresco. */
+enum { SPURS_PM_MAX_WKL_ = 16 };
+static uint64_t s_pm_data[SPURS_PM_MAX_WKL_][6];
+
+/* cellSpursRemoveWorkload: il kernel vero scarica il policy module; il
+ * prossimo AddWorkload sullo stesso wid (Uncharted lo fa ~700 volte, edge
+ * zlib per ogni pacchetto, SEMPRE con la stessa coda) deve ripartire da LS
+ * pulito, altrimenti il PM riparte dallo stato "catena finita" della vita
+ * precedente e la nuova catena non gira mai (stallo FIOS a meta' corse). */
+void spurs_pm_forget(uint32_t wid)
+{
+    if (wid >= SPURS_PM_MAX_WKL_) return;
+    for (int i = 0; i < 6; i++) s_pm_data[wid][i] = ~0ull;
+}
+
 int spu_run_policy_module(spu_lifted_entry_fn entry, int image_id,
                           const uint8_t* pm_host, uint32_t pm_size,
                           uint64_t wkl_data, uint32_t wid, uint32_t spurs_ea,
@@ -140,7 +156,6 @@ int spu_run_policy_module(spu_lifted_entry_fn entry, int image_id,
      * masks 0x1270/0x1280, records) into queue B made the PM see stale
      * state and claim nothing (observed: LBP's second loading queue sat at
      * lanes {0,...} while the first drained fine). */
-    static uint64_t s_pm_data[SPURS_PM_MAX_WKL][6];
     if (!ctx) {
         ctx = (spu_context*)malloc(sizeof(spu_context));
         if (!ctx) return -1;

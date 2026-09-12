@@ -1322,6 +1322,7 @@ s32 cellSpursRemoveWorkload(CellSpurs* spurs, CellSpursWorkloadId wid)
     if (!s_workloads[wid].in_use) return CELL_SPURS_CORE_ERROR_SRCH;
 
     s_workloads[wid].in_use = 0;
+    { extern void spurs_pm_forget(u32); spurs_pm_forget(wid); }   /* LS fresco al prossimo Add */
     printf("[cellSpurs] RemoveWorkload(wid=%u)\n", wid);
     return CELL_OK;
 }
@@ -1891,8 +1892,18 @@ s32 cellSpursEventFlagWait(CellSpursEventFlag* eventFlag, u16* bits,
         fprintf(stderr, "[cellSpurs] EventFlagWait WAKE tid=%lu flagEA=0x%08X "
                 "pattern=0x%04X got=0x%04X (waits=%u)\n",
                 (unsigned long)GetCurrentThreadId(), ea, pattern, current, waits); }
-    if (vm_read8(ea + EF_CLEAR_MODE) == CELL_SPURS_EVENT_FLAG_CLEAR_AUTO)
-        vm_write16(ea + EF_EVENTS, (u16)(current & ~received));
+    /* Il clear AUTO e' una read-modify-write sulla stessa linea che il task
+     * SPU aggiorna con GETLLAR/PUTLLC: va fatta sotto il lock delle linee
+     * atomiche e rileggendo, altrimenti un PUTLLC che atterra fra la lettura
+     * di `current` e la scrittura viene cancellato (il task edge-zlib di
+     * Uncharted segnalava un chunk, il PPU lo cancellava, e il caricamento
+     * restava fermo per sempre in ~meta' delle corse). */
+    if (vm_read8(ea + EF_CLEAR_MODE) == CELL_SPURS_EVENT_FLAG_CLEAR_AUTO) {
+        extern void spu_atomic_line_lock(void); extern void spu_atomic_line_unlock(void);
+        spu_atomic_line_lock();
+        vm_write16(ea + EF_EVENTS, (u16)(vm_read16(ea + EF_EVENTS) & ~received));
+        spu_atomic_line_unlock();
+    }
 
     ef_unlock(sync);
 
@@ -1932,8 +1943,12 @@ s32 cellSpursEventFlagTryWait(CellSpursEventFlag* eventFlag, u16* bits,
     vm_write16(bits_ea, current);
     u16 received = (mode == CELL_SPURS_EVENT_FLAG_AND) ? pattern
                                                        : (u16)(current & pattern);
-    if (vm_read8(ea + EF_CLEAR_MODE) == CELL_SPURS_EVENT_FLAG_CLEAR_AUTO)
-        vm_write16(ea + EF_EVENTS, (u16)(current & ~received));
+    if (vm_read8(ea + EF_CLEAR_MODE) == CELL_SPURS_EVENT_FLAG_CLEAR_AUTO) {
+        extern void spu_atomic_line_lock(void); extern void spu_atomic_line_unlock(void);
+        spu_atomic_line_lock();   /* come in cellSpursEventFlagWait: RMW atomica rispetto ai PUTLLC */
+        vm_write16(ea + EF_EVENTS, (u16)(vm_read16(ea + EF_EVENTS) & ~received));
+        spu_atomic_line_unlock();
+    }
 
     ef_unlock(sync);
     return CELL_OK;
@@ -1950,7 +1965,10 @@ s32 cellSpursEventFlagClear(CellSpursEventFlag* eventFlag, u16 bits)
         return CELL_SPURS_TASK_ERROR_STAT;
 
     ef_lock(sync);
-    vm_write16(ea + EF_EVENTS, (u16)(vm_read16(ea + EF_EVENTS) & ~bits));
+    { extern void spu_atomic_line_lock(void); extern void spu_atomic_line_unlock(void);
+      spu_atomic_line_lock();
+      vm_write16(ea + EF_EVENTS, (u16)(vm_read16(ea + EF_EVENTS) & ~bits));
+      spu_atomic_line_unlock(); }
     ef_unlock(sync);
 
     return CELL_OK;
