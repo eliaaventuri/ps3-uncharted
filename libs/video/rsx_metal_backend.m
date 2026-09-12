@@ -98,6 +98,7 @@ typedef struct {
     __unsafe_unretained id<MTLTexture> tex[RSX_MAX_TEXTURES];
 } MtlDraw;
 static u32 fp_ucode_hash(u32 fp_addr);
+static id<MTLLibrary> guest_fp_library(u32 fp_addr, int vp, u32 ctrl, u32 mrt, u32 hash);
 
 /* One MTLTexture per unit, rebuilt when the guest rebinds a different image. */
 typedef struct {
@@ -111,6 +112,7 @@ static MtlVertex* s_verts;
 static u32        s_vert_count;
 static MtlDraw    s_draws[MTL_MAX_DRAWS];
 static u32        s_draw_count;
+unsigned rsx_backend_draw_count(void) { return s_draw_count; }   /* per RSX_MTRACE (rsx_commands.c) */
 static u32        s_dropped_draws;
 
 /* ---- vertex program del guest (sessione 27) --------------------------------
@@ -570,6 +572,10 @@ static void record_draw(const rsx_state* st, u32 prim, u32 base, u32 count,
     d->surf_fmt = st->surface_format; d->color_target = st->color_target; d->surf_pitch0 = st->surface_color_pitch[0]; d->surf1 = st->surface_color_offset[1];
     d->surf2 = st->surface_color_offset[2]; d->surf3 = st->surface_color_offset[3];
     d->n_mrt = (st->color_target == 0x13) ? 2 : (st->color_target == 0x17) ? 3 : (st->color_target == 0x1F) ? 4 : 1;
+    /* Il programma va tradotto ORA, finche' il microcodice in memoria e' quello
+     * del draw: il titolo riusa il ring dei FP e alla codifica (present) ci
+     * sarebbe gia' il programma del fotogramma dopo. */
+    if (d->fp_addr) (void)guest_fp_library(d->fp_addr, (d->vp >= 0 && s_vps[d->vp].ok) ? d->vp : -1, d->shader_ctrl, d->n_mrt, d->fp_hash);
     d->surf_w = st->surface_clip_w ? st->surface_clip_w : s_width; d->surf_h = st->surface_clip_h ? st->surface_clip_h : s_height;
     d->sx = st->scissor_x; d->sy = st->scissor_y;
     d->sw = st->scissor_w; d->sh = st->scissor_h;
@@ -701,6 +707,7 @@ done:
     d->surf_fmt = s_state ? s_state->surface_format : 0; d->color_target = s_state ? s_state->color_target : 0;
     d->surf2 = s_state ? s_state->surface_color_offset[2] : 0; d->surf3 = s_state ? s_state->surface_color_offset[3] : 0;
     d->n_mrt = (d->color_target == 0x13) ? 2 : (d->color_target == 0x17) ? 3 : (d->color_target == 0x1F) ? 4 : 1;
+    if (d->fp_addr) (void)guest_fp_library(d->fp_addr, (d->vp >= 0 && s_vps[d->vp].ok) ? d->vp : -1, d->shader_ctrl, d->n_mrt, d->fp_hash);
     d->surf_pitch0 = s_state ? s_state->surface_color_pitch[0] : 0; d->surf1 = s_state ? s_state->surface_color_offset[1] : 0;
     d->surf_w = (s_state && s_state->surface_clip_w) ? s_state->surface_clip_w : s_width;
     d->surf_h = (s_state && s_state->surface_clip_h) ? s_state->surface_clip_h : s_height;
@@ -1336,14 +1343,14 @@ static id<MTLLibrary> guest_fp_library(u32 fp_addr, int vp, u32 ctrl, u32 mrt, u
                 fprintf(stderr, "[RSX metal] guest fp 0x%08X compile failed: %s\n",
                         fp_addr, [[err localizedDescription] UTF8String]);
             else {
-                fprintf(stderr, "[RSX metal] guest fp 0x%08X: %d instructions\n",
-                        fp_addr, n);
+                fprintf(stderr, "[RSX metal] guest fp 0x%08X/%08X: %d instructions\n",
+                        fp_addr, hash, n);
                 /* RSX_FP_DUMP=1: l'MSL tradotto. Quando la geometria rasterizza
                  * (provato con la tinta) ma resta nera, la risposta e' qui. */
                 { static int fd = -1;
                   if (fd < 0) fd = getenv("RSX_FP_DUMP") ? 1 : 0;
-                  if (fd) fprintf(stderr, "---- MSL fp 0x%08X ----\n%s\n----\n",
-                                  fp_addr, msl); }
+                  if (fd) fprintf(stderr, "---- MSL fp 0x%08X/%08X ----\n%s\n----\n",
+                                  fp_addr, hash, msl); }
             }
         } else {
             fprintf(stderr, "[RSX metal] guest fp 0x%08X: decompile failed\n", fp_addr);
@@ -1694,10 +1701,12 @@ void rsx_metal_backend_present(void)
                       s_frame_no, s_draw_count, s_vert_count, s_cb_count);
               for (u32 i = 0; i < s_draw_count; i++) {
                   const MtlDraw* d = &s_draws[i];
-                  fprintf(stderr, "[drawlist] #%-3u surf=%08X%s[fmt=%X ct=%X pitch=%u B=%X Z=%X dt=%d/%X/%d sc=%X] vp=%s%08X fp=%08X n=%-5u topo=%d blend=%d(%03X,%03X) sc=%u,%u %ux%u tex:",
+                  fprintf(stderr, "[drawlist] #%-3u surf=%08X%s[fmt=%X ct=%X pitch=%u B=%X Z=%X dt=%d/%X/%d sc=%X] vp=%s%08X fp=%08X/%08X n=%-5u topo=%d blend=%d(%03X,%03X) sc=%u,%u %ux%u tex:",
                           i, d->surf, cellGcmOffsetIsDisplay(d->surf) ? "*" : " ", d->surf_fmt, d->color_target, d->surf_pitch0, d->surf1, d->zeta_off, d->depth_test, d->depth_func, d->depth_mask, d->shader_ctrl,
-                          d->vp >= 0 ? "" : "-", d->vp >= 0 ? s_vps[d->vp].hash : 0u, d->fp_addr, d->count, (int)d->topology,
+                          d->vp >= 0 ? "" : "-", d->vp >= 0 ? s_vps[d->vp].hash : 0u, d->fp_addr, d->fp_hash, d->count, (int)d->topology,
                           d->blend_enable, d->blend_sfactor, d->blend_dfactor, d->sx, d->sy, d->sw, d->sh);
+                  /* il microcodice del FP e' ancora quello del draw? (anello riusato) */
+                  if (d->fp_addr) { u32 hn = fp_ucode_hash(d->fp_addr); if (hn != d->fp_hash) fprintf(stderr, " fp-ora=%08X", hn); }
                   for (u32 t = 0; t < RSX_MAX_TEXTURES; t++) if (d->tex[t])
                       fprintf(stderr, " %u:%lux%lu@%X/f%02X", t, (unsigned long)d->tex[t].width, (unsigned long)d->tex[t].height, d->tex_off[t], (d->tex_fmt[t] >> 8) & 0xFF);
                   fprintf(stderr, "\n");

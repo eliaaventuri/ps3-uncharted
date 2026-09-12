@@ -1562,7 +1562,13 @@ static DWORD WINAPI spurs_kernel_thread(LPVOID p)
                 static u32 s_pass_no;                            /* shared pass counter is fine */
                 if (wid == 0) s_pass_no++;
                 if (kicked) s_idle[wid] = 0;
-                u32 cad = 1u << (s_idle[wid] > 4 ? 4 : s_idle[wid]);
+                /* SPURS_IDLE_MAX=<n>: tetto dell'esponente del backoff (default
+                 * 4 = ogni 16 passate). Uncharted non "kicka" i workload: ogni
+                 * sync PPU<->SPU di un fotogramma pagava fino a 16 ms di
+                 * latenza, e ce ne sono decine per fotogramma. */
+                static int s_imax = -1;
+                if (s_imax < 0) { const char* e = getenv("SPURS_IDLE_MAX"); s_imax = e ? atoi(e) : 4; }
+                u32 cad = 1u << (s_idle[wid] > (u8)s_imax ? (u32)s_imax : s_idle[wid]);
                 if (!kicked && (s_pass_no & (cad - 1)) != 0) continue;
                 extern volatile unsigned g_spurs_pm_polls, g_spurs_pm_exited;
                 u32 polls_before = g_spurs_pm_polls;   /* heuristic only */

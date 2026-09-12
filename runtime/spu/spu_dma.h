@@ -927,11 +927,12 @@ static inline int mfc_submit(mfc_engine* mfc, spu_context* spu, uint32_t cmd)
           if (++s_rep >= s_limit) {
               s_rep = 0;   /* re-arm: the chain may run this job again */
               extern void spu_halt(spu_context*);
+              { uint32_t _v = 0; if (size >= 4 && mfc_ea_range_committed(ea, 4)) { memcpy(&_v, vm_base + (uint32_t)ea, 4); _v = __builtin_bswap32(_v); }
               fprintf(stderr, "[spu-dma] img=%d ovl=%d pc=0x%05X: %u identical "
-                      "%s transfers lsa=0x%05X ea=0x%08X size=0x%X -- halting the SPU\n",
+                      "%s transfers lsa=0x%05X ea=0x%08X size=0x%X (valore 0x%08X) -- halting the SPU\n",
                       spu->image_id, spu->resident_ovl, (uint32_t)spu->pc & SPU_LS_MASK, s_limit,
                       mfc_is_get(cmd) ? "GET" : mfc_is_put(cmd) ? "PUT" : "cmd", lsa,
-                      (uint32_t)ea, size);
+                      (uint32_t)ea, size, _v); }
               fflush(stderr);
               spu_halt(spu);
           }

@@ -131,6 +131,7 @@ extern "C" void ps3_install_guest_ptr_trap(void)
 extern "C" uint32_t ppu_vm_size;   /* defined below; the handler needs it */
 extern "C" PPU_THREAD_LOCAL ppu_context* g_active_ctx;   /* likewise */
 extern "C" int g_hle_trace_armed;                        /* ppu_hle.cpp: PS3_HLE_TID_TRACE armato da PS3_TTY_BT */
+extern "C" unsigned long long ps3_ms_now(void);          /* cellGcmSys.c: orologio in ms per le tracce */
 
 static struct sigaction s_prev_segv, s_prev_bus;
 
@@ -249,6 +250,12 @@ static void sc_trace(uint64_t num, ppu_context* ctx, uint64_t a3, uint64_t a4,
     if (mode < 0) { const char* e = getenv("PS3_SCTRACE");
         mode = !e ? 0 : (strcmp(e, "fail") == 0 ? 2 : 1); }
     if (!mode) return;
+    /* PS3_SCTRACE_TID=<tid>[,<tid>..]: solo quei thread (il resto e' rumore di
+     * usleep); ogni riga porta i millisecondi, per misurare le latenze FIOS. */
+    { static long tids[8]; static int nt = -1;
+      if (nt < 0) { nt = 0; const char* e = getenv("PS3_SCTRACE_TID");
+          while (e && *e && nt < 8) { char* q = 0; tids[nt++] = strtol(e, &q, 10); if (!q || *q != ',') break; e = q + 1; } }
+      if (nt) { int ok = 0; for (int i = 0; i < nt; i++) if ((long)ctx->thread_id == tids[i]) ok = 1; if (!ok) return; } }
     int64_t rv = (int64_t)ctx->gpr[3];
     if (mode == 2 && (rv == 0 || (uint64_t)rv < 0x80000000ull)) return;
     /* Resolve the GUEST function that made the call: walk the host stack and
@@ -267,10 +274,11 @@ static void sc_trace(uint64_t num, ppu_context* ctx, uint64_t a3, uint64_t a4,
               snprintf(who, sizeof who, "func_%08X+0x%llX", best_g,
                        (unsigned long long)(tgt - best_h));
       } }
-    fprintf(stderr, "[sc] %llu(0x%llX, 0x%llX, 0x%llX, 0x%llX) -> 0x%llX tid=%u from %s\n",
-            (unsigned long long)num, (unsigned long long)a3, (unsigned long long)a4,
+    {
+    fprintf(stderr, "[sc] t=%llums %llu(0x%llX, 0x%llX, 0x%llX, 0x%llX) -> 0x%llX tid=%u from %s\n",
+            ps3_ms_now(), (unsigned long long)num, (unsigned long long)a3, (unsigned long long)a4,
             (unsigned long long)a5, (unsigned long long)a6,
-            (unsigned long long)rv, (unsigned)ctx->thread_id, who);
+            (unsigned long long)rv, (unsigned)ctx->thread_id, who); }
     fflush(stderr);
 }
 

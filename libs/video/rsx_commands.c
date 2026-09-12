@@ -342,6 +342,16 @@ int rsx_process_method(rsx_state* state, u32 method, u32 data)
     { static int _rt=-1; if(_rt<0){ const char* e=getenv("YDKJ_RSXTRACE");
         _rt = e ? (atoi(e) > 1 ? atoi(e) : 250) : 0; }
       if(_rt){ static int _m=0; if(_m++<_rt) fprintf(stderr,"[rsxm] method=0x%04X data=0x%08X\n", method, data); } }
+    /* RSX_MTRACE=<lo>:<hi>: i metodi mentre il contatore dei draw del backend
+     * (nel fotogramma corrente) e' in [lo,hi]; armato da PS3_TTY_BT, tetto
+     * 4000 righe. Per vedere COSA cambia fra due draw "uguali" (superficie,
+     * maschere, offset) senza leggere tutto l'anello. */
+#ifdef __APPLE__   /* il contatore vive nel backend Metal */
+    { static long s_lo = -2, s_hi = -1; static int s_n = 0; extern unsigned rsx_backend_draw_count(void); extern int g_hle_trace_armed;
+      if (s_lo == -2) { const char* e = getenv("RSX_MTRACE"); s_lo = -1; if (e) { s_lo = strtol(e, 0, 10); const char* c = strchr(e, ':'); s_hi = c ? strtol(c + 1, 0, 10) : s_lo; } }
+      if (s_lo >= 0 && g_hle_trace_armed && s_n < 4000) { long dc = (long)rsx_backend_draw_count();
+          if (dc >= s_lo && dc <= s_hi) { s_n++; fprintf(stderr, "[mtrace] d%ld m=0x%04X %08X\n", dc, method, data); } } }
+#endif
     /* Back-end write label / semaphore (cellGcmSetWriteBackEndLabel): the RSX
      * writes a value to a report/label the CPU polls for CPU<->RSX sync (double
      * buffering). Real hardware DOES this; without it the game's frame-fence
@@ -415,6 +425,10 @@ int rsx_process_method(rsx_state* state, u32 method, u32 data)
         u32 val = (data & 0xff00ff00u) | ((data >> 16) & 0xffu) | ((data & 0xffu) << 16);
         vm_write32(VM_HLE_INJECT_BASE + (s_sem_off & 0x00FFFFFFu), val);
         { static int _l=0; if(_l++<8) fprintf(stderr,"[RSX] label write @0x%08X = 0x%08X (sync fence, raw 0x%08X)\n", VM_HLE_INJECT_BASE+(s_sem_off&0xFFFFFF), val, data); }
+        /* RSX_LABEL_DBG=<hex offset>: tutte le scritture di quel label (il job
+         * 215 aspetta il 0x480 = "fin dove la RSX ha consumato l'anello SPU") */
+        { static long s_ld = -2; if (s_ld == -2) { const char* e = getenv("RSX_LABEL_DBG"); s_ld = e ? strtol(e, 0, 16) : -1; }
+          if (s_ld >= 0 && (long)(s_sem_off & 0xFFFFFF) == s_ld) fprintf(stderr, "[label] 0x%03lX = 0x%08X (metodo 0x%04X)\n", s_ld, val, method); }
         return 0;
       } }
     if ((method >= 0x200 && method <= 0x23C) ||

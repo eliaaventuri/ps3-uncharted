@@ -727,6 +727,132 @@ Manca tutto il resto: illuminazione/texture (i draw dei job escono neri),
 posizione/viewport (la scena occupa il quadrante in basso a sinistra, un
 rettangolo nero in alto a sinistra), depth test.
 
+### Quinta parte (13 settembre): depth, MRT, e perche' lo schermo resta nero
+
+Commit `0026542` (backend Metal, non ancora raccontato qui):
+
+23. **Superfici e depth nel backend Metal.** Dimensioni per superficie
+    (`surface_texture(off,w,h,pf)`, 64 slot, drawable ridimensionato SOLO
+    per le superfici display: l'atlante delle ombre lo portava a 2432x1216);
+    passaggio principale 007D0000 = A8R8G8B8 MSAA 2x (fmt 0x3148, pitch
+    10240 → 2560x720); depth F50000 Z24S8 come attachment vero, test/scrittura
+    da `dt=test/func/mask` (`dss_for`, `RSX_DEPTH_FUNC` override, `RSX_DEPTH=0`);
+    **export del depth dal fragment program** (`SHADER_CONTROL & 0xE`, r1.z →
+    `[[depth(any)]]`): senza, il quad del cielo/copy (control 0x200840E)
+    lasciava il depth a zero e il z-prepass (LEQUAL+write, poi colore EQUAL)
+    scartava tutto. Il titolo "risolve" il depth con un quad che scrive Z
+    codificato in ARGB (A=Z[23:16], R=Z[15:8], G=Z[7:0]) nella superficie
+    02D50000, poi usata come zeta: `zeta_from_color` (compute
+    `fs_rgba_to_depth`) e `depth_to_rgba` (`depth2d<float, access::read>`,
+    con `texture2d` non leggeva nulla) tengono le due viste sincronizzate.
+    MRT: `SET_SURFACE_COLOR_TARGET`=0x17 → 3 attachment (016D0000/01E50000/
+    025D0000, FP16 fmt 0x14B → `RGBA16Float`, `RSX_HDR=0` lo spegne), il
+    decompilatore emette `struct RsxFpOut { color0..3, depth }`
+    (`rsx_fp_set_mrt_count`). Lookup delle texture: prima le superfici di
+    rendering (il post-processing leggeva una decodifica stantia di 7D0000
+    dalla texcache), poi zeta, poi texcache.
+24. **Fragment program: cache per contenuto e compilazione al record.** Il
+    titolo tiene i FP in un anello in memoria principale (IO 0x120000..,
+    slot da 0x200 → EA 0x21120000..: `MapMainMemory` iniziale IO 0 = EA
+    0x21000000; la scrittura e' una `memcpy` per programma, `stvx` per le
+    costanti, in `func_004989D8`); una cache per indirizzo restituiva il
+    programma del fotogramma prima. Ora: hash FNV del microcodice
+    (`fp_ucode_hash`) al momento del draw e compilazione subito
+    (`guest_fp_library` nei due `record_draw`), cache chiave hash+vp+ctrl+mrt.
+    Misurato con `fp-ora=` nel drawlist: in un fotogramma di 559 draw
+    nessun programma cambia fra record e present (il problema era solo la
+    cache per indirizzo). Il MSL usa `[[position, invariant]]` +
+    `preserveInvariance` (z-prepass EQUAL), `discard_fragment()`.
+25. **Present sotto il lock del FIFO** (`cellGcm_fifo_lock/unlock` in
+    `boot_main.cpp`): Metal validava "constant buffer offset oltre la
+    lunghezza" perche' il present correva insieme al record dei draw.
+    `GCM_FLIP_FIFO=1` (in `run.sh`): il flip si completa solo a get==put.
+
+**Perche' il display e' nero anche se la scena c'e'** (la parte lunga,
+`run_s27_c211..c250`): il fotogramma finisce con **sei quad neri** (fp
+`00121A02`, 1 istruzione `h0=(0,0,0,1)`, `RSX_FP_DUMP=1`): su 03C30000
+(512x512), sul **display**, e 4 volte su 016D0000 (viewport pieno, stesso
+stato: `RSX_MTRACE=548:562` non mostra nessun cambio di superficie fra un
+draw e l'altro). Con lldb (`scratchpad/bp*.py`: breakpoint sui simboli
+`func_XXXX`, legge `ctx->gpr` da x0) sono tutte `DrawQuad(id=50)` =
+"riempi con un colore" (tabella dei post-shader a `obj+0x65A4+id*4`, obj =
+`*(*(0x7CB290)-0x7F9C)` = 0x106F9D70, TOC = 0x7D3190), chiamate da
+`func_004B1300..` = il ramo "azzera i buffer" di `func_004AFC68`, preso
+quando `(G+0x2E0 / ((G+0x2A0+G+0x2C0)-(G+0x2B0+G+0x2D0))) * G+0x300 == 0`
+per i tre canali, con G = render settings del tonemap (statica 0x10512DA0;
+`PS3_TTY_DUMP=0x10512DA0+2A0:0x80`). I tre G+0x2E0..0x2E8 valgono 0 perche'
+ogni fotogramma `func_00199298` fa memcpy(1.0) e poi `func_00199158`
+(blend `dst=(1-w)*dst+w*src`) con src=0 e **w=1.0**: l'override e'
+registrato da `func_0051C468(f1=1.0, f2=FLT_MAX)` = **fade a nero**,
+chiamato ogni fotogramma da `func_00522458` = lo stato "**Resetting
+dive-boat movie-intro: waiting for region N**" (stringhe a 0x10065340..;
+`bp5.py` sulla `strcat` `func_00761C50` le ha lette). Cioe': il titolo e'
+ancora nel caricamento del checkpoint, e tiene lo schermo nero finche'
+tutti i pacchetti delle regioni non sono in stato 5 (`level+0x90`). NON e'
+il rendering: i draw neri sono giusti.
+
+**Perche' il caricamento non finisce:** (a) e' lento — ~100 `RequestLevel`
+(dive-boat, attori, sky-dive-boat, dive-wide, dive-ocean, temple-0a,
+sky-temple...) e ogni pacchetto costa 1-2 fotogrammi di "login" a 2-5
+fps (misura `RSX_FRAMESTAT=100`: menu 60 fps, livello 5.5 fps con 367
+draw, 2.2 fps con 1080 draw); il profilo (`sample`) dice: main thread PPU
+al 61% dentro `func_0074232C` (spin sul job manager, nessuna syscall),
+walker 8%, thread SPURS (uno solo, `Sleep(1)` per passata) al 64% in
+nanosleep e 18% nel job 215; (b) in ~meta' delle corse **la lettura di
+`sky-dive-boat.pak` non completa mai** (OpenAsync emesso, la PreadAsync a
+volte nemmeno): i thread FIOS (5,6,8,9,10 media, 7 e 11 scheduler) restano
+in `cond_wait` — corsa nel nostro HLE, non ancora trovata (con
+`PS3_SCTRACE=1 PS3_SCTRACE_TID=5,..,11` i pacchetti che passano fanno
+open→pread→close in 50 ms); (c) a lungo andare l'assert
+`joblist.cpp(578) m_jobHeaderCommand == kNoJobYet` (AddJob su uno slot non
+libero), poi SIGSEGV: sospetto le occlusion query finte (tutto visibile →
+1000 draw/fotogramma e piu' job di quanti la lista ne tenga).
+
+Provato e scartato: `SPURS_FORCE_SPUS=3` (3 SPU virtuali in parallelo):
+il boot si ferma a 200 fotogrammi (il job manager WWS non regge lane
+concorrenti, come per LBP). `SPURS_IDLE_MAX=0` (niente backoff del kernel
+SPURS): il caricamento avanza un po' piu' in fretta (106 pacchetti in 130
+s contro 97 in 195 s), fps invariati.
+
+Non-problemi verificati: `Technique index 0 already exists` (dati del pak,
+gia' in sessione 27); `Unknown semantic 0x25` / `Lost 1 shader parameter`
+(stampe del titolo).
+
+### Il prossimo passo (quinta parte)
+
+1. Lo stallo FIOS su `sky-dive-boat.pak`: `PS3_SCTRACE_TID=7,11` con
+   timestamp intorno all'`OpenAsync` che non completa; confrontare con un
+   pacchetto che passa (open→pread→close in 50 ms).
+2. Occlusion query vere nel backend Metal (`MTLVisibilityResultMode`) o
+   almeno un conteggio realistico: taglia i draw per fotogramma e forse
+   l'assert `joblist.cpp(578)`.
+3. Velocita': il PPU spinna in `func_0074232C` aspettando il job manager;
+   il kernel SPURS dorme 1 ms per passata su un solo thread. Misurare
+   quante passate/kick servono per fotogramma prima di toccare la
+   pianificazione.
+4. Dopo il caricamento completo (regioni in stato 5) il fade dovrebbe
+   togliersi da solo: verificare con una corsa lunga senza stallo
+   (`SPURS_IDLE_MAX=0`), screenshot a 300+ s.
+
+### Strumenti nuovi (quinta parte)
+
+- Metal: `RSX_DRAWLIST_MIN/AFTER` (il primo fotogramma con ≥n draw dopo il
+  fotogramma m; con `RSX_DUMP_FRAME` salva anche le superfici),
+  `RSX_DRAW_LIMIT`, `RSX_DEPTH`, `RSX_DEPTH_FUNC`, `RSX_HDR`,
+  `RSX_DEBUG_TINT=3` (depth del guest), `RSX_FP_DUMP=1` (MSL con hash),
+  drawlist con `fp=addr/hash`, `fp-ora=` se il microcodice e' cambiato al
+  present, `tex u:WxH@off/fXX`, `[fmt ct pitch B Z dt sc]`.
+- `RSX_MTRACE=<lo>:<hi>` (metodi RSX mentre il contatore dei draw del
+  backend e' in [lo,hi], armato da `PS3_TTY_BT`), `RSX_LABEL_DBG=<off>`
+  (tutte le scritture di quel label), `[spu-dma] ... (valore 0x..)` nel
+  watchdog delle GET identiche, `MapMainMemory -> io=`.
+- `PS3_SCTRACE_TID=<tid>[,..]` + timestamp `t=..ms` in `[sc]`.
+- `SPURS_IDLE_MAX=<n>` (esponente massimo del backoff del kernel SPURS).
+- lldb sul processo vivo: `lldb --batch -o "command script import bp.py"
+  -o "script bp.run(lldb.debugger, <pid>, <s>)"`; i simboli `func_XXXX`
+  esistono (C++ mangled), `ctx` e' in x0, `gpr[n]` a x0+8n, `fpr[n]` a
+  x0+256+8n, la memoria guest a `vm_base + ea` (big-endian).
+
 ### Il prossimo passo
 
 1. Il rettangolo nero e la scena nel quadrante: `RSX_DRAWLIST=<frame>` su un
