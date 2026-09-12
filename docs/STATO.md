@@ -773,7 +773,7 @@ Commit `0026542` (backend Metal, non ancora raccontato qui):
 `00121A02`, 1 istruzione `h0=(0,0,0,1)`, `RSX_FP_DUMP=1`): su 03C30000
 (512x512), sul **display**, e 4 volte su 016D0000 (viewport pieno, stesso
 stato: `RSX_MTRACE=548:562` non mostra nessun cambio di superficie fra un
-draw e l'altro). Con lldb (`scratchpad/bp*.py`: breakpoint sui simboli
+draw e l'altro). Con lldb (`tools/lldb_guest_bp.py`: breakpoint sui simboli
 `func_XXXX`, legge `ctx->gpr` da x0) sono tutte `DrawQuad(id=50)` =
 "riempi con un colore" (tabella dei post-shader a `obj+0x65A4+id*4`, obj =
 `*(*(0x7CB290)-0x7F9C)` = 0x106F9D70, TOC = 0x7D3190), chiamate da
