@@ -40,6 +40,14 @@ CODE_END = {
     "jobmod_ef33c6c99dc7_e0A40": 0xAE68,   # real code ends at br 0xA554 @ 0xAE60
     "jobmod_6943e26934ea_e0A20": 0xAE48,   # real code ends at br 0xA534 @ 0xAE40
 }
+# Ingressi che --auto-functions non vede (raggiunti solo da `bisl $r0, $rN`
+# calcolati), passati come --extra-funcs. Senza, il salto finisce nel
+# microstep, che non sa eseguire il corpo, e il job si ferma.
+EXTRA_FUNCS = {
+    # Uncharted, ovl 216: `bisl $r0,$r20` a LS 0x59CC -> 0x6C80 (hbrr + cwd + lqd...),
+    # "BRANCH-TO-0 unresolved pc=0x06C80", e la batch job list non finiva mai (sessione 28)
+    "jobmod_008eea40_867403af57c7": [0x6C80],
+}
 
 def main():
     # I percorsi LBP restano i default: e' il titolo su cui questo e' nato. Ma i
@@ -81,6 +89,29 @@ def main():
                "--source-name", "spu_recomp.c", "--header-name", "spu_recomp.h"]
         if name in CODE_END:
             cmd += ["--code-end", hex(CODE_END[name])]
+        # Tabelle di puntatori a funzione (sessione 28): i moduli WwsJob di
+        # Uncharted chiamano i gestori con `bisl $r0, $rN` da tabelle di parole
+        # (es. 216: LS 0x13FB0.., 0x14AE0..), che --auto-functions non vede.
+        # Ogni corsa di >= 6 parole allineate che cadono nel modulo e' una
+        # tabella: i suoi elementi diventano ingressi extra.
+        extras = set(EXTRA_FUNCS.get(name, []))
+        cands = []
+        for off in range(0, len(raw) - 4, 4):
+            w = struct.unpack_from(">I", raw, off)[0]
+            cands.append(w if (BASE <= w < BASE + len(raw) and w % 4 == 0 and w != BASE) else None)
+        # una corsa puo' contenere fino a 3 zeri di fila (tabelle sparse:
+        # 216 ha {0,0,0,6C80,A020,0,0,0} a LS 0x14060); vale con >= 2 voci
+        # se contiene zeri, >= 6 se piena
+        zeros = [struct.unpack_from(">I", raw, off)[0] == 0 for off in range(0, len(raw) - 4, 4)]
+        run = []; nz = 0; zrun = 0
+        for w, z in list(zip(cands, zeros)) + [(None, False)]:
+            if w is not None: run.append(w); zrun = 0
+            elif z and zrun < 3 and run: zrun += 1; nz += 1
+            else:
+                if len(run) >= 6 or (len(run) >= 2 and nz): extras.update(run)
+                run = []; nz = 0; zrun = 0
+        if extras:
+            cmd += ["--extra-funcs", ",".join(hex(x) for x in sorted(extras))]
         r = subprocess.run(cmd, capture_output=True, text=True)
         if r.returncode != 0:
             print(f"  FAIL {name}\n{r.stderr}", file=sys.stderr)

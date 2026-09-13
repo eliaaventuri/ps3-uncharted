@@ -1405,7 +1405,7 @@ static int spu_smc_microstep(spu_context* ctx)
         if (op7 == 0x21)  { ctx->gpr[rt] = spu_splat_u32((w >> 7) & 0x3FFFF); pc += 4; continue; } /* ila */
         if (op11 == 0x201 || op11 == 0x001) { pc += 4; continue; }  /* nop/lnop */
         if (op11 == 0x002 || op11 == 0x003) { pc += 4; continue; }  /* sync/dsync */
-        if (op11 == 0x1AC || op9 == 0x008 || op9 == 0x009) { pc += 4; continue; } /* hbr hints */
+        if (op11 == 0x1AC || op7 == 0x08 || op7 == 0x09) { pc += 4; continue; } /* hbr/hbra/hbrr: hint, RI18 (op7) -- con op9 hbrr 0x127A7F90 era "UNKNOWN word" (sessione 28) */
 
         { static int _n = 0;
           if (_n++ < 8)

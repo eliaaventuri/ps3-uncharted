@@ -2194,10 +2194,17 @@ static void gcm_rsx_process_fifo_unlocked(void)
      * passes while `put` is somewhere else, there is work the walker will
      * never reach: resynchronise to the write head. Same trade as the
      * unmapped-get path -- commands are lost, the FIFO lives. */
+    /* Sessione 28: un park VERO (JUMP-a-se-stessi che il job SPU non ha
+     * ancora patchato) non e' uno stallo: con 8 passate (32 ms) il watchdog
+     * scattava appena un job tardava (es. aspettando il report di un
+     * fotogramma il cui present compilava centinaia di pipeline), saltava a
+     * put e i job che aspettavano i label/report di quel fotogramma
+     * restavano fermi per sempre (livello fermo a 45 s). Un park non conta;
+     * per il resto il tetto e' 250 passate (~1 s). */
     { static u32 last = 0xFFFFFFFFu; static int stuck = 0;
-      if (s_fifo_getoff == last && s_fifo_getoff != put) {
-          if (++stuck >= 8) { gcm_fifo_dump_around(s_fifo_getoff);
-                              gcm_fifo_resync_why("stuck-get", &s_fifo_getoff, put); stuck = 0; }
+      if (!s_parked && s_fifo_getoff == last && s_fifo_getoff != put) {
+          if (++stuck >= 250) { gcm_fifo_dump_around(s_fifo_getoff);
+                                gcm_fifo_resync_why("stuck-get", &s_fifo_getoff, put); stuck = 0; }
       } else { stuck = 0; last = s_fifo_getoff; } }
 
     /* Publish progress: get chases put; ref advances at most ONE queued fence

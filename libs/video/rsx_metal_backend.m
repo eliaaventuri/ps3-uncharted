@@ -166,8 +166,28 @@ static dispatch_semaphore_t s_inflight;
 /* PSO cache. Keyed on the blend state, which is all the built-in shader path
  * varies; a guest-shader key (vp/fp ucode hash) joins it when that lands. */
 typedef struct { u32 key; int vp; id<MTLRenderPipelineState> pso; } MtlPsoEntry;
-static MtlPsoEntry s_pso_cache[512];
+/* 512 voci erano poche per il livello (sessione 28): con la cache dei
+ * programmi piena ogni draw cadeva sulla coppia incorporata e la scena era
+ * un colore piatto. 8192 voci e un indice hash (sonda lineare). */
+#define MTL_PSO_CACHE 8192
+#define MTL_PSO_HASH  (MTL_PSO_CACHE * 4)
+static MtlPsoEntry s_pso_cache[MTL_PSO_CACHE];
+static u32         s_pso_hash[MTL_PSO_HASH];   /* indice+1, 0 = vuoto */
 static u32         s_pso_count;
+static u32 pso_slot(u32 key, int vp) { u32 h = key * 2654435761u ^ ((u32)vp * 40503u); h ^= h >> 15; return h & (MTL_PSO_HASH - 1); }
+static id<MTLRenderPipelineState> pso_find(u32 key, int vp)
+{
+    for (u32 hs = pso_slot(key, vp), n = 0; n < MTL_PSO_HASH; n++, hs = (hs + 1) & (MTL_PSO_HASH - 1)) {
+        u32 ix = s_pso_hash[hs]; if (!ix) return nil;
+        if (s_pso_cache[ix - 1].key == key && s_pso_cache[ix - 1].vp == vp) return s_pso_cache[ix - 1].pso; }
+    return nil;
+}
+static void pso_index_add(u32 ix)
+{
+    u32 hs = pso_slot(s_pso_cache[ix].key, s_pso_cache[ix].vp);
+    while (s_pso_hash[hs]) hs = (hs + 1) & (MTL_PSO_HASH - 1);
+    s_pso_hash[hs] = ix + 1;
+}
 
 /* RSX clear colour, ARGB8888, as written by NV4097_SET_COLOR_CLEAR_VALUE. */
 static u32 s_clear_argb = 0xFF000000u;
@@ -470,7 +490,11 @@ static int vp_lookup(const rsx_state* st)
      * uno slot diverso da 0). Hash e decompilazione dal punto di partenza,
      * fino alla fine dei byte scritti (il decompilatore si ferma al bit END). */
     u32 start = st->transform_program_start * 16u;
-    if (start + 16 > st->vp_ucode_bytes) return -1;
+    if (start + 16 > st->vp_ucode_bytes) {
+        static int _n = 0; if (_n++ < 12)
+            fprintf(stderr, "[RSX metal] vp_lookup: slot di partenza %u (byte %u) oltre il microcodice caricato (%u byte): niente VP del guest\n",
+                    st->transform_program_start, start, st->vp_ucode_bytes);
+        return -1; }
     /* Cache (sessione 28): l'hash FNV su tutto il microcodice ad OGNI draw era
      * il 42% del thread del walker con 6.000 draw per fotogramma. Il
      * microcodice cambia solo con SET_TRANSFORM_PROGRAM (vp_ucode_gen) o con
@@ -1373,7 +1397,7 @@ static void mtl_bind_texture(void* ud, u32 unit, const rsx_texture_state* tex)
 /* One compiled library per guest program. A program that fails to decompile or
  * to compile is remembered as a miss (lib == nil) so it is not retried every
  * draw; that draw falls back to the built-in shader rather than dropping. */
-typedef struct { u32 fp_addr; u32 hash; int vp; u32 ctrl; u32 mrt; id<MTLLibrary> lib; } GuestFpEntry;
+typedef struct { u32 fp_addr; u32 hash; int vp; u32 ctrl; u32 mrt; id<MTLLibrary> lib; volatile int done; } GuestFpEntry;
 /* Hash del microcodice (FNV-1a sui primi rsx_fp_program_size byte): Uncharted
  * riusa gli stessi indirizzi in memoria principale (0x0012xxxx) per programmi
  * diversi, e una cache per indirizzo restituiva la traduzione di un programma
@@ -1390,18 +1414,30 @@ static u32 fp_ucode_hash(u32 fp_addr)
     for (u32 i = 0; i < n; i++) { h ^= p[i]; h *= 16777619u; }
     return h ? h : 1u;
 }
-static GuestFpEntry s_fp_cache[512];
+#define MTL_FP_CACHE 8192   /* il livello passa i 512 programmi (sessione 28: cache piena = scena piatta) */
+#define MTL_FP_HASH  (MTL_FP_CACHE * 4)
+static GuestFpEntry s_fp_cache[MTL_FP_CACHE];
+static u32          s_fp_hash[MTL_FP_HASH];   /* indice+1, 0 = vuoto */
 static u32          s_fp_count;
+static u32 fp_slot(u32 hash, int vp, u32 ctrl, u32 mrt) { u32 h = hash * 2654435761u ^ ((u32)vp * 40503u) ^ (ctrl * 2246822519u) ^ (mrt * 3266489917u); h ^= h >> 15; return h & (MTL_FP_HASH - 1); }
 
 static id<MTLLibrary> guest_fp_library(u32 fp_addr, int vp, u32 ctrl, u32 mrt, u32 hash)
 {
     extern void rsx_fp_set_mrt_count(int n);
     if (!hash) hash = fp_ucode_hash(fp_addr);
-    for (u32 i = 0; i < s_fp_count; i++)
-        if (s_fp_cache[i].hash == hash && s_fp_cache[i].vp == vp && s_fp_cache[i].ctrl == ctrl && s_fp_cache[i].mrt == mrt) return s_fp_cache[i].lib;
-    if (s_fp_count >= (u32)(sizeof(s_fp_cache) / sizeof(s_fp_cache[0]))) return nil;
+    for (u32 hs = fp_slot(hash, vp, ctrl, mrt), n = 0; n < MTL_FP_HASH; n++, hs = (hs + 1) & (MTL_FP_HASH - 1)) {
+        u32 ix = s_fp_hash[hs]; if (!ix) break;
+        GuestFpEntry* e = &s_fp_cache[ix - 1];
+        if (e->hash == hash && e->vp == vp && e->ctrl == ctrl && e->mrt == mrt)
+            return __atomic_load_n(&e->done, __ATOMIC_ACQUIRE) ? e->lib : nil; }   /* nil = in compilazione o fallito */
+    /* RSX_FP_CACHE_MAX=<n>: tetto artificiale (A/B: con 512 il livello non
+     * si fermava ma la scena era piatta, sessione 28) */
+    static long s_fpmax = -1; if (s_fpmax < 0) { const char* e = getenv("RSX_FP_CACHE_MAX"); s_fpmax = e ? atol(e) : (long)(sizeof(s_fp_cache) / sizeof(s_fp_cache[0])); }
+    if (s_fp_count >= (u32)s_fpmax) {
+        static int _n = 0; if (_n++ < 4) fprintf(stderr, "[RSX metal] cache dei fragment program PIENA (%u): draw con la coppia incorporata\n", s_fp_count);
+        return nil; }
 
-    id<MTLLibrary> lib = nil;
+    id<MTLLibrary> lib = nil; int s_fp_sync_done = 1;   /* 0 solo quando la compilazione e' stata affidata al blocco */
     const u32 off = cellGcmResolveLocated((fp_addr & 0x3u) == 1, fp_addr & ~0x3u);
     if (vm_base && off) {
         static char msl[32768];
@@ -1435,23 +1471,52 @@ static id<MTLLibrary> guest_fp_library(u32 fp_addr, int vp, u32 ctrl, u32 mrt, u
             MTLCompileOptions* co = [[MTLCompileOptions alloc] init];
             co.fastMathEnabled = NO;
             co.preserveInvariance = YES;
-            lib = [s_dev newLibraryWithSource:src options:co error:&err];
-            if (!lib && vp >= 0) {
-                fprintf(stderr, "[RSX metal] guest vp %08X + fp 0x%08X compile failed: %s\n",
-                        s_vps[vp].hash, fp_addr, [[err localizedDescription] UTF8String]);
-                s_vps[vp].ok = 0;   /* i draw futuri con questo VP: percorso incorporato */
-            } else if (!lib)
-                fprintf(stderr, "[RSX metal] guest fp 0x%08X compile failed: %s\n",
-                        fp_addr, [[err localizedDescription] UTF8String]);
-            else {
-                fprintf(stderr, "[RSX metal] guest fp 0x%08X/%08X: %d instructions\n",
-                        fp_addr, hash, n);
-                /* RSX_FP_DUMP=1: l'MSL tradotto. Quando la geometria rasterizza
-                 * (provato con la tinta) ma resta nera, la risposta e' qui. */
-                { static int fd = -1;
-                  if (fd < 0) fd = getenv("RSX_FP_DUMP") ? 1 : 0;
-                  if (fd) fprintf(stderr, "---- MSL fp 0x%08X/%08X ----\n%s\n----\n",
-                                  fp_addr, hash, msl); }
+            /* RSX_FP_DUMP=1: l'MSL tradotto. Quando la geometria rasterizza
+             * (provato con la tinta) ma resta nera, la risposta e' qui. */
+            { static int fd = -1;
+              if (fd < 0) fd = getenv("RSX_FP_DUMP") ? 1 : 0;
+              if (fd) fprintf(stderr, "---- MSL fp 0x%08X/%08X ----\n%s\n----\n", fp_addr, hash, msl); }
+            /* Compilazione ASINCRONA (sessione 28): il livello ha migliaia di
+             * fragment program e ogni newLibraryWithSource costa 50-100 ms sul
+             * thread del walker (misurato: passate da 5 s, 85% del tempo nel
+             * compilatore). La voce entra in cache subito senza libreria: i
+             * draw intanto usano la coppia incorporata, e appena la
+             * compilazione finisce i draw seguenti trovano il programma.
+             * RSX_FP_SYNC=1 ripristina la compilazione sincrona. */
+            static int s_sync = -1; if (s_sync < 0) s_sync = getenv("RSX_FP_SYNC") ? 1 : 0;
+            if (s_sync) {
+                lib = [s_dev newLibraryWithSource:src options:co error:&err];
+                if (!lib && vp >= 0) {
+                    fprintf(stderr, "[RSX metal] guest vp %08X + fp 0x%08X compile failed: %s\n",
+                            s_vps[vp].hash, fp_addr, [[err localizedDescription] UTF8String]);
+                    s_vps[vp].ok = 0;   /* i draw futuri con questo VP: percorso incorporato */
+                } else if (!lib)
+                    fprintf(stderr, "[RSX metal] guest fp 0x%08X compile failed: %s\n",
+                            fp_addr, [[err localizedDescription] UTF8String]);
+                else
+                    fprintf(stderr, "[RSX metal] guest fp 0x%08X/%08X: %d instructions\n", fp_addr, hash, n);
+            } else {
+                /* coda SERIALE a bassa priorita': non blocca mai il walker
+                 * (un semaforo a 6 lo teneva fermo 40 s all'ingresso nel
+                 * livello, 2.500 programmi nuovi) e non ruba i core alle
+                 * lane SPU; i programmi arrivano uno dopo l'altro. */
+                static dispatch_queue_t s_cq;
+                if (!s_cq) s_cq = dispatch_queue_create("rsx.fp.compile", dispatch_queue_attr_make_with_qos_class(DISPATCH_QUEUE_CONCURRENT, QOS_CLASS_UTILITY, 0));
+                GuestFpEntry* ent = &s_fp_cache[s_fp_count]; ent->done = 0; ent->lib = nil; s_fp_sync_done = 0;
+                const int nins = n; const u32 fpa = fp_addr, fph = hash; const int vpi = vp;
+                dispatch_async(s_cq, ^{
+                    NSError* e2 = nil;
+                    id<MTLLibrary> l2 = [s_dev newLibraryWithSource:src options:co error:&e2];
+                    if (!l2) {
+                        fprintf(stderr, "[RSX metal] guest %sfp 0x%08X compile failed: %s\n", vpi >= 0 ? "vp + " : "", fpa, [[e2 localizedDescription] UTF8String]);
+                        if (vpi >= 0) s_vps[vpi].ok = 0;
+                    } else {
+                        static _Atomic unsigned s_nc = 0; unsigned k = atomic_fetch_add(&s_nc, 1);
+                        if (k < 64 || (k % 500) == 0) fprintf(stderr, "[RSX metal] guest fp 0x%08X/%08X: %d instructions (compilato #%u)\n", fpa, fph, nins, k + 1);
+                    }
+                    ent->lib = l2;
+                    __atomic_store_n(&ent->done, 1, __ATOMIC_RELEASE);
+                });
             }
         } else {
             fprintf(stderr, "[RSX metal] guest fp 0x%08X: decompile failed\n", fp_addr);
@@ -1463,7 +1528,8 @@ static id<MTLLibrary> guest_fp_library(u32 fp_addr, int vp, u32 ctrl, u32 mrt, u
     s_fp_cache[s_fp_count].vp      = vp;
     s_fp_cache[s_fp_count].ctrl    = ctrl;
     s_fp_cache[s_fp_count].mrt     = mrt;
-    s_fp_cache[s_fp_count].lib     = lib;
+    if (lib || s_fp_sync_done) { s_fp_cache[s_fp_count].lib = lib; s_fp_cache[s_fp_count].done = 1; }   /* asincrono: li scrive il blocco */
+    { u32 hs = fp_slot(hash, vp, ctrl, mrt); while (s_fp_hash[hs]) hs = (hs + 1) & (MTL_FP_HASH - 1); s_fp_hash[hs] = s_fp_count + 1; }
     s_fp_count++;
     return lib;
 }
@@ -1488,9 +1554,10 @@ static id<MTLRenderPipelineState> pso_for(MtlDraw* d)
     /* Un VP che non compila (ok=0) manda il draw sul percorso incorporato. */
     int vp = (d->vp >= 0 && s_vps[d->vp].ok) ? d->vp : -1;
     u32 key = pso_key(d);
-    for (u32 i = 0; i < s_pso_count; i++)
-        if (s_pso_cache[i].key == key && s_pso_cache[i].vp == vp) return s_pso_cache[i].pso;
-    if (s_pso_count >= (u32)(sizeof(s_pso_cache) / sizeof(s_pso_cache[0]))) return nil;
+    { id<MTLRenderPipelineState> hit = pso_find(key, vp); if (hit) return hit; }
+    if (s_pso_count >= (u32)(sizeof(s_pso_cache) / sizeof(s_pso_cache[0]))) {
+        static int _n = 0; if (_n++ < 4) fprintf(stderr, "[RSX metal] cache delle pipeline PIENA (%u): draw con la coppia incorporata\n", s_pso_count);
+        return nil; }
 
     MTLVertexDescriptor* vd = [MTLVertexDescriptor vertexDescriptor];
     if (vp >= 0) {
@@ -1525,8 +1592,7 @@ static id<MTLRenderPipelineState> pso_for(MtlDraw* d)
     if (!glib && vp >= 0) {
         /* il VP non compila: si riprova la coppia con il VS incorporato */
         vp = -1; d->vp = -1;
-        for (u32 i = 0; i < s_pso_count; i++)
-            if (s_pso_cache[i].key == key && s_pso_cache[i].vp == vp) return s_pso_cache[i].pso;
+        { id<MTLRenderPipelineState> hit = pso_find(key, vp); if (hit) return hit; }
         vd = [MTLVertexDescriptor vertexDescriptor];
         for (int i = 0; i < 3; i++) {
             vd.attributes[i].format      = MTLVertexFormatFloat4;
@@ -1585,6 +1651,7 @@ static id<MTLRenderPipelineState> pso_for(MtlDraw* d)
     s_pso_cache[s_pso_count].key = key;
     s_pso_cache[s_pso_count].vp  = vp;
     s_pso_cache[s_pso_count].pso = pso;
+    pso_index_add(s_pso_count);
     s_pso_count++;
     return pso;
 }
@@ -2278,7 +2345,7 @@ void rsx_metal_backend_present(void)
             memcpy(reps, s_reports, sizeof(MtlReport) * nrep);
             id<MTLBuffer> visb = vis;
             [cb addCompletedHandler:^(id<MTLCommandBuffer> _u) {
-                (void)_u;
+                if (_u.error) { static int _e = 0; if (_e++ < 8) fprintf(stderr, "[RSX metal] command buffer FALLITO: %s\n", [[_u.error localizedDescription] UTF8String]); }
                 extern void rsx_report_set_value(u32 ea, u32 val);
                 const uint64_t* cnt = (const uint64_t*)[visb contents];
                 static int s_dbg = -1; if (s_dbg < 0) s_dbg = getenv("RSX_OCCLUSION_DBG") ? 1 : 0;

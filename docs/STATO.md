@@ -604,12 +604,35 @@ azzerato a ogni corsa): ora e' su un contatore mai azzerato.
    sblocchi necessari. Il walker riparte da solo anche dopo la parola di
    flip (prima aspettava il prossimo `put`).
 
-**Lo schermo del livello e' un azzurro uniforme** (corsa da 600 s,
+**Lo schermo del livello era un azzurro uniforme** (corsa da 600 s,
 `RSX_DUMP_FRAME=300 RSX_DUMP_SKIP=1200`: fotogramma a 169 s, media RGB
-83/186/225, 100% dei pixel non neri): il fade nero del caricamento se n'e'
-andato, ma con 5.300 draw per fotogramma il display mostra un colore
-piatto. E' il fronte di rendering: `RSX_DRAWLIST` su un fotogramma del
-livello per vedere che cosa arriva sulla superficie del display. Il codice
+83/186/225): il fade nero del caricamento se n'e' andato, ma con 5.300
+draw il display mostrava un colore piatto. `RSX_DRAWLIST_MIN=3000`: tutti i
+6.301 draw avevano `vp=-` (nessun vertex program del guest) -- la **cache
+dei fragment program era piena (512 voci)** e da li' in poi ogni draw
+usava la coppia incorporata: tutte le superfici (007D0000 MSAA, 016D0000
+MRT, 03EE0000/044D0000 ombre 2432x1216, 00050000 display) uscivano dello
+stesso colore piatto. Ora: cache dei FP e delle pipeline a 8.192 voci con
+indice hash (`RSX_FP_CACHE_MAX=<n>` per l'A/B), e **compilazione dei
+fragment program ASINCRONA** (coda GCD a priorita' utility; la voce entra
+in cache subito senza libreria, i draw intanto usano la coppia incorporata;
+`RSX_FP_SYNC=1` per la sincrona): il livello ha 2.500+ programmi e ogni
+`newLibraryWithSource` costa 50-100 ms sul thread del walker (misurato:
+passate da 5 s, 85% nel compilatore). NON ANCORA VISTO il risultato a
+schermo: con i programmi veri il livello si ferma spesso all'ingresso
+(fotogramma ~2100, 45 s): `BATCHJOB: Waiting for batch job list 0 to
+finish` sul thread principale, lane e walker fermi. Correlazioni misurate
+(1 corsa ciascuna, quindi da confermare): con `RSX_FP_CACHE_MAX=512` va;
+con `RSX_OCCLUSION=0` (report a valore fisso) va in 2 corse su 3; con
+`RSX_DUMP_FRAME` impostata si ferma sempre (il percorso del dump nel
+present esce prima del commit/handler dei report). `run.sh` ora ha
+`RSX_OCCLUSION=0`. Il watchdog "stuck-get" del walker (8 passate = 32 ms)
+scattava su park legittimi e saltava a `put` (label e report del
+fotogramma mai scritti): ora ignora i park e vale 250 passate. Trovato e
+risolto anche un `bisl $r0,$r20` del job 216 verso 0x6C80/0xA020 (tabella
+sparsa a LS 0x14060) non liftato: `lift_jobmods.py` ora aggiunge come
+ingressi extra le tabelle di puntatori (corse di >= 6 parole, o >= 2 con
+zeri sparsi); il microstep riconosce `hbra/hbrr` (op7, non op9). Il codice
 SPU liftato si compila ora a -O2 (`SPU_OPT` in `build.sh`; +30-60% di
 blocchi), e `build.sh` ricompila i moduli liftati quando cambia un header
 di `runtime/spu` (prima un campo aggiunto a `spu_context` dava "Illegal
@@ -644,12 +667,12 @@ job manager in `func_0074232C`): resta il fronte.
 
 ### Il prossimo passo (sessione 28)
 
-1. Rendering del livello: lo schermo e' azzurro uniforme con 5.300 draw.
-   `RSX_DRAWLIST=<frame>` + `RSX_DUMP_FRAME` su un fotogramma del livello:
-   quali draw finiscono sul display (superficie 007D0000?), che cosa
-   disegnano i quad del post-processing, se il tonemap legge la superficie
-   giusta. (I job SPU ora scrivono blocchi veri: la scena c'e' nei buffer
-   fuori schermo?)
+1. Lo stallo all'ingresso del livello con i fragment program veri
+   ("Waiting for batch job list 0"): capire quale job list (wid 14/15,
+   aggiunti e rimossi ~9 volte) non finisce e perche' -- lista vuota con
+   tutto occluso? il PM non scrive il "fatto" di una lista senza job?
+   Poi guardare finalmente la scena: `RSX_DUMP_FRAME` va riparato prima
+   (fa fermare il livello), oppure catturare la finestra da fuori.
 2. Velocita': ~8 fps con 5.300 draw; nessun thread saturo (lane ~65%, main
    35%, walker 25%): e' latenza fra PPU, job e walker. Prossima misura:
    la catena critica di UN fotogramma (timestamp di kick job list, fine
