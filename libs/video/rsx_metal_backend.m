@@ -461,6 +461,7 @@ static u32 resolve_indexed(const rsx_state* st, u32 seq, void* ctx)
 
 /* Il programma corrente nella cache (tradotto alla prima vista); -1 se non
  * c'e' un programma, non si traduce, o non legge attributi. */
+static int vp_lookup_slow(const rsx_state* st, u32 start);
 static int vp_lookup(const rsx_state* st)
 {
     if (!use_vp() || !st || st->vp_ucode_bytes < 16) return -1;
@@ -470,6 +471,19 @@ static int vp_lookup(const rsx_state* st)
      * fino alla fine dei byte scritti (il decompilatore si ferma al bit END). */
     u32 start = st->transform_program_start * 16u;
     if (start + 16 > st->vp_ucode_bytes) return -1;
+    /* Cache (sessione 28): l'hash FNV su tutto il microcodice ad OGNI draw era
+     * il 42% del thread del walker con 6.000 draw per fotogramma. Il
+     * microcodice cambia solo con SET_TRANSFORM_PROGRAM (vp_ucode_gen) o con
+     * lo slot di partenza. */
+    static u32 s_vl_gen, s_vl_start, s_vl_bytes; static int s_vl_res = -2;
+    if (s_vl_res != -2 && st->vp_ucode_gen == s_vl_gen && start == s_vl_start && st->vp_ucode_bytes == s_vl_bytes) return s_vl_res;
+    s_vl_gen = st->vp_ucode_gen; s_vl_start = start; s_vl_bytes = st->vp_ucode_bytes;
+    int res = vp_lookup_slow(st, start);
+    s_vl_res = res;
+    return res;
+}
+static int vp_lookup_slow(const rsx_state* st, u32 start)
+{
     const u8* ucode = st->vp_ucode + start;
     u32 bytes = st->vp_ucode_bytes - start; if (bytes > sizeof st->vp_ucode - start) bytes = sizeof st->vp_ucode - start;
     u32 h = 2166136261u;
@@ -1084,33 +1098,63 @@ static NSString* const kGuestVertexMSL = @
  * a ogni cambio di unita' costava una decodifica per draw. Evizione a fine
  * fotogramma delle voci non usate da un po'. */
 typedef struct { u32 offset, format, image_rect; id<MTLTexture> tex; unsigned long last_use; } MtlTexEntry;
-#define MTL_TEXCACHE 2048
+/* 2048 voci erano poche per il livello (sessione 28: cache piena, 5-7.000
+ * ridecodifiche per 100 fotogrammi, 1,3 Gpixel): 8192 voci e un indice hash
+ * al posto della scansione lineare a ogni bind. */
+#define MTL_TEXCACHE 32768   /* il livello dive-boat lega >8.000 texture piccole distinte per fotogramma (RSX_TEXCACHE_DBG) */
+#define MTL_TEXHASH  (MTL_TEXCACHE * 4)
 static MtlTexEntry s_texcache[MTL_TEXCACHE];
+static u32 s_texhash[MTL_TEXHASH];   /* indice+1 nella cache, 0 = vuoto (open addressing, sonda lineare) */
+static unsigned long s_tex_decodes, s_tex_decode_px;   /* per RSX_FRAMESTAT */
 static u32 s_texcache_n;
 
+static u32 texhash_slot(u32 offset, u32 format, u32 image_rect)
+{
+    u32 h = offset * 2654435761u ^ (format * 40503u) ^ (image_rect * 2246822519u);
+    return (h ^ (h >> 16)) & (MTL_TEXHASH - 1);
+}
 static id<MTLTexture> texcache_find(u32 offset, u32 format, u32 image_rect)
 {
-    for (u32 i = 0; i < s_texcache_n; i++) {
-        MtlTexEntry* e = &s_texcache[i];
+    for (u32 hs = texhash_slot(offset, format, image_rect), n = 0; n < MTL_TEXHASH; n++, hs = (hs + 1) & (MTL_TEXHASH - 1)) {
+        u32 ix = s_texhash[hs];
+        if (!ix) return nil;
+        MtlTexEntry* e = &s_texcache[ix - 1];
         if (e->tex && e->offset == offset && e->format == format && e->image_rect == image_rect) {
             e->last_use = s_frame_no; return e->tex; }
     }
     return nil;
 }
+/* Ricostruisce l'indice hash dalle voci vive (dopo un'evizione). */
+static void texhash_rebuild(void)
+{
+    memset(s_texhash, 0, sizeof s_texhash);
+    for (u32 i = 0; i < s_texcache_n; i++) {
+        if (!s_texcache[i].tex) continue;
+        u32 hs = texhash_slot(s_texcache[i].offset, s_texcache[i].format, s_texcache[i].image_rect);
+        while (s_texhash[hs]) hs = (hs + 1) & (MTL_TEXHASH - 1);
+        s_texhash[hs] = i + 1;
+    }
+}
 static void texcache_add(u32 offset, u32 format, u32 image_rect, id<MTLTexture> t)
 {
     MtlTexEntry* e = NULL;
-    for (u32 i = 0; i < s_texcache_n; i++) if (!s_texcache[i].tex) { e = &s_texcache[i]; break; }
-    if (!e && s_texcache_n < MTL_TEXCACHE) e = &s_texcache[s_texcache_n++];
-    if (!e) {
-        /* piena: la voce piu' vecchia NON usata in questo fotogramma (i draw
-         * registrati la puntano senza ritenerla) */
-        unsigned long best = (unsigned long)-1;
-        for (u32 i = 0; i < s_texcache_n; i++)
-            if (s_texcache[i].last_use < s_frame_no && s_texcache[i].last_use < best) { best = s_texcache[i].last_use; e = &s_texcache[i]; }
-        if (!e) return;
+    if (s_texcache_n < MTL_TEXCACHE) e = &s_texcache[s_texcache_n++];
+    else {
+        for (u32 i = 0; i < s_texcache_n; i++) if (!s_texcache[i].tex) { e = &s_texcache[i]; break; }
+        if (!e) {
+            /* piena: la voce piu' vecchia NON usata in questo fotogramma (i draw
+             * registrati la puntano senza ritenerla) */
+            unsigned long best = (unsigned long)-1;
+            for (u32 i = 0; i < s_texcache_n; i++)
+                if (s_texcache[i].last_use < s_frame_no && s_texcache[i].last_use < best) { best = s_texcache[i].last_use; e = &s_texcache[i]; }
+            if (!e) return;
+            e->tex = nil; texhash_rebuild();
+        }
     }
     e->offset = offset; e->format = format; e->image_rect = image_rect; e->tex = t; e->last_use = s_frame_no;
+    { u32 hs = texhash_slot(offset, format, image_rect);
+      while (s_texhash[hs]) hs = (hs + 1) & (MTL_TEXHASH - 1);
+      s_texhash[hs] = (u32)(e - s_texcache) + 1; }
 }
 /* SET_TEXTURE_CONTROL1 (remap): CELL_GCM_REMAP_MODE -- bit [1:0] sorgente di
  * A, [3:2] di R, [5:4] di G, [7:6] di B (0=A 1=R 2=G 3=B), bit [15:8] il tipo
@@ -1149,13 +1193,28 @@ static id<MTLTexture> tex_with_remap(id<MTLTexture> t, u32 remap)
 /* A fine fotogramma (dopo la codifica): via le voci ferme da 600 fotogrammi. */
 static void texcache_sweep(void)
 {
+    int evicted = 0;
     for (u32 i = 0; i < s_texcache_n; i++)
         if (s_texcache[i].tex && s_frame_no > s_texcache[i].last_use + 600) {
             /* anche le viste con remap di questa texture */
             for (u32 k = 0; k < s_remap_n; k++)
                 if (s_remaps[k].base == s_texcache[i].tex) { s_remaps[k] = s_remaps[s_remap_n - 1]; s_remaps[s_remap_n - 1].view = nil; s_remap_n--; k--; }
-            s_texcache[i].tex = nil;
+            s_texcache[i].tex = nil; evicted = 1;
         }
+    if (evicted) texhash_rebuild();
+    /* RSX_TEXCACHE_DBG=1: una volta, a cache piena, quanti offset distinti
+     * e quante varianti (formato/dimensioni) per offset. */
+    { static int s_td = -1; if (s_td < 0) s_td = getenv("RSX_TEXCACHE_DBG") ? 1 : 0;
+      static int done = 0;
+      if (s_td && !done && s_texcache_n >= MTL_TEXCACHE) { done = 1;
+          u32 distinct = 0, multi = 0;
+          for (u32 i = 0; i < s_texcache_n; i++) { int first = 1, variants = 0;
+              for (u32 j = 0; j < s_texcache_n; j++) if (s_texcache[j].offset == s_texcache[i].offset) { if (j < i) { first = 0; break; } variants++; }
+              if (first) { distinct++; if (variants > 1) multi++; } }
+          fprintf(stderr, "[texcache] %u voci: %u offset distinti, %u con piu' varianti (formato/dimensioni)\n", s_texcache_n, distinct, multi);
+          for (u32 i = 0, shown = 0; i < s_texcache_n && shown < 12; i++) { int v = 0;
+              for (u32 j = 0; j < s_texcache_n; j++) if (s_texcache[j].offset == s_texcache[i].offset) v++;
+              if (v > 4) { shown++; fprintf(stderr, "[texcache]   offset 0x%08X: %d varianti, es. fmt=0x%X rect=0x%08X\n", s_texcache[i].offset, v, s_texcache[i].format, s_texcache[i].image_rect); } } } }
 }
 static id<MTLSamplerState> s_sampler;
 /* Il fragment program tradotto del guest dichiara le texture come ARRAY
@@ -1211,7 +1270,9 @@ static void mtl_bind_texture(void* ud, u32 unit, const rsx_texture_state* tex)
                         "fuori schermo 0x%X\n", unit, tex->offset); }
           return;
       } }
-    { id<MTLTexture> ct = texcache_find(tex->offset, tex->format, tex->image_rect);
+    /* la chiave ignora il numero di mipmap (bit 19:16 del formato): la
+     * texture Metal non ha mip e lo stesso offset compariva con 5 varianti */
+    { id<MTLTexture> ct = texcache_find(tex->offset, tex->format & ~0xF0000u, tex->image_rect);
       if (ct) { u->tex = ct; u->offset = tex->offset; u->format = tex->format;
                 u->image_rect = tex->image_rect; return; } }
 
@@ -1245,6 +1306,7 @@ static void mtl_bind_texture(void* ud, u32 unit, const rsx_texture_state* tex)
      * sono (che e' giusto per chi carica BC nativo, come D3D12). Copiandoli in
      * una RGBA8 si otteneva rumore rosso/verde/blu -- misurato: un riquadro di
      * 128x32 pixel di sale e pepe colorato al posto dell'HUD. */
+    s_tex_decodes++; s_tex_decode_px += (unsigned long)width * height;
     if (tl.compressed)
         rsx_texture_decode_bc(staging, pitch, vm_base + ea, width, height, &tl);
     else
@@ -1262,7 +1324,7 @@ static void mtl_bind_texture(void* ud, u32 unit, const rsx_texture_state* tex)
         u->tex = mt;
         u->offset = tex->offset; u->format = tex->format;
         u->image_rect = tex->image_rect;
-        texcache_add(tex->offset, tex->format, tex->image_rect, mt);
+        texcache_add(tex->offset, tex->format & ~0xF0000u, tex->image_rect, mt);
         { static int _tn = 0; if (_tn++ < 64)
           fprintf(stderr, "[RSX metal] texture unit %u: %ux%u fmt=0x%02X\n",
                   unit, width, height, fmt); }
@@ -1722,8 +1784,9 @@ void rsx_metal_backend_present(void)
           s_acc += s_draw_count; if (s_draw_count) s_nz++;
           if (s_fs > 0 && (s_frame_no % (unsigned long)s_fs) == 0) {
               extern unsigned long long ps3_ms_now(void);
-              fprintf(stderr, "[RSX metal] fotogramma #%lu: negli ultimi %d presentati %lu draw in %lu fotogrammi non vuoti, t=%llums\n",
-                      s_frame_no, s_fs, s_acc, s_nz, ps3_ms_now()); s_acc = 0; s_nz = 0; } }
+              fprintf(stderr, "[RSX metal] fotogramma #%lu: negli ultimi %d presentati %lu draw in %lu fotogrammi non vuoti, t=%llums decodifiche=%lu (%lu Mpx) cache=%u\n",
+                      s_frame_no, s_fs, s_acc, s_nz, ps3_ms_now(), s_tex_decodes, s_tex_decode_px >> 20, s_texcache_n);
+              s_tex_decodes = 0; s_tex_decode_px = 0; s_acc = 0; s_nz = 0; } }
         /* RSX_DRAWLIST=<n>: l'elenco dei draw del fotogramma n (o di ogni
          * fotogramma con piu' di 5 draw quando n = 0 e' il primo tale):
          * superficie, programmi, texture, ritaglio, blend. La radiografia di

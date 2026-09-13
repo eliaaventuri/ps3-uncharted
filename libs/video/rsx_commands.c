@@ -670,6 +670,7 @@ int rsx_process_method(rsx_state* state, u32 method, u32 data)
             state->vp_ucode_write = w + 4;
             if (w + 4 > state->vp_ucode_bytes) state->vp_ucode_bytes = w + 4;
             state->vp_dirty = 1;
+            state->vp_ucode_gen++;
         }
         return 0;
     }

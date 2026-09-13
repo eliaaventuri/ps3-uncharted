@@ -556,7 +556,21 @@ piccolo parser Python del XML; `sample` sbaglia l'attribuzione):
    vincolo resta per il flip via import. 150 s di livello senza fermate,
    7-8 fps con 5.300-6.600 draw per fotogramma.
 Il trace `[spurs-pm] poll #N` usciva 8.000 volte al secondo (contatore
-azzerato a ogni corsa): ora e' su un contatore mai azzerato. Il codice
+azzerato a ogni corsa): ora e' su un contatore mai azzerato.
+6. Altri tagli misurati con Instruments: azzeramento parziale del contesto
+   "fresh" del PM (solo LS 0..0x4000 + campi di stato, `SPURS_PM_FRESH_LS`;
+   era bzero di 256 KB ~10.000 volte al secondo, 5,6%), `_setjmp` al posto
+   di `setjmp` in `spu_run_with_halt` (sigprocmask a ogni corsa, 5,6%),
+   percorso veloce in `spu_task_launch_check` (6%), cache di `vp_lookup`
+   per generazione del microcodice (`vp_ucode_gen`: l'hash FNV su 8 KB a
+   ogni draw era il 42% del thread del walker), cache delle texture da
+   2.048 a 32.768 voci con indice hash e chiave senza i bit del numero di
+   mip (il livello lega ~17.000 texture piccole distinte: con 2.048 voci
+   ridecodificava 1,3 Gpixel ogni 100 fotogrammi; `RSX_TEXCACHE_DBG=1`,
+   `decodifiche=` in RSX_FRAMESTAT). Blocchi per lane: ~8.000 al secondo.
+   Livello: 8,5-9,5 fps con 5.500-6.700 draw. Nessun thread e' al 100%
+   (lane ~65%, main 35% -- di cui i due terzi nell'attesa dei job --,
+   walker 25%): il resto e' latenza fra i tre. Il codice
 SPU liftato si compila ora a -O2 (`SPU_OPT` in `build.sh`; +30-60% di
 blocchi), e `build.sh` ricompila i moduli liftati quando cambia un header
 di `runtime/spu` (prima un campo aggiunto a `spu_context` dava "Illegal

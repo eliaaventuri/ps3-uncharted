@@ -108,7 +108,13 @@ void spu_halt(spu_context* ctx)
                 ctx->gpr[80]._u32[0], ctx->gpr[85]._u32[0]);
         fflush(stderr);
       } }
-    if (s_spu_halt_armed) { s_spu_halt_armed = 0; longjmp(s_spu_halt_env, 1); }
+    if (s_spu_halt_armed) { s_spu_halt_armed = 0;
+#ifdef _WIN32
+        longjmp(s_spu_halt_env, 1);
+#else
+        _longjmp(s_spu_halt_env, 1);
+#endif
+    }
 }
 
 /* Diagnostic: dump the taskset-policy scheduler's working tables (LS 0x2700..)
@@ -216,7 +222,13 @@ int spu_run_with_halt(void (*entry)(spu_context*), spu_context* ctx)
      * executes at a time. No-op when unarmed. The thread-local halt env above
      * makes a token pause/resume mid-run safe. */
     yz_lockstep_register(ctx);
+    /* _setjmp: senza salvare la maschera dei segnali (sigprocmask era il
+     * 5,6% del tempo delle lane: una syscall per ogni corsa del PM) */
+#ifdef _WIN32
     if (setjmp(s_spu_halt_env) != 0) {
+#else
+    if (_setjmp(s_spu_halt_env) != 0) {
+#endif
         halted = 1;                                /* came back via longjmp     */
         g_spu_trampoline_fn = 0;                   /* unwound mid-drain: discard */
     } else {

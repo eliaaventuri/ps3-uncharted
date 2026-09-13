@@ -314,6 +314,7 @@ typedef struct rsx_state {
     u32 vp_ucode_write;       /* byte write cursor (from SET_TRANSFORM_PROGRAM_LOAD) */
     u32 vp_ucode_bytes;       /* highest byte written + 1 */
     int vp_dirty;             /* program changed since last translate */
+    u32 vp_ucode_gen;         /* +1 ad ogni parola caricata: chiave della cache di vp_lookup (sessione 28) */
 
     /* Dirty flags for incremental state updates */
     int surface_dirty;

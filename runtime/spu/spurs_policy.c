@@ -27,6 +27,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <stddef.h>
 
 extern int spu_run_with_halt(void (*)(spu_context*), spu_context*);
 
@@ -173,7 +174,21 @@ int spu_run_policy_module(spu_lifted_entry_fn entry, int image_id,
                         (unsigned long long)wkl_data);
         }
         first = 1;
-        memset(ctx, 0, sizeof(*ctx));
+        /* Azzeramento parziale (sessione 28): con SPURS_PM_FRESH ogni corsa
+         * del PM azzerava tutto il contesto (256 KB di LS) -- ~10.000 corse
+         * al secondo, il 5,6% del tempo delle lane in bzero. Basta la parte
+         * bassa della LS (contesto del kernel a 0x100, immagine del PM a
+         * 0xA00 e sua bss fino a ~0x3A00) piu' i campi di stato: la LS alta
+         * sull'hardware e' comunque spazzatura da un giro all'altro.
+         * SPURS_PM_FRESH_LS=<hex> cambia la soglia (0x40000 = tutto). */
+        static long s_fresh_ls = -1;
+        if (s_fresh_ls < 0) { const char* e = getenv("SPURS_PM_FRESH_LS"); s_fresh_ls = e ? strtol(e, 0, 16) : 0x4000; }
+        if (s_fresh_ls >= SPU_LS_SIZE) memset(ctx, 0, sizeof(*ctx));
+        else {
+            memset(ctx, 0, offsetof(spu_context, ls) + (size_t)s_fresh_ls);
+            memset((uint8_t*)ctx + offsetof(spu_context, ls) + SPU_LS_SIZE, 0,
+                   sizeof(*ctx) - offsetof(spu_context, ls) - SPU_LS_SIZE);
+        }
         spu_context_init(ctx, 0);
     }
     s_pm_data[wid][spu_num] = wkl_data;

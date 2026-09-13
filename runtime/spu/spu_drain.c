@@ -38,6 +38,26 @@ extern void spu_halt(spu_context*);
 void spu_task_launch_check(spu_context* ctx, void* fn)
 {
     (void)fn;
+    /* Percorso veloce (sessione 28): questa funzione gira a ogni ingresso di
+     * funzione liftata ed era il 6% del tempo delle lane con otto sonde
+     * statiche in fila. Senza variabili di trace resta solo il controllo
+     * "salto a LS 0 = job finito" e il buffer del flow del PM. */
+    static int s_fast = -1;
+    if (s_fast < 0) s_fast = !(getenv("SPU_EXITTRACE") || getenv("SPU_STEPTRACE") || getenv("SPURS_PM_WATCHDOG") ||
+                               getenv("LBP_JOBDRAIN") || getenv("SPU_NO_LS0_END"));
+    if (s_fast) {
+        ctx->steps++;
+        if (__builtin_expect((ctx->pc & SPU_LS_MASK) == 0 && ctx->steps > 1 && !ctx->policy_mode && ctx->image_id > 0, 0)) {
+            static int _n = 0;
+            if (_n++ < 8)
+                fprintf(stderr, "[spurs-job] img=%d branched to LS 0 -- job complete\n", ctx->image_id);
+            spu_halt(ctx);
+            return;
+        }
+        if (g_pm_flow_ctx == (void*)ctx && g_pm_flow_n < 8192)
+            g_pm_flow_buf[g_pm_flow_n++] = ctx->pc;
+        return;
+    }
     /* A SPURS job returning to LS 0 is finished -- its crt tail-jumps to the
      * resident job manager, and with the job loaded at 0 that lands on its own
      * entry. Planting a return address in r0 catches the jobs that get there
