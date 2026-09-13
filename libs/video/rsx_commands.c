@@ -438,6 +438,15 @@ int rsx_process_method(rsx_state* state, u32 method, u32 data)
         else ea = cellGcmResolveLocated(1, 0x1400000u + off);      /* 0x66626660: area report locale */
         static long s_zp = -1; if (s_zp < 0) { const char* e = getenv("RSX_ZPASS_COUNT"); s_zp = e ? strtol(e, 0, 16) : 0x1000; }
         u32 val = (type == 1) ? (u32)s_zp : 0;
+        /* Occlusion vere (sessione 28): il valore vero arriva a GPU finita,
+         * ma il job 215 legge il report SUBITO (timestamp nuovo = pronto) e
+         * con 0 in attesa il livello si fermava ("Rendering is stuck on
+         * reference value"). Sul ferro la RSX e' un fotogramma indietro e
+         * il job legge il risultato del fotogramma prima: qui si scrive
+         * subito l'ULTIMO valore noto di quello slot (l'ombra), che il
+         * completed handler poi aggiorna. Riuso temporale, come sul ferro. */
+        { static int s_oq2 = -1; if (s_oq2 < 0) { const char* e = getenv("RSX_OCCLUSION"); s_oq2 = (e && *e == '0') ? 0 : 1; }
+          u32 prev; if (s_oq2 && type == 1 && ea && rsx_report_shadow_get(ea, &prev)) val = prev; }
         if (ea) { unsigned long long ts = ps3_ms_now() * 1000ull;
             vm_write32(ea, (u32)(ts >> 32)); vm_write32(ea + 4, (u32)ts); vm_write32(ea + 8, val); vm_write32(ea + 12, 0);
             rsx_report_shadow_set(ea, val);
