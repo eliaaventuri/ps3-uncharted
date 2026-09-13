@@ -683,11 +683,46 @@ livello dive-boat: 376 poi **1094 draw per fotogramma a ~3 fps**, 97
 `RequestLevel` in 120 s. E' la fase lenta gia' misurata (PPU che spinna sul
 job manager in `func_0074232C`): resta il fronte.
 
+**LA SCENA VERA (13 settembre, sera tardi, corse c131..c136): il display
+era piatto perche' NESSUN draw usava il vertex program del guest.** La
+catena "02D50000 costante -> 016D0000 piatto" era un sintomo: nel
+fotogramma con drawlist (c131, #2700) tutti i 6161 draw avevano `vp=-` e
+`0 blocchi di costanti`, cioe' `vp_lookup` tornava -1 per tutti e la
+geometria passava dal VS incorporato (posizione grezza, texcoord e colori
+a caso: silhouette nere, cielo (83,186,225) su OGNI superficie compresa la
+copia del depth). Due cause in fila:
+1. `s_vps[256]` era pieno (dopo ~150 fotogrammi del livello) e il 257-esimo
+   programma tornava -1 senza dirlo. Portato a 4096 con messaggio: pieno lo
+   stesso.
+2. L'hash del VP copriva `vp_ucode_bytes - start`, cioe' TUTTI i byte
+   caricati dopo lo slot di partenza -- anche gli altri programmi residenti
+   (Uncharted ne tiene diversi nei 512 slot, `start` 4256/4528/5072/5136...).
+   Ogni ricarica di uno slot vicino cambiava l'hash di ogni VP: 4096 voci
+   "diverse" per 25 programmi. Ora l'hash si ferma al bit END
+   (`rsx_vp_program_size_instrs`): **25 VP nella corsa c136**, 4072/4072 draw
+   con VP, 365 blocchi di costanti.
+Risultato (dump del fotogramma #2162 di c136): 007D0000 ha 7071 colori
+distinti con la barca, la cabina, il molo e le montagne a fuoco
+(`docs/img_s28_dive_boat_c136.png`, colori FP16 clampati 1:1, non tone-map);
+02D50000 ha 5327 valori (byte del depth, (255,255,0) = lontano, B=0 come
+scrive `depth_to_rgba`) -- il quad di risoluzione funziona.
+Attenzione a `build.sh`: due corse (c133/c134) sono state fatte col binario
+vecchio perche' avevo lanciato solo `cmake --build`; `run.sh` usa il
+binario linkato da `build.sh`, sempre entrambi.
+
+Aperto subito dopo, nella stessa corsa: **cache dei fragment program PIENA
+(8192)** e delle pipeline (8192) a ~frame 2450: il titolo patcha le costanti
+dentro il microcodice FP a ogni draw (job SPU), e la cache e' per contenuto
+-> ogni variante e' un programma nuovo. Va tolto il valore delle costanti
+dall'hash e passato come buffer (il decompilatore le incorpora come
+letterali). Inoltre `MTL_MAX_VERTS` (1M) scarta ~860 draw per fotogramma
+(`dropped ... (cap 32768 draws / 1048576 verts)`). E 016D0000 (luce
+differita) esce nero con i VP giusti: da guardare dopo le costanti.
+
 ### Il prossimo passo (sessione 28)
 
-0. Il display: perche' 016D0000 (illuminazione differita, 884 draw MRT
-   FP16) e 02D50000 (depth risolto) sono piatti mentre 007D0000 ha la
-   scena. Vedi "LA PRIMA SCENA 3D DEL LIVELLO". Poi i materiali neri.
+0. (risolto: era l'hash del VP, vedi "LA SCENA VERA") Ora: costanti FP
+   fuori dall'hash (cache piena a 8192), `MTL_MAX_VERTS`, poi 016D0000 nero.
 1. (risolto, vedi sopra: era il watchdog) Lo stallo all'ingresso del
    livello con i fragment program veri: il PPU spinnava su `0x202FFED8`
    (`[HOTREAD]`, lr=0x005D78C8) aspettando che diventi != 0. Quella parola

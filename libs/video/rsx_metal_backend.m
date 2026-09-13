@@ -127,11 +127,11 @@ static u32        s_dropped_draws;
  * flusso a passo variabile, e le 512 costanti + la trasformazione di
  * viewport vanno in un blocco per draw (deduplicato quando non cambiano).
  * RSX_VP=0 torna al percorso incorporato. */
-#define MTL_VP_FLOATS   (16u * 1024u * 1024u)   /* 64 MB di attributi per fotogramma */
+#define MTL_VP_FLOATS   (48u * 1024u * 1024u)   /* 192 MB di attributi per fotogramma: il livello ne muove 1M x ~4 float4 (66 MB), oltre i 64 di prima */
 #define MTL_CB_BYTES    8448u                    /* 512 float4 + scale/offset, a 256 */
 #define MTL_CB_MAX      4096u                    /* blocchi per fotogramma (34 MB) */
 typedef struct { u32 hash; u32 bytes; u32 mask; char* msl; int ok; } MtlVp;
-static MtlVp   s_vps[256];
+static MtlVp   s_vps[4096];    /* 256 era pieno dopo ~150 fotogrammi del livello: ogni VP nuovo tornava -1 e TUTTI i draw finivano nel percorso incorporato (scena piatta, s.28) */
 static u32     s_vp_count;
 static float*  s_vpd;          /* attributi dei draw con VP, in float */
 static u32     s_vpd_used;
@@ -390,7 +390,9 @@ static void fetch_vp_vertex(const rsx_state* st, u32 vi)
 {
     if (!s_cur_mask) return;
     u32 n = (u32)__builtin_popcount(s_cur_mask);
-    if (s_vpd_used + n * 4 > MTL_VP_FLOATS) { s_vp_full = 1; return; }
+    if (s_vpd_used + n * 4 > MTL_VP_FLOATS) { s_vp_full = 1;
+        { static int _n = 0; if (_n++ < 4) fprintf(stderr, "[RSX metal] flusso degli attributi pieno (%u float) al draw %u: percorso incorporato\n", s_vpd_used, s_draw_count); }
+        return; }
     for (int a = 0; a < 16; a++)
         if (s_cur_mask & (1u << a)) { rsx_fetch_attrib(st, a, vi, &s_vpd[s_vpd_used]); s_vpd_used += 4; }
 }
@@ -484,7 +486,9 @@ static u32 resolve_indexed(const rsx_state* st, u32 seq, void* ctx)
 static int vp_lookup_slow(const rsx_state* st, u32 start);
 static int vp_lookup(const rsx_state* st)
 {
-    if (!use_vp() || !st || st->vp_ucode_bytes < 16) return -1;
+    if (!use_vp() || !st || st->vp_ucode_bytes < 16) {
+        static int _n = 0; if (_n++ < 4) fprintf(stderr, "[RSX metal] vp_lookup: niente microcodice (%u byte) al draw %u\n", st ? st->vp_ucode_bytes : 0, s_draw_count);
+        return -1; }
     /* Il programma parte da SET_TRANSFORM_PROGRAM_START: la RSX ha 512 slot
      * e Uncharted ne tiene caricati diversi insieme (i quad 2D partono da
      * uno slot diverso da 0). Hash e decompilazione dal punto di partenza,
@@ -504,18 +508,26 @@ static int vp_lookup(const rsx_state* st)
     s_vl_gen = st->vp_ucode_gen; s_vl_start = start; s_vl_bytes = st->vp_ucode_bytes;
     int res = vp_lookup_slow(st, start);
     s_vl_res = res;
+    { static int _n = 0; if (res < 0 && _n++ < 4) fprintf(stderr, "[RSX metal] vp_lookup: -1 per start=%u bytes=%u gen=%u al draw %u\n", start, st->vp_ucode_bytes, st->vp_ucode_gen, s_draw_count); }
     return res;
 }
 static int vp_lookup_slow(const rsx_state* st, u32 start)
 {
     const u8* ucode = st->vp_ucode + start;
     u32 bytes = st->vp_ucode_bytes - start; if (bytes > sizeof st->vp_ucode - start) bytes = sizeof st->vp_ucode - start;
+    /* Solo fino al bit END: prima l'hash copriva tutti i byte caricati dopo
+     * lo slot di partenza, cioe' anche gli ALTRI programmi residenti, e ogni
+     * ricarica di uno slot vicino faceva "nuovo" ogni VP (4096 voci piene in
+     * 150 fotogrammi del livello, poi tutto nel percorso incorporato). */
+    { u32 ni = rsx_vp_program_size_instrs(ucode, bytes); if (ni) bytes = ni * 16u; }
     u32 h = 2166136261u;
     for (u32 i = 0; i < bytes; i++) h = (h ^ ucode[i]) * 16777619u;
     h ^= bytes;
     for (u32 i = 0; i < s_vp_count; i++)
         if (s_vps[i].hash == h && s_vps[i].bytes == bytes) return s_vps[i].ok ? (int)i : -1;
-    if (s_vp_count >= (u32)(sizeof s_vps / sizeof s_vps[0])) return -1;
+    if (s_vp_count >= (u32)(sizeof s_vps / sizeof s_vps[0])) {
+        static int _n = 0; if (_n++ < 4) fprintf(stderr, "[RSX metal] cache dei VP piena (%u): il guest VP non viene usato\n", s_vp_count);
+        return -1; }
     MtlVp* v = &s_vps[s_vp_count++];
     v->hash = h; v->bytes = bytes; v->ok = 0; v->msl = NULL; v->mask = 0;
     static char msl[192 * 1024];
@@ -1473,9 +1485,9 @@ static id<MTLLibrary> guest_fp_library(u32 fp_addr, int vp, u32 ctrl, u32 mrt, u
             co.preserveInvariance = YES;
             /* RSX_FP_DUMP=1: l'MSL tradotto. Quando la geometria rasterizza
              * (provato con la tinta) ma resta nera, la risposta e' qui. */
-            { static int fd = -1;
-              if (fd < 0) fd = getenv("RSX_FP_DUMP") ? 1 : 0;
-              if (fd) fprintf(stderr, "---- MSL fp 0x%08X/%08X ----\n%s\n----\n", fp_addr, hash, msl); }
+            { static long fd = -2;   /* RSX_FP_DUMP=1: tutti; =<hex>: solo quel fp_addr */
+              if (fd == -2) { const char* e = getenv("RSX_FP_DUMP"); fd = e ? (strlen(e) > 2 ? (long)strtoul(e, 0, 16) : atol(e)) : 0; }
+              if (fd == 1 || (fd > 1 && (u32)fd == fp_addr)) fprintf(stderr, "---- MSL fp 0x%08X/%08X ----\n%s\n----\n", fp_addr, hash, msl); }
             /* Compilazione ASINCRONA (sessione 28): il livello ha migliaia di
              * fragment program e ogni newLibraryWithSource costa 50-100 ms sul
              * thread del walker (misurato: passate da 5 s, 85% del tempo nel
