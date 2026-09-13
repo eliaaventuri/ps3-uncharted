@@ -356,6 +356,12 @@ typedef struct spu_context {
     uint32_t irq_resume_stack[SPU_IRQ_NEST];
     u128     irq_gpr[SPU_IRQ_NEST][128];
 
+    /* IN CODA: il codice liftato (spu_jobs/, spu_lifted/) e' compilato con
+     * gli offset di questa struct e build.sh non lo ricompila quando cambia
+     * l'header -- un campo aggiunto nel mezzo lo manda in "Illegal
+     * instruction" all'avvio (sessione 28). */
+    uint64_t dec_cache_ns;   /* ultimo clock host letto per SPU_RdDec (rinfrescato ogni 64 letture) */
+    uint32_t dec_cache_n;    /* letture dall'ultimo rinfresco */
 } spu_context;
 
 /* Reserved LS addresses (inside the kernel area, below the 0xA00 policy-module

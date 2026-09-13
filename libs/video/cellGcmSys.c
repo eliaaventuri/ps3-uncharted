@@ -1293,6 +1293,35 @@ static u32 s_last_jump_tgt = 0;
 void cellGcm_fifo_lock(void)   { AcquireSRWLockExclusive(&s_gcm_fifo_lock); }
 void cellGcm_fifo_unlock(void) { ReleaseSRWLockExclusive(&s_gcm_fifo_lock); }
 
+/* GCM_WSTAT=1 (sessione 28): ogni 2 s, quante passate del walker, quanto
+ * tempo ci passano (ms), quante finiscono parcheggiate, e get/put. E' la
+ * misura di "la RSX e' indietro?" senza cui si indovina. */
+static int s_wstat = -1;
+static unsigned long long s_ws_ns, s_ws_n, s_ws_parked, s_ws_t0;
+static u32 s_park_last; static unsigned long long s_park_since; static unsigned s_park_changes;
+static unsigned long long gcm_ns_now(void)
+{
+    struct timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (unsigned long long)ts.tv_sec * 1000000000ull + (unsigned long long)ts.tv_nsec;
+}
+static void gcm_wstat_run(int from_put)
+{
+    unsigned long long t0 = gcm_ns_now();
+    gcm_rsx_process_fifo_unlocked();
+    unsigned long long t1 = gcm_ns_now();
+    s_ws_ns += t1 - t0; s_ws_n++; if (s_parked) s_ws_parked++;
+    if (!s_ws_t0) s_ws_t0 = t1;
+    if (t1 - s_ws_t0 >= 2000000000ull) {
+        fprintf(stderr, "[wstat] %llu passate in %.1f s, %.0f ms nel walker (%.1f%%), %llu parcheggiate (%u blocchi diversi, ultimo %08X da %.0f ms), get=%08X put=%08X%s\n",
+                s_ws_n, (t1 - s_ws_t0) / 1e9, s_ws_ns / 1e6, 100.0 * s_ws_ns / (t1 - s_ws_t0), s_ws_parked,
+                s_park_changes, s_park_last, s_parked ? (t1 - s_park_since) / 1e6 : 0.0,
+                s_fifo_getoff, vm_read32(GCM_CONTROL_GUEST_ADDR + 0), from_put ? " (da put)" : "");
+        s_ws_ns = 0; s_ws_n = 0; s_ws_parked = 0; s_ws_t0 = t1; s_park_changes = 0;
+    }
+}
+
+int cellGcm_fifo_parked(void) { return s_parked; }   /* per il ticker: ripassare subito */
+
 void cellGcm_rsx_process_fifo(void)
 {
     /* GCM_DRAIN_ONLY_PUT=1: nessun drain a timer. La RSX vera avanza solo
@@ -1303,7 +1332,8 @@ void cellGcm_rsx_process_fifo(void)
       if (only < 0) { const char* e = getenv("GCM_DRAIN_ONLY_PUT"); only = (e && *e && *e != '0') ? 1 : 0; }
       if (only && !s_in_put_hook && !s_parked) return; }
     AcquireSRWLockExclusive(&s_gcm_fifo_lock);
-    gcm_rsx_process_fifo_unlocked();
+    if (s_wstat < 0) s_wstat = getenv("GCM_WSTAT") ? 1 : 0;
+    if (s_wstat) gcm_wstat_run(s_in_put_hook); else gcm_rsx_process_fifo_unlocked();
     ReleaseSRWLockExclusive(&s_gcm_fifo_lock);
 }
 
@@ -1820,6 +1850,16 @@ static void gcm_rsx_process_fifo_unlocked(void)
                   { static int pw = -1;
                     if (pw < 0) { const char* e = getenv("GCM_PARK_WAIT"); pw = (e && *e && *e != '0') ? 1 : 0; }
                     if (pw) { s_parked = 1;
+                              /* per [wstat]: da quanto siamo fermi sullo STESSO blocco */
+                              if (tgt != s_park_last) { s_park_last = tgt; s_park_since = gcm_ns_now(); s_park_changes++;
+                                  /* GCM_PARK_DUMP=<n>: i primi n park (dopo l'armo di PS3_TTY_BT o
+                                   * dal fotogramma GCM_PARK_DUMP_FROM) con le 12 parole prima e 4 dopo */
+                                  static int s_pd = -2; static long s_from = 0; extern unsigned rsx_backend_frame_no(void);
+                                  if (s_pd == -2) { const char* e = getenv("GCM_PARK_DUMP"); s_pd = e ? atoi(e) : 0; const char* f = getenv("GCM_PARK_DUMP_FROM"); s_from = f ? atol(f) : 0; }
+                                  if (s_pd > 0 && (long)rsx_backend_frame_no() >= s_from) { s_pd--;
+                                      fprintf(stderr, "[park] #%u io=%08X put=%08X call-da=%08X:", s_park_changes, tgt, put, s_fifo_calloff);
+                                      for (int k = -12; k <= 4; k++) { u32 e2 = gcm_io2ea(tgt + (u32)(k * 4)); fprintf(stderr, "%s%08X", k == 0 ? " |" : " ", e2 ? vm_read32(e2) : 0); }
+                                      fputc('\n', stderr); } }
                               { static int _n = 0; if (_n++ < 8)
                                 fprintf(stderr, "[cellGcmSys] FIFO parcheggiata a 0x%08X (put=0x%08X): aspetto la patch\n", tgt, put); }
                               /* GCM_PARKDUMP=1: i comandi dell'anello DOPO la CALL parcheggiata

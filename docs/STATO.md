@@ -478,6 +478,44 @@ riprova. Ora `cellSpursEventFlagWait`/`TryWait` fanno lo stesso
 thread bloccati, tutte con salvataggio e 106 `RequestLevel`** (prima:
 thread bloccato in 12 su 12, 91-97 RequestLevel).
 
+**Label della RSX scritti con i byte sbagliati (RISOLTO):** il job di
+geometria (ovl 215, `jobmod_008dc900`) chiude ogni blocco di comandi con
+`SET_SEMAPHORE_OFFSET 0x480+16*lane` + `TEXTURE_READ_SEMAPHORE_RELEASE
+(0x1D74) <posizione nel mesh output ring>` e, prima di scrivere un nuovo
+blocco di vertici in `(r12, r5]`, legge il label e aspetta finche' la
+posizione della RSX sta DENTRO quell'intervallo (`func_4B48`, ciclo con 25
+`rdch Dec` di pausa in `func_4BDC`). Il nostro walker applicava a 0x1D74 lo
+scambio di byte 0<->2 del back-end release: il label valeva 0x20000080
+invece di 0x20800000, mai nello spazio confrontato. RPCS3 (`nv4097.cpp`):
+solo `back_end_write_semaphore_release` (0x1D70) scambia, 0x1D74 scrive
+`arg` com'e'. Trovato con `SPU_LABEL_POLL=1` (nuovo). Il watchdog delle
+DMA identiche (`SPU_DMA_REPEAT_LIMIT`, default 256 -> 200000) uccideva il
+job dopo 256 letture (~1 ms) di un'attesa legittima.
+
+**Perche' il livello va a 3-9 fps (misurato, non ancora risolto):**
+`GCM_WSTAT=1` (nuovo): nel livello il walker fa ~500 passate in 2 s, il
+95% finisce PARCHEGGIATO su un blocco diverso ogni volta (`[park]`,
+`GCM_PARK_DUMP=n`: ogni blocco = JUMP-a-se-stessi + `40580100` (257 NOP)
++ ... + `SET_SEMAPHORE_OFFSET/RELEASE` + RET, patchato dal job) e usa il
+5-17% del tempo: la RSX e' PIU' VELOCE dei job, che producono ~600 blocchi
+al secondo per lane (~1.6 ms l'uno; su una SPU vera decine di us). La
+velocita' del codice SPU liftato e' il limite. Instruments (`xcrun xctrace
+record --template 'Time Profiler' --attach`; `sample` sbaglia
+l'attribuzione) sulla lane attiva: 58% in `mach_absolute_time` (isb+mrs)
+chiamata da `SPU_RdDec` (25 letture per blocco) -- ma con il clock in
+cache (`SPU_DEC_CACHE=1`, una lettura ogni 64) i fps non cambiano: da
+capire. Le lane attive sono 1-4 a seconda del momento.
+`GCM_PARK_POLL_US=200` (ripassare il walker ogni 200 us quando
+parcheggiato invece di 4 ms) blocca il livello all'ingresso in 4/4 corse
+(put fermo, job in attesa dei label, main thread in attesa dei job): resta
+spento (default 0). Anche a 4 ms in ~1 corsa su 3 il livello si ferma dopo
+100 fotogrammi: una lane (es. 3) aspetta per sempre che il label esca da
+`(20D31500, 20D35600]` con label=20D35200 = fine del penultimo blocco del
+giro precedente: l'ultimo blocco di quella lane non e' mai stato consumato
+(o il suo label non scritto) prima che il job riavvolgesse il puntatore.
+Da capire chi resetta il puntatore (r12 torna indietro a meta' anello) e
+perche' il walker non arriva a quel blocco.
+
 **Occlusion query vere (lavoro della sessione precedente, non ancora
 raccontato, ora misurato):** `NV4097_GET_REPORT` ZPASS -> visibility buffer
 Metal (`MTLVisibilityResultModeCounting`, uno slot da 8 byte per draw,
@@ -524,6 +562,16 @@ job manager in `func_0074232C`): resta il fronte.
   `arg=` in `[cellSpurs] AddWorkload`.
 - `SPURS_EF_TRACE=<ea>` (`[ef-trace]` + `[GCS:ef-wait/ef-clear]` catena
   guest), `SPURS_EF_MULTIWAIT=1`.
+- `SPU_LABEL_POLL=1` (`[label-wait]`: strisce di letture dei label 0x480..
+  per lane, con blocco e conteggio `rddec`), `SPU_REPORT_POLL=1`
+  (`[report-poll]`: letture dei report 0x21014000..), `SPU_WRING_LIVE=1`
+  (le PUT nella finestra di `SPU_WRING` subito), `SPU_DEC_CACHE=1`,
+  `SPU_DMA_REPEAT_LIMIT` (default 200000).
+- `GCM_WSTAT=1` (`[wstat]` ogni 2 s: passate, ms nel walker, park, get/put),
+  `GCM_PARK_DUMP=<n>` + `GCM_PARK_DUMP_FROM=<frame>` (`[park]`: le parole
+  attorno al blocco parcheggiato), `GCM_PARK_POLL_US=<us>`.
+- I contatori del trace `[spurs-pm] DMA` sono atomici: prima il tetto non
+  arrivava mai e una corsa da 10 minuti ha scritto 30 milioni di righe.
 - `RSX_OCCLUSION=0`, `RSX_OCCLUSION_DBG=1` (`[occlusion] N report, M
   visibili` per fotogramma), `SPURS_KERN_SPIN=0`, `SPURS_KERN_SLEEP_US=<n>`.
 

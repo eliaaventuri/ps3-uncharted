@@ -21,6 +21,7 @@
 #include <dlfcn.h>
 #endif
 #include <stdint.h>
+#include <stdatomic.h>
 #include <string.h>
 #include <stdlib.h>
 #include <stdio.h>
@@ -216,6 +217,12 @@ static inline void spu_wring_note(spu_context* spu, const char* kind, uint32_t e
     memset(w->data, 0, sizeof w->data);
     if (from < size) memcpy(w->data, data + from, (size - from) < SPU_WRING_BYTES ? (size - from) : SPU_WRING_BYTES);
     w->ea = ea + from;
+    /* SPU_WRING_LIVE=1: le scritture (non le letture) si stampano subito */
+    static int s_live = -1; if (s_live < 0) s_live = getenv("SPU_WRING_LIVE") ? 1 : 0;
+    if (s_live && kind[0] == 'P') {
+        fprintf(stderr, "[wring-live] t=%llu %s img=%d ovl=%d pc=0x%05X ea=0x%08X size=%u:", w->t, kind, w->img, w->ovl, w->pc, w->ea, w->size);
+        for (unsigned k = 0; k < SPU_WRING_BYTES && k < size; k++) fprintf(stderr, "%s%02X", (k % 4) ? "" : " ", w->data[k]);
+        fputc('\n', stderr); }
     /* chi ha emesso il comando: le funzioni SPU liftate hanno nomi host
      * (spurs_policy_func_XXXX, jobmod_..._func_XXXX), e il pc del contesto
      * si aggiorna solo ai salti */
@@ -991,8 +998,15 @@ static inline int mfc_submit(mfc_engine* mfc, spu_context* spu, uint32_t cmd)
      * succeeds, and halt at a known pc rather than hanging silently. */
     { static uint32_t s_last_ea, s_last_lsa, s_rep;
       static uint32_t s_limit = 0;
+      /* 256 era troppo poco: il job di geometria di Uncharted (ovl 215)
+       * interroga il label della RSX (0x480+16*lane) ogni ~4 us finche' la
+       * RSX non ha consumato la regione dell'anello che vuole riscrivere --
+       * un'attesa legittima di decine di ms quando il walker e' indietro --
+       * e a 256 letture uguali il watchdog uccideva il job: il suo blocco di
+       * comandi restava con il JUMP-a-se-stessi e il walker parcheggiato li'
+       * per sempre (sessione 28: livello fermo dopo 2-3 halt). */
       if (!s_limit) { const char* e = getenv("SPU_DMA_REPEAT_LIMIT");
-                      s_limit = e ? (uint32_t)strtoul(e, 0, 0) : 256u; }
+                      s_limit = e ? (uint32_t)strtoul(e, 0, 0) : 200000u; }
       if ((uint32_t)ea == s_last_ea && lsa == s_last_lsa) {
           if (++s_rep >= s_limit) {
               s_rep = 0;   /* re-arm: the chain may run this job again */
@@ -1007,6 +1021,46 @@ static inline int mfc_submit(mfc_engine* mfc, spu_context* spu, uint32_t cmd)
               spu_halt(spu);
           }
       } else { s_last_ea = (uint32_t)ea; s_last_lsa = lsa; s_rep = 0; } }
+
+    /* SPU_LABEL_POLL=1 (sessione 28): il job 215 di Uncharted aspetta in
+     * `func_4B48` che la posizione della RSX (label 0x480+16*lane) esca da
+     * un intervallo (r12, r5]: stampa valore e registri di confronto. */
+    { static int s_lp = -1; if (s_lp < 0) s_lp = getenv("SPU_LABEL_POLL") ? 1 : 0;
+      { static int s_rp = -1; if (s_rp < 0) s_rp = getenv("SPU_REPORT_POLL") ? 1 : 0;
+      if (s_rp && size == 16 && (uint32_t)ea >= 0x21014000u && (uint32_t)ea < 0x21016000u && mfc_is_get(cmd)) {
+          /* i report delle occlusion query (IO 0x14000..): il job 215 aspetta
+           * che la RSX li scriva; 16 byte = {ts, ts, valore, 0} */
+          static int _m = 0; static uint32_t _lea; static uint64_t _lv; uint64_t v = 0;
+          if (mfc_ea_range_committed(ea, 16)) memcpy(&v, vm_base + (uint32_t)ea, 8);
+          if ((_lea != (uint32_t)ea || _lv != v) && _m++ < 2000) {
+              extern unsigned long long ps3_ms_now(void);
+              const uint8_t* q = vm_base + (uint32_t)ea;
+              fprintf(stderr, "[report-poll] t=%llu img=%d ovl=%d ea=0x%08X = %02X%02X%02X%02X %02X%02X%02X%02X %02X%02X%02X%02X %02X%02X%02X%02X r3=0x%08X r4=0x%08X r5=0x%08X\n",
+                      ps3_ms_now(), spu->image_id, spu->resident_ovl, (uint32_t)ea, q[0],q[1],q[2],q[3],q[4],q[5],q[6],q[7],q[8],q[9],q[10],q[11],q[12],q[13],q[14],q[15],
+                      spu->gpr[3]._u32[0], spu->gpr[4]._u32[0], spu->gpr[5]._u32[0]);
+              _lea = (uint32_t)ea; _lv = v; } } }
+      if (s_lp && size == 4 && (uint32_t)ea >= 0x50000480u && (uint32_t)ea < 0x50000500u && mfc_is_get(cmd)) {
+          /* Per lane (indice = (ea-0x480)/16): una "striscia" = letture
+           * consecutive dello stesso label con lo stesso r12 (= il job sta
+           * aspettando). Si stampa alla fine della striscia: quante letture,
+           * quanto tempo, label/r12/r5 all'inizio e alla fine. */
+          static int _n = 0; extern unsigned long long ps3_ms_now(void);
+          extern _Atomic unsigned long long g_spu_rddec_count;
+          static struct { uint32_t r12, v0, v1, r5, r12b, r5b, r23, r26; unsigned n, nr12; unsigned long long t0, tlast, dec0; } st[8];
+          unsigned li = (((uint32_t)ea - 0x50000480u) >> 4) & 7; uint32_t v = 0;
+          if (mfc_ea_range_committed(ea, 4)) { memcpy(&v, vm_base + (uint32_t)ea, 4); v = __builtin_bswap32(v); }
+          uint32_t r12 = spu->gpr[12]._u32[0], r5 = spu->gpr[5]._u32[0];
+          unsigned long long now = ps3_ms_now();
+          /* stessa lane, letture a meno di 20 ms di distanza = stesso ciclo di attesa */
+          if (st[li].n && now - st[li].tlast < 20) { st[li].n++; st[li].v1 = v; st[li].tlast = now;
+              if (r12 != st[li].r12 && r12 != st[li].r12b) { st[li].nr12++; st[li].r12b = r12; st[li].r5b = r5; } }
+          else {
+              if (st[li].n > 1 && _n++ < 4000)
+                  fprintf(stderr, "[label-wait] lane %u: %u letture in %llu ms, label %08X -> %08X, blocco (%08X, %08X] poi (%08X, %08X] (+%u altri r12) r23=%08X r26=%08X rddec=%llu\n",
+                          li, st[li].n, st[li].tlast - st[li].t0, st[li].v0, st[li].v1, st[li].r12, st[li].r5, st[li].r12b, st[li].r5b, st[li].nr12,
+                          st[li].r23, st[li].r26, (unsigned long long)atomic_load(&g_spu_rddec_count) - st[li].dec0);
+              st[li].n = 1; st[li].nr12 = 0; st[li].r12 = r12; st[li].r5 = r5; st[li].r12b = 0; st[li].r5b = 0; st[li].v0 = v; st[li].v1 = v; st[li].t0 = now; st[li].tlast = now;
+              st[li].r23 = spu->gpr[23]._u32[0]; st[li].r26 = spu->gpr[26]._u32[0]; st[li].dec0 = atomic_load(&g_spu_rddec_count); } } }
 
     /* Mark tag as in-progress */
     mfc->tag_completed &= ~(1u << tag);
@@ -1168,20 +1222,23 @@ static inline int mfc_submit(mfc_engine* mfc, spu_context* spu, uint32_t cmd)
      * always on (policy runs are rare and their DMA pattern is the primary
      * bring-up signal: joblist fetch, job-module loads, output stores). */
     if (spu->policy_mode) {
-        static int _pn = 0;
+        /* Contatori ATOMICI: con 4-6 lane che passano di qui insieme, gli
+         * `int` condivisi perdevano incrementi e il tetto non arrivava mai
+         * (sessione 28: 30 milioni di righe in una corsa da 10 minuti). */
+        static _Atomic int _pn = 0;
         /* Cap the boot-time flood, but reopen the trace once the PPU is at the
          * job barrier (g_barrier_sync_watch armed): the post-ticket DMA
          * sequence is exactly what the pipeline diagnosis needs. */
         extern uint32_t g_barrier_sync_watch;
-        static int _post = 0;
-        int open = (_pn < 96) || (g_barrier_sync_watch && _post < 256);
+        static _Atomic int _post = 0;
+        int pn = atomic_fetch_add(&_pn, 1);
+        int open = (pn < 96) || (g_barrier_sync_watch && atomic_load(&_post) < 256);
         if (open) {
-            if (_pn >= 96) _post++;
+            if (pn >= 96) atomic_fetch_add(&_post, 1);
             fprintf(stderr, "[spurs-pm] DMA cmd=0x%02X lsa=0x%05X ea=0x%09llX size=0x%X tag=%u\n",
                     cmd, lsa, (unsigned long long)ea, size, tag);
-        } else if (_pn == 96)
+        } else if (pn == 96)
             fprintf(stderr, "[spurs-pm] DMA trace suppressed from here\n");
-        _pn++;
     }
 
     /* Execute the transfer.

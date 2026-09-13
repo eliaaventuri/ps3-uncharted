@@ -22,6 +22,9 @@
 #include <stdlib.h>
 #include <setjmp.h>
 #include <time.h>
+#ifdef __APPLE__
+#include <mach/mach_time.h>
+#endif
 #ifdef _WIN32
 #include <windows.h>
 #endif
@@ -51,6 +54,15 @@ static uint64_t spu_host_ns(void)
     return (uint64_t)(c.QuadPart / s_freq.QuadPart) * 1000000000ull
          + (uint64_t)(c.QuadPart % s_freq.QuadPart) * 1000000000ull
            / (uint64_t)s_freq.QuadPart;
+#elif defined(__APPLE__)
+    /* mach_absolute_time e' il contatore piu' economico (~20 ns): il job di
+     * geometria di Uncharted legge il decrementer 25 volte per blocco di
+     * comandi, e clock_gettime(CLOCK_MONOTONIC) passava da gettimeofday
+     * (sessione 28: `sample` lo dava come prima voce di CPU delle lane). */
+    static mach_timebase_info_data_t tb;
+    if (!tb.denom) mach_timebase_info(&tb);
+    uint64_t t = mach_absolute_time();
+    return (tb.numer == tb.denom) ? t : t * tb.numer / tb.denom;
 #else
     struct timespec ts;
     clock_gettime(CLOCK_MONOTONIC, &ts);
@@ -321,6 +333,7 @@ void spu_atomic_line_unlock(void) { resv_unlock(); }
 /* Total PUTLLC attempts (all SPUs). The PM flow trace (spurs_policy.c) reads
  * the delta across one policy run to find the run that performed a claim. */
 volatile unsigned g_spu_putllc_count = 0;
+_Atomic unsigned long long g_spu_rddec_count = 0;   /* letture di SPU_RdDec (diagnostica, sessione 28) */
 /* PUTLLCs that hit the WATCHED sync line (g_barrier_sync_watch) -- isolates the
  * work-run on the stalled job queue from the dozen idle jobmanager instances. */
 volatile unsigned g_spu_putllc_sync_hit = 0;
@@ -779,12 +792,22 @@ u128 spu_rdch(spu_context* ctx, uint32_t channel)
      * Wraparound on subtract is deliberate -- it is what hardware does, and the
      * `cgti > 0` test above is written to tolerate it. */
     case SPU_RdDec: {
+        atomic_fetch_add(&g_spu_rddec_count, 1);   /* diagnostica: [label-wait] */
         /* Never armed by a WrDec: stamp the base on first read rather than
          * measuring from epoch 0, which would subtract the host's entire
          * uptime and hand back a wild value to code that has every right to
          * read the decrementer before writing it. */
         if (!ctx->dec_base_ns) ctx->dec_base_ns = spu_host_ns();
-        uint64_t elapsed = spu_host_ns() - ctx->dec_base_ns;
+        /* Il clock host si legge una volta ogni 64 letture: fra due letture
+         * consecutive il guest non puo' aver visto passare piu' di qualche
+         * tick (il job 215 di Uncharted fa `rdch Dec` 25 volte di fila per
+         * pausa), e Instruments dava mach_absolute_time (isb + mrs) come il
+         * 58% del tempo della lane (sessione 28). Le letture intermedie
+         * avanzano di 13 ns l'una. */
+        { static int s_dc = -1; if (s_dc < 0) { const char* e = getenv("SPU_DEC_CACHE"); s_dc = (e && *e && *e != '0') ? 1 : 0; }
+          if (s_dc) { if ((ctx->dec_cache_n++ & 63) == 0) ctx->dec_cache_ns = spu_host_ns(); else ctx->dec_cache_ns += 13; }
+          else ctx->dec_cache_ns = spu_host_ns(); }
+        uint64_t elapsed = ctx->dec_cache_ns - ctx->dec_base_ns;
         uint32_t ticks   = (uint32_t)((elapsed * SPU_DECREMENTER_HZ)
                                       / 1000000000ull);
         v = ctx->decrementer - ticks;

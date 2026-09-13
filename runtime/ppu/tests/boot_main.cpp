@@ -37,6 +37,7 @@
 #endif
 #include <stdint.h>
 #include <stdio.h>
+#include <time.h>
 #include <stdlib.h>
 
 extern "C" {
@@ -48,6 +49,7 @@ void     ppu_fs_register(void);
 int      ppu_run(uint32_t entry_opd, uint32_t stack_top);
 extern const char* ppu_vfs_root;   /* host dir that PS3 mount points map into */
 extern "C" void ps3_install_guest_ptr_trap(void);
+extern "C" int  cellGcm_fifo_parked(void);         /* libs/video/cellGcmSys.c */
 extern "C" uint32_t ppu_hle_inject_base;   /* vm.h: the port picks where it lands */
 /* The title's lifted SPU images, if the port built any (tools/
  * build_spu_workloads.py). Weak: a port without them still links, and
@@ -286,8 +288,27 @@ static DWORD WINAPI vblank_ticker(LPVOID)
      * paced the game's main loop to ~0.5fps. Drive the ticks off REAL elapsed time
      * and catch up in a bounded burst so present latency never slows the game. */
     ULONGLONG next_tick = GetTickCount64();
+    /* GCM_PARK_POLL_US=<n> (default 0 = spento): quando il walker e'
+     * parcheggiato su un blocco che un job SPU sta ancora scrivendo, si
+     * ripassa ogni n us invece che ogni 4 ms. Misurato (sessione 28,
+     * [wstat]): nel livello il walker fa UN blocco per passata, ~390 blocchi
+     * in 2 s. Ma con 200 us il livello si blocca all'ingresso in 4 corse su
+     * 4 (nessun fotogramma, put fermo, job in attesa dei label): non e'
+     * ancora capito perche', quindi resta spento. */
+    static long s_park_us = -1;
+    if (s_park_us < 0) { const char* e = getenv("GCM_PARK_POLL_US"); s_park_us = e ? atol(e) : 0; }
     for (;;) {
-        Sleep(4);
+        { if (rsx_ok && s_park_us > 0 && cellGcm_fifo_parked()) {
+              /* niente Sleep(4): ripassa dal walker e basta */
+#ifdef _WIN32
+              Sleep(1);
+#else
+              struct timespec ts = { 0, s_park_us * 1000L }; nanosleep(&ts, NULL);
+#endif
+              cellGcm_rsx_process_fifo();
+              ULONGLONG now2 = GetTickCount64();
+              if ((long long)(now2 - next_tick) < 0) continue;   /* il tick a 60 Hz non e' ancora dovuto */
+          } else Sleep(4); }
         ULONGLONG now = GetTickCount64();
         int fired = 0;
         while ((long long)(now - next_tick) >= 0 && fired < 240) {

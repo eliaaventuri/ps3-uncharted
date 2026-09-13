@@ -113,6 +113,8 @@ static u32        s_vert_count;
 static MtlDraw    s_draws[MTL_MAX_DRAWS];
 static u32        s_draw_count;
 unsigned rsx_backend_draw_count(void) { return s_draw_count; }   /* per RSX_MTRACE (rsx_commands.c) */
+static unsigned long s_frame_no;
+unsigned rsx_backend_frame_no(void) { return (unsigned)s_frame_no; }   /* per GCM_PARK_DUMP_FROM (cellGcmSys.c) */
 static u32 s_draw_count_peek(void) { return s_draw_count; }
 static u32        s_dropped_draws;
 
@@ -809,7 +811,6 @@ static MTLPixelFormat surface_pixel_format(u32 surf_fmt)
 static MtlSurface s_surf[MTL_SURF_MAX];
 static id<MTLTexture> s_surf_dump[MTL_SURF_MAX];
 static u32        s_surf_count;
-static unsigned long s_frame_no;
 static int s_dump_with_drawlist;   /* 1 = il fotogramma della RSX_DRAWLIST va anche salvato (RSX_DUMP_FRAME impostata) */
 
 static id<MTLTexture> surface_texture(u32 offset, u32 w, u32 h, MTLPixelFormat pf, int* first_use)

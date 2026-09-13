@@ -420,10 +420,16 @@ int rsx_process_method(rsx_state* state, u32 method, u32 data)
     { static u32 s_sem_off = 0;
       if (method == 0x1D6C) { s_sem_off = data; return 0; }
       /* 0x1D74 NV4097_TEXTURE_READ_SEMAPHORE_RELEASE: stessa scrittura del
-       * back-end release, con lo stesso scambio di byte (RPCS3 fa lo stesso).
-       * Uncharted usa SOLO questa: i buffer di comandi dei job SPU finiscono
-       * con SET_SEMAPHORE_OFFSET 0x480.. + questa release, e il job di
-       * geometria (ovl 215) aspetta che qualcuno scriva quei label. */
+       * back-end release ma SENZA lo scambio di byte (RPCS3 nv4097.cpp:
+       * texture_read_semaphore_release scrive `arg` com'e', solo
+       * back_end_write_semaphore_release scambia 0<->2). Uncharted usa SOLO
+       * questa: i buffer di comandi dei job SPU finiscono con
+       * SET_SEMAPHORE_OFFSET 0x480+16*lane + questa release con la posizione
+       * raggiunta nell'anello dei comandi (es. 0x20800000), e il job di
+       * geometria (ovl 215, `func_4B48`) aspetta che quella posizione esca
+       * dall'intervallo che vuole riscrivere. Con lo scambio il label valeva
+       * 0x20000080, mai nello spazio confrontato, e le 5 lane restavano a
+       * interrogarlo per sempre (sessione 28, `SPU_LABEL_POLL=1`). */
       if (method == 0x1D70 || method == 0x1D74) {
         extern void vm_write32(uint32_t a, uint32_t v);
         /* The RSX back-end semaphore write swaps bytes 0<->2 of the value (hw
@@ -433,7 +439,7 @@ int rsx_process_method(rsx_state* state, u32 method, u32 data)
          * cellGcmUtilFinish poll (label 255 == sLabelVal, starts at 1) compared
          * 0x00010000 != 1 and spun forever (gcm/cube sample hang after init).
          * Apply the same swap the hardware does so the pre-swap cancels out. */
-        u32 val = (data & 0xff00ff00u) | ((data >> 16) & 0xffu) | ((data & 0xffu) << 16);
+        u32 val = (method == 0x1D70) ? ((data & 0xff00ff00u) | ((data >> 16) & 0xffu) | ((data & 0xffu) << 16)) : data;
         vm_write32(VM_HLE_INJECT_BASE + (s_sem_off & 0x00FFFFFFu), val);
         { static int _l=0; if(_l++<8) fprintf(stderr,"[RSX] label write @0x%08X = 0x%08X (sync fence, raw 0x%08X)\n", VM_HLE_INJECT_BASE+(s_sem_off&0xFFFFFF), val, data); }
         /* RSX_LABEL_DBG=<hex offset>: tutte le scritture di quel label (il job
