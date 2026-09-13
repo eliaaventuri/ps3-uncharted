@@ -15,6 +15,7 @@
 #include "spu_workload.h"   /* SPU image -> lifted-entry dispatch (runtime/spu) */
 #include "spurs_taskset.h"  /* REAL BE CellSpursTaskset layout builders (fork Option-B) */
 #include "../../runtime/ppu/ppu_memory.h"   /* vm_base (guest mem) */
+#include "../../runtime/ppu/ppu_tls.h"      /* PPU_THREAD_LOCAL (pool delle lane) */
 #include <stdio.h>
 #include <stdlib.h>   /* getenv -- an implicit decl returns int, truncating the pointer */
 #include <string.h>
@@ -1437,6 +1438,86 @@ static DWORD WINAPI spurs_pm_worker(LPVOID p)
     a->ns = spurs_ns_now() - t0;
     return 0;
 }
+/* Pool di thread per le lane (sessione 28). Prima ogni corsa del PM con
+ * maxContention > 1 creava e distruggeva maxcont-1 thread (Uncharted: ~1.700
+ * corse al secondo del workload di geometria -> ~7.000 thread al secondo,
+ * il 16% del tempo delle lane in bsdthread_create/vm_deallocate). Ora ogni
+ * thread kernel tiene i propri worker persistenti: consegna il lavoro con
+ * una condition variable e aspetta il "fatto". SPURS_LANE_POOL=0 torna a
+ * CreateThread per confronto. */
+typedef struct LaneWorker {
+#ifdef _WIN32
+    CRITICAL_SECTION cs; CONDITION_VARIABLE cv;
+#else
+    pthread_mutex_t mtx; pthread_cond_t cond;
+#endif
+    int has_work, done, alive;
+    struct spurs_pm_worker_arg arg;
+} LaneWorker;
+static void lw_lock(LaneWorker* w)   {
+#ifdef _WIN32
+    EnterCriticalSection(&w->cs);
+#else
+    pthread_mutex_lock(&w->mtx);
+#endif
+}
+static void lw_unlock(LaneWorker* w) {
+#ifdef _WIN32
+    LeaveCriticalSection(&w->cs);
+#else
+    pthread_mutex_unlock(&w->mtx);
+#endif
+}
+static void lw_wait(LaneWorker* w)   {
+#ifdef _WIN32
+    SleepConditionVariableCS(&w->cv, &w->cs, INFINITE);
+#else
+    pthread_cond_wait(&w->cond, &w->mtx);
+#endif
+}
+static void lw_signal(LaneWorker* w) {
+#ifdef _WIN32
+    WakeAllConditionVariable(&w->cv);
+#else
+    pthread_cond_broadcast(&w->cond);
+#endif
+}
+static DWORD WINAPI spurs_lane_pool_thread(LPVOID p)
+{
+    { ULONG g = 256 * 1024; SetThreadStackGuarantee(&g); }
+    LaneWorker* w = (LaneWorker*)p;
+    for (;;) {
+        lw_lock(w);
+        while (!w->has_work) lw_wait(w);
+        w->has_work = 0;
+        lw_unlock(w);
+        unsigned long long t0 = spurs_ns_now();
+        spu_run_policy_module(w->arg.fn, w->arg.image_id, w->arg.pm, w->arg.pm_size,
+                              w->arg.arg, w->arg.wid, w->arg.ea, w->arg.spu_num);
+        w->arg.ns = spurs_ns_now() - t0;
+        lw_lock(w); w->done = 1; lw_signal(w); lw_unlock(w);
+    }
+    return 0;
+}
+/* i worker di QUESTO thread kernel (uno per lane 1..7) */
+static PPU_THREAD_LOCAL LaneWorker* t_lane_pool;
+static LaneWorker* spurs_lane_pool_get(unsigned k)
+{
+    if (!t_lane_pool) {
+        t_lane_pool = (LaneWorker*)calloc(8, sizeof(LaneWorker));
+        for (int i = 0; i < 8; i++) {
+#ifdef _WIN32
+            InitializeCriticalSection(&t_lane_pool[i].cs); InitializeConditionVariable(&t_lane_pool[i].cv);
+#else
+            pthread_mutex_init(&t_lane_pool[i].mtx, NULL); pthread_cond_init(&t_lane_pool[i].cond, NULL);
+#endif
+        }
+    }
+    LaneWorker* w = &t_lane_pool[k];
+    if (!w->alive) { w->alive = 1; HANDLE h = CreateThread(NULL, 1u << 20, spurs_lane_pool_thread, w, 0, NULL); if (h) CloseHandle(h); }
+    return w;
+}
+
 /* SPURS_LANE_STAT=1 (sessione 28): ogni 2 s, per workload, quante corse del
  * PM, quante lane, tempo di parete totale e tempo somma delle lane: dice
  * se le lane lavorano in parallelo o se una sola fa tutto. */
@@ -1701,20 +1782,27 @@ static DWORD WINAPI spurs_kernel_thread(LPVOID p)
                      * spurs_pm_worker): each lane advances in parallel so the
                      * cross-SPU barrier resolves. Spawn maxcont-1 workers for
                      * lanes 1..N-1 and run lane 0 on this thread, then join. */
-                    HANDLE th[8]; struct spurs_pm_worker_arg wa[8];
+                    HANDLE th[8]; struct spurs_pm_worker_arg wa[8]; LaneWorker* lw[8];
                     unsigned nth = 0;
+                    static int s_pool = -1; if (s_pool < 0) { const char* e = getenv("SPURS_LANE_POOL"); s_pool = (e && *e == '0') ? 0 : 1; }
                     for (u32 sn = 1; sn < maxcont && nth < 7; sn++, nth++) {
                         wa[nth].fn = r->fn; wa[nth].image_id = r->image_id;
                         wa[nth].pm = pm; wa[nth].pm_size = sz;
                         wa[nth].arg = arg; wa[nth].wid = wid; wa[nth].ea = ea;
-                        wa[nth].spu_num = sn;
-                        th[nth] = CreateThread(NULL, 1u << 20, spurs_pm_worker, &wa[nth], 0, NULL);
+                        wa[nth].spu_num = sn; wa[nth].ns = 0;
+                        if (s_pool) { lw[nth] = spurs_lane_pool_get(nth);
+                                      lw_lock(lw[nth]); lw[nth]->arg = wa[nth]; lw[nth]->done = 0; lw[nth]->has_work = 1; lw_signal(lw[nth]); lw_unlock(lw[nth]); }
+                        else th[nth] = CreateThread(NULL, 1u << 20, spurs_pm_worker, &wa[nth], 0, NULL);
                     }
                     spu_run_policy_module(r->fn, r->image_id, pm, sz, arg, wid, ea, 0);
                     if (s_lstat) { lane0_ns = spurs_ns_now() - t_run0; lanes_ns = max_ns = lane0_ns; }
                     if (nth) {
-                        WaitForMultipleObjects(nth, th, TRUE, INFINITE);
-                        for (unsigned k = 0; k < nth; k++) CloseHandle(th[k]);
+                        if (s_pool) {
+                            for (unsigned k = 0; k < nth; k++) { lw_lock(lw[k]); while (!lw[k]->done) lw_wait(lw[k]); lw_unlock(lw[k]); wa[k].ns = lw[k]->arg.ns; }
+                        } else {
+                            WaitForMultipleObjects(nth, th, TRUE, INFINITE);
+                            for (unsigned k = 0; k < nth; k++) CloseHandle(th[k]);
+                        }
                         if (s_lstat) for (unsigned k = 0; k < nth; k++) { lanes_ns += wa[k].ns; if (wa[k].ns > max_ns) max_ns = wa[k].ns; }
                         nlanes += nth;
                     }

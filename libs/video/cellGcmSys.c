@@ -93,6 +93,10 @@ static u32 s_current_display_buffer_id = 0;
  * presenting on a raw flip-count change raced the drain and showed empty or
  * mixed batches (wave: black flashes, layout flicker). */
 static volatile int s_flip_pending = 0;
+/* Il flip viene dalla parola 0xFEAD nella FIFO (il walker ci e' arrivato,
+ * quindi ha gia' consumato tutto il fotogramma) o dall'import
+ * cellGcmSetFlip chiamato dal PPU (la FIFO puo' essere ancora piena). */
+static volatile int s_flip_from_fifo = 0, s_flip_reached = 0;
 
 int cellGcm_take_flip_pending(void)
 {
@@ -663,7 +667,15 @@ void cellGcmTickFlip(void)
     { static int need = -1;
       if (need < 0) { const char* e = getenv("GCM_FLIP_FIFO"); need = (e && *e && *e != '0') ? 1 : 0; }
       if (need) { u32 put = vm_read32(GCM_CONTROL_GUEST_ADDR + 0);
-                  if (s_fifo_getoff != put) return;
+                  /* Sessione 28: "get == put" era troppo forte. Con i job SPU
+                   * veloci il walker, passato il flip di N, entra nel segmento
+                   * di N+1 e parcheggia su un blocco che il PPU kicka solo
+                   * DOPO cellGcmSetWaitFlip: get non raggiunge mai put e il
+                   * titolo aspetta il flip per sempre (livello fermo dopo
+                   * ~100 fotogrammi). Se il flip viene dalla parola nella
+                   * FIFO, il walker ha gia' consumato tutto il fotogramma N:
+                   * basta questo. Il vincolo resta per il flip via import. */
+                  if (!s_flip_reached && s_fifo_getoff != put) return;
 #ifdef __APPLE__
                   /* ...e che la GPU abbia finito il fotogramma presentato: i
                    * report delle occlusion query (GET_REPORT) vengono scritti
@@ -1760,6 +1772,7 @@ static void gcm_rsx_process_fifo_unlocked(void)
              * frame split across 4 presents, layout flashing/zooming). */
             extern s32 cellGcmSetFlipCommand(u32 bufferId);
             s_fifo_getoff += 4;
+            s_flip_from_fifo = 1;   /* il walker E' arrivato al flip: tutto il fotogramma prima e' consumato */
             cellGcmSetFlipCommand(w & 0xFFu);
             break;
         }
@@ -2309,6 +2322,7 @@ s32 cellGcmSetFlipCommand(u32 bufferId)
     s_current_display_buffer_id = bufferId;
     /* Flip requested but not yet shown: a subsequent cellGcmSetWaitFlip blocks
      * until the present thread's cellGcmTickFlip marks it done (vsync). */
+    s_flip_reached = s_flip_from_fifo; s_flip_from_fifo = 0;
     s_flip_status = CELL_GCM_FLIP_STATUS_WAITING;
     s_flip_pending = 1;   /* ticker: present BEFORE the next drain */
     s_flip_request_count++;

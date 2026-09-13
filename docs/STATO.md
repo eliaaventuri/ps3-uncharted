@@ -542,9 +542,21 @@ piccolo parser Python del XML; `sample` sbaglia l'attribuzione):
    quei workload su un secondo thread kernel. Provato prima
    `SPURS_SKIP_WID=80` (non dispatchare l'audio, solo per misurare): 9,5 fps
    contro 4.
-Ancora nel profilo delle lane: ~16% in creazione/distruzione di thread
-(`CreateThread` per le lane 1..4 a OGNI corsa del PM, ~7.000 thread al
-secondo): il prossimo passo e' un pool di thread persistenti. Il codice
+4. ~16% delle lane in creazione/distruzione di thread (`CreateThread` per
+   le lane 1..4 a OGNI corsa del PM, ~7.000 thread al secondo): ora ogni
+   thread kernel tiene un pool di worker persistenti (condition variable
+   per consegnare il lavoro e per il "fatto"; `SPURS_LANE_POOL=0` torna a
+   CreateThread). Blocchi per lane: ~5.000 al secondo.
+5. Con i job veloci il livello si fermava dopo ~100 fotogrammi in
+   `cellGcmSetWaitFlip`: `GCM_FLIP_FIFO` completava il flip solo a
+   get == put, ma il walker, passata la parola di flip di N, entrava nel
+   segmento di N+1 e parcheggiava su un blocco che il PPU kicka solo DOPO
+   la WaitFlip. Ora un flip che viene dalla parola 0xFEAD nella FIFO (il
+   walker ha gia' consumato tutto N) si completa senza aspettare put; il
+   vincolo resta per il flip via import. 150 s di livello senza fermate,
+   7-8 fps con 5.300-6.600 draw per fotogramma.
+Il trace `[spurs-pm] poll #N` usciva 8.000 volte al secondo (contatore
+azzerato a ogni corsa): ora e' su un contatore mai azzerato. Il codice
 SPU liftato si compila ora a -O2 (`SPU_OPT` in `build.sh`; +30-60% di
 blocchi), e `build.sh` ricompila i moduli liftati quando cambia un header
 di `runtime/spu` (prima un campo aggiunto a `spu_context` dava "Illegal

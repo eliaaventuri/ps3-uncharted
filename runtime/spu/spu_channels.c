@@ -1472,7 +1472,12 @@ void spu_indirect_branch(spu_context* ctx)
             /* cellSpursModulePoll: report "no contention — keep running".
              * (One virtual SPU per workload here, so nothing ever preempts.) */
             unsigned n = ++g_spurs_pm_polls;
-            if (n <= 4 || (n % 4096) == 0)
+            /* il tetto della stampa su un contatore MAI azzerato: g_spurs_pm_polls
+             * riparte da 0 a ogni corsa del PM e con 2.000 corse al secondo
+             * uscivano 8.000 righe al secondo (2 milioni in una corsa) */
+            static _Atomic unsigned s_poll_prints = 0;
+            unsigned np = atomic_fetch_add(&s_poll_prints, 1);
+            if (np < 4 || (np % 65536) == 0)
                 fprintf(stderr, "[spurs-pm] poll #%u (r3=0x%08X) -> continue\n",
                         n, ctx->gpr[3]._u32[0]);
             ctx->gpr[3] = spu_make_preferred_u32(0);
