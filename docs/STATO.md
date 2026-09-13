@@ -681,6 +681,12 @@ job manager in `func_0074232C`): resta il fronte.
    per le scritture PPU e `SPU_WRING_LIVE` per quelle SPU.
    Poi guardare finalmente la scena: `RSX_DUMP_FRAME` va riparato prima
    (fa fermare il livello), oppure catturare la finestra da fuori.
+   Ultime misure (22:20): con i programmi veri e `RSX_OCCLUSION=0` il
+   livello si ferma comunque in ~1 corsa su 2 all'ingresso (c117, c123,
+   c124; c113/c114 no); l'ultima volta il sintomo era "Rendering is stuck
+   on reference value 2121" dopo 5 sblocchi di label -- il walker non
+   arriva a un fence. `run.sh` ora ha `RSX_FP_CACHE_MAX=512` (stabile,
+   scena piatta): togliere il tetto quando si lavora su questo.
 2. Velocita': ~8 fps con 5.300 draw; nessun thread saturo (lane ~65%, main
    35%, walker 25%): e' latenza fra PPU, job e walker. Prossima misura:
    la catena critica di UN fotogramma (timestamp di kick job list, fine
