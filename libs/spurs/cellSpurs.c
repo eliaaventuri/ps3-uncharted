@@ -94,6 +94,7 @@ typedef struct {
     pthread_cond_t      cond;
 #endif
     int                 initialized;
+    int                 ppu_waiting; /* un PPU e' dentro cellSpursEventFlagWait (un solo waiter, come sul ferro) */
 } EventFlagSync;
 
 static EventFlagSync s_ef_sync[MAX_EVENT_FLAGS];
@@ -1815,6 +1816,16 @@ s32 cellSpursEventFlagDetachLv2EventQueue(CellSpursEventFlag* eventFlag)
     return CELL_OK;
 }
 
+/* SPURS_EF_TRACE=<hex ea>: ogni Wait/TryWait/Clear/Set del PPU su quel flag,
+ * con tid e valore letto/scritto (senza tetto). */
+static int ef_tr(uint32_t ea)
+{
+    static int s_on = -1; static uint32_t s_ea;
+    if (s_on < 0) { const char* e = getenv("SPURS_EF_TRACE"); s_ea = e ? (uint32_t)strtoul(e, 0, 16) : 0; s_on = s_ea ? 1 : 0; }
+    return s_on && ea == s_ea;
+}
+#define EF_TR(ea, ...) do { if (ef_tr(ea)) { fprintf(stderr, "[ef-trace] tid=%lu ", (unsigned long)GetCurrentThreadId()); fprintf(stderr, __VA_ARGS__); fputc('\n', stderr); } } while (0)
+
 s32 cellSpursEventFlagSet(CellSpursEventFlag* eventFlag, u16 bits)
 {
     uint32_t ea = (uint32_t)(uintptr_t)eventFlag;
@@ -1833,6 +1844,7 @@ s32 cellSpursEventFlagSet(CellSpursEventFlag* eventFlag, u16 bits)
                 vm_read16(ea + EF_SPU_PENDING_RECV), vm_read16(ea + EF_SPU_WAIT_MODE)); }
 
     ef_lock(sync);
+    EF_TR(ea, "Set bits=0x%04X events=0x%04X", bits, vm_read16(ea + EF_EVENTS));
     spurs_ef_set_locked(ea, bits);
     ef_broadcast(sync);
     ef_unlock(sync);
@@ -1861,7 +1873,34 @@ s32 cellSpursEventFlagWait(CellSpursEventFlag* eventFlag, u16* bits,
                 "events=0x%04X\n", _n, ea, (unsigned)pattern,
                 vm_read16(ea + EF_EVENTS)); }
 
+    EF_TR(ea, "Wait pattern=0x%04X mode=%u events=0x%04X", pattern, mode, vm_read16(ea + EF_EVENTS));
+    if (ef_tr(ea)) { extern void ppu_guest_callstack(const char*); ppu_guest_callstack("ef-wait"); }
     ef_lock(sync);
+
+    /* Un solo PPU per volta puo' aspettare su un event flag: il secondo
+     * riceve CELL_SPURS_TASK_ERROR_BUSY subito (RPCS3 cellSpurs.cpp:
+     * `if (ctrl.ppuWaitMask || ctrl.ppuPendingRecv) return BUSY`). Prima
+     * bloccavamo anche il secondo, e i due thread FIOS di Uncharted che
+     * condividono il decompressore edge-zlib (flag 0x2A870C80, ciclo
+     * `while (pending) Wait` in func_0009F238) si rubavano i risvegli: chi
+     * arrivava per primo consumava il bit di ogni chunk, l'altro non vedeva
+     * mai il proprio e restava fermo per sempre (un media thread bloccato
+     * in OGNI corsa, e il salvataggio/menu fermo in 2 corse su 12). Col
+     * BUSY il secondo thread rilegge il proprio contatore e riprova, come
+     * sulla PS3. SPURS_EF_MULTIWAIT=1 ripristina il vecchio comportamento. */
+    { static int s_multi = -1;
+      if (s_multi < 0) { const char* e = getenv("SPURS_EF_MULTIWAIT"); s_multi = (e && *e && *e != '0') ? 1 : 0; }
+      if (!s_multi && sync->ppu_waiting) {
+          ef_unlock(sync);
+          EF_TR(ea, "Wait -> BUSY (un altro PPU sta gia' aspettando)");
+#ifdef _WIN32
+          SwitchToThread();
+#else
+          { struct timespec ts = { 0, 100000L }; nanosleep(&ts, NULL); }   /* il guest riprova subito: non bruciare un core */
+#endif
+          return CELL_SPURS_TASK_ERROR_BUSY;
+      }
+      sync->ppu_waiting = 1; }
 
     /* Block until the requested bit pattern is satisfied in the GUEST struct
      * (BE events word at +0x00) — set by an SPU task (lifted code / taskset
@@ -1930,6 +1969,8 @@ s32 cellSpursEventFlagWait(CellSpursEventFlag* eventFlag, u16* bits,
         vm_write16(ea + EF_EVENTS, (u16)(vm_read16(ea + EF_EVENTS) & ~received));
         spu_atomic_line_unlock();
     }
+    EF_TR(ea, "Wait WAKE got=0x%04X received=0x%04X waits=%u events-dopo=0x%04X", current, received, waits, vm_read16(ea + EF_EVENTS));
+    sync->ppu_waiting = 0;
 
     ef_unlock(sync);
 
@@ -1953,6 +1994,12 @@ s32 cellSpursEventFlagTryWait(CellSpursEventFlag* eventFlag, u16* bits,
     ef_lock(sync);
 
     u16 current = vm_read16(ea + EF_EVENTS);
+    EF_TR(ea, "TryWait pattern=0x%04X mode=%u events=0x%04X", pattern, mode, current);
+    if (sync->ppu_waiting) {   /* stessa regola del Wait: un PPU sta gia' aspettando */
+        static int s_multi = -1;
+        if (s_multi < 0) { const char* e = getenv("SPURS_EF_MULTIWAIT"); s_multi = (e && *e && *e != '0') ? 1 : 0; }
+        if (!s_multi) { ef_unlock(sync); return CELL_SPURS_TASK_ERROR_BUSY; }
+    }
 
     if (mode == CELL_SPURS_EVENT_FLAG_AND) {
         if ((current & pattern) != pattern) {
@@ -1965,6 +2012,7 @@ s32 cellSpursEventFlagTryWait(CellSpursEventFlag* eventFlag, u16* bits,
             return CELL_SPURS_TASK_ERROR_BUSY;
         }
     }
+    EF_TR(ea, "TryWait OK: consumo 0x%04X", (mode == CELL_SPURS_EVENT_FLAG_AND) ? pattern : (u16)(current & pattern));
 
     vm_write16(bits_ea, current);
     u16 received = (mode == CELL_SPURS_EVENT_FLAG_AND) ? pattern
@@ -1991,6 +2039,8 @@ s32 cellSpursEventFlagClear(CellSpursEventFlag* eventFlag, u16 bits)
         return CELL_SPURS_TASK_ERROR_STAT;
 
     ef_lock(sync);
+    EF_TR(ea, "Clear bits=0x%04X events=0x%04X", bits, vm_read16(ea + EF_EVENTS));
+    if (ef_tr(ea)) { extern void ppu_guest_callstack(const char*); ppu_guest_callstack("ef-clear"); }
     { extern void spu_atomic_line_lock(void); extern void spu_atomic_line_unlock(void);
       spu_atomic_line_lock();
       vm_write16(ea + EF_EVENTS, (u16)(vm_read16(ea + EF_EVENTS) & ~bits));

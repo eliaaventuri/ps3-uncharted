@@ -457,6 +457,27 @@ Percorso, in ordine:
    commento che lo giustificava diceva che con {hi,lo} "l'attach usciva
    subito": e' l'audit che DEVE uscire subito quando non c'e').
 
+**Secondo stallo FIOS RISOLTO: un media thread fermo per sempre in
+`cellSpursEventFlagWait` in OGNI corsa (e il salvataggio/menu fermo in 2
+corse su 12).** Trovato con `SPURS_EF_TRACE=2A870C80` (nuovo: ogni
+Wait/TryWait/Clear/Set del PPU sul flag, con la catena guest): DUE media
+thread FIOS (tid 8 e 9, `func_00661438` -> `func_00655300` ->
+`func_0009F238`) usano lo stesso decompressore edge-zlib (coda 0x2A870D00,
+task 0 del taskset 0x2A86F380, flag 0x2A870C80 bit 0) nello stesso momento,
+con il ciclo `while (obj+0x2C00 != 0) cellSpursEventFlagWait(flag, 0x0001,
+AND)`: il flag e' solo una sveglia, la condizione vera e' il contatore. Il
+nostro Wait bloccava ANCHE il secondo thread e i due si rubavano i
+risvegli: chi arrivava per primo consumava il bit di ogni chunk (`waits=0`),
+l'altro non vedeva mai il suo e restava fermo con il contatore gia' a zero.
+Sul ferro (RPCS3 `_cellSpursEventFlagWait`: `if (ppuWaitMask ||
+ppuPendingRecv) return CELL_SPURS_TASK_ERROR_BUSY`) un solo PPU per volta
+puo' aspettare: il secondo riceve BUSY subito, rilegge il contatore e
+riprova. Ora `cellSpursEventFlagWait`/`TryWait` fanno lo stesso
+(`ppu_waiting` in `EventFlagSync`, pausa di 100 us prima del BUSY;
+`SPURS_EF_MULTIWAIT=1` ripristina). Misura: **4 corse su 4 da 120 s senza
+thread bloccati, tutte con salvataggio e 106 `RequestLevel`** (prima:
+thread bloccato in 12 su 12, 91-97 RequestLevel).
+
 **Occlusion query vere (lavoro della sessione precedente, non ancora
 raccontato, ora misurato):** `NV4097_GET_REPORT` ZPASS -> visibility buffer
 Metal (`MTLVisibilityResultModeCounting`, uno slot da 8 byte per draw,
@@ -501,6 +522,8 @@ job manager in `func_0074232C`): resta il fronte.
 - `SPU_WRING=<ea>:<len>` (anello scritture SPU in una finestra, scaricato
   alla trap del titolo; `[wring]`), `SPU_PUTLLC_FULL=1`, `SPURS_PM_R4_LO=1`,
   `arg=` in `[cellSpurs] AddWorkload`.
+- `SPURS_EF_TRACE=<ea>` (`[ef-trace]` + `[GCS:ef-wait/ef-clear]` catena
+  guest), `SPURS_EF_MULTIWAIT=1`.
 - `RSX_OCCLUSION=0`, `RSX_OCCLUSION_DBG=1` (`[occlusion] N report, M
   visibili` per fotogramma), `SPURS_KERN_SPIN=0`, `SPURS_KERN_SLEEP_US=<n>`.
 
