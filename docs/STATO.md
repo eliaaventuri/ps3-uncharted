@@ -668,9 +668,17 @@ job manager in `func_0074232C`): resta il fronte.
 ### Il prossimo passo (sessione 28)
 
 1. Lo stallo all'ingresso del livello con i fragment program veri
-   ("Waiting for batch job list 0"): capire quale job list (wid 14/15,
-   aggiunti e rimossi ~9 volte) non finisce e perche' -- lista vuota con
-   tutto occluso? il PM non scrive il "fatto" di una lista senza job?
+   ("Waiting for batch job list 0"): il PPU spinna su `0x202FFED8`
+   (`[HOTREAD]`, lr=0x005D78C8) aspettando che diventi != 0. Quella parola
+   la scrive il job **ovl 210** (pc 0x6098, `PUT` di 16 byte a 0x202FFED0
+   = {1, 0, 1, 0}; visto con `SPU_WRING=202FFE00:100 SPU_WRING_LIVE=1`,
+   11 scritture nella corsa) -- quindi la scrittura c'e' stata e il PPU
+   l'ha poi azzerata e ha kickato un nuovo batch che il job non ha piu'
+   servito, oppure il job ha scritto prima del reset. Le job list di wid
+   14/15 (`SPURS_DISPATCH_TRACE=1`) risultano consumate (1/1 e 6/6 job
+   presi, lane FFFF). Da fare: tracciare l'ordine PPU (reset di
+   0x202FFED8 + kick) vs job 210 (scrittura), con `YDKJ_WWATCH=0x202FFED0`
+   per le scritture PPU e `SPU_WRING_LIVE` per quelle SPU.
    Poi guardare finalmente la scena: `RSX_DUMP_FRAME` va riparato prima
    (fa fermare il livello), oppure catturare la finestra da fuori.
 2. Velocita': ~8 fps con 5.300 draw; nessun thread saturo (lane ~65%, main
