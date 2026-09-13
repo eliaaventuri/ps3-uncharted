@@ -570,7 +570,20 @@ azzerato a ogni corsa): ora e' su un contatore mai azzerato.
    `decodifiche=` in RSX_FRAMESTAT). Blocchi per lane: ~8.000 al secondo.
    Livello: 8,5-9,5 fps con 5.500-6.700 draw. Nessun thread e' al 100%
    (lane ~65%, main 35% -- di cui i due terzi nell'attesa dei job --,
-   walker 25%): il resto e' latenza fra i tre. Il codice
+   walker 25%): il resto e' latenza fra i tre.
+7. `SPURS_KERN2_WIDS` accetta piu' maschere ("80,1000": audio, geometria e
+   il resto su tre thread kernel): wid 12 passa da 4.400 a 5.400 corse al
+   secondo ma i fps non cambiano -- le lane non sono piu' il collo. Il
+   walker parcheggia ~10 volte per fotogramma e ogni park costa un tick da
+   4 ms (~40 ms dei ~110 ms di fotogramma): ma `GCM_PARK_POLL_US=200`
+   blocca ancora il livello all'ingresso (anche col flip corretto): una
+   lane aspetta per sempre che il label esca da un blocco che contiene la
+   posizione finale del giro precedente (es. lane 2: label 20C5C380 in
+   (20C59A00, 20C5E700]) mentre il walker e' parcheggiato sul PRIMO blocco
+   del fotogramma, che deve scrivere proprio quel job. Con il walker a
+   4 ms la posizione della RSX e' vecchia e il controllo non scatta. Per
+   capirlo servono il ramo di wrap di `func_4B48` (r23/r25/r26) e chi
+   scrive il label = base dell'anello (un reset a fine fotogramma?). Il codice
 SPU liftato si compila ora a -O2 (`SPU_OPT` in `build.sh`; +30-60% di
 blocchi), e `build.sh` ricompila i moduli liftati quando cambia un header
 di `runtime/spu` (prima un campo aggiunto a `spu_context` dava "Illegal

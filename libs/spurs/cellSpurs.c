@@ -437,13 +437,21 @@ static s32 spurs_initialize_common(u32 spurs_ea, u32 nspus, const char* prefix)
          * solo thread li serializzava: in Uncharted il synth audio (wid 7,
          * ~1700 corse al secondo) prendeva il 45% del tempo del kernel e la
          * geometria (wid 12) aspettava (sessione 28, SPURS_LANE_STAT). */
-        static struct SpursKernArg s_ka[MAX_SPURS_INST][2];
+        /* SPURS_KERN2_WIDS=<m1>[,<m2>,...]: una maschera per ogni thread
+         * kernel in piu' (es. "80,1000": l'audio su uno, la geometria wid 12
+         * su un altro, tutto il resto sul primo). Misurato con un solo thread
+         * extra per l'audio: il thread principale restava al 76% nel solo
+         * dispatch (wid 12: 4.400 corse al secondo da 100 us). */
+        static struct SpursKernArg s_ka[MAX_SPURS_INST][6];
         int slot = (int)(si - s_inst); if (slot < 0 || slot >= MAX_SPURS_INST) slot = 0;
-        u32 m2 = 0; { const char* e = getenv("SPURS_KERN2_WIDS"); if (e && *e) m2 = (u32)strtoul(e, 0, 16); }
-        s_ka[slot][0].si = si; s_ka[slot][0].mask = ~m2;
+        u32 all = 0, masks[5]; int nm = 0;
+        { const char* e = getenv("SPURS_KERN2_WIDS");
+          while (e && *e && nm < 5) { char* q = 0; u32 m = (u32)strtoul(e, &q, 16); if (q == e) break;
+              if (m) { masks[nm++] = m; all |= m; } e = (q && *q == ',') ? q + 1 : NULL; } }
+        s_ka[slot][0].si = si; s_ka[slot][0].mask = ~all;
         CreateThread(NULL, 1u << 20, spurs_kernel_thread, &s_ka[slot][0], 0, NULL);
-        if (m2) { s_ka[slot][1].si = si; s_ka[slot][1].mask = m2;
-                  CreateThread(NULL, 1u << 20, spurs_kernel_thread, &s_ka[slot][1], 0, NULL); }
+        for (int k = 0; k < nm; k++) { s_ka[slot][1 + k].si = si; s_ka[slot][1 + k].mask = masks[k];
+                                       CreateThread(NULL, 1u << 20, spurs_kernel_thread, &s_ka[slot][1 + k], 0, NULL); }
     }
 
     printf("[cellSpurs] Initialize \"%s\" ea=0x%08X nSpus=%u (real BE instance + kernel poll)\n",
