@@ -1045,14 +1045,27 @@ static inline int mfc_submit(mfc_engine* mfc, spu_context* spu, uint32_t cmd)
           uint32_t r12 = spu->gpr[12]._u32[0], r5 = spu->gpr[5]._u32[0];
           if (us[li].ea == (uint32_t)ea && us[li].v == v) {
               us[li].n++;
-              if (now - us[li].t0 > (unsigned long long)s_unst && v > r12 && v <= r5) {
+              if (now - us[li].t0 > (unsigned long long)s_unst) {
                   extern void vm_write32(uint32_t a, uint32_t v);
-                  /* = r12: l'inizio del blocco e' ESCLUSO dall'intervallo, e
-                   * dice il vero ("consumato fino all'inizio del tuo blocco") */
-                  vm_write32((uint32_t)ea, r12);
+                  uint32_t r23 = spu->gpr[23]._u32[0], r26 = spu->gpr[26]._u32[0], nv;
+                  const char* why;
+                  if (v > r12 && v <= r5) {
+                      /* = r12: l'inizio del blocco e' ESCLUSO dall'intervallo, e
+                       * dice il vero ("consumato fino all'inizio del tuo blocco") */
+                      nv = r12; why = "dentro";
+                  } else if (r5 > r26 && v <= r23) {
+                      /* ramo di wrap di func_4B48: il blocco supera la fine
+                       * dell'anello e il job aspetta che la RSX abbia passato
+                       * r23 (la fine del blocco riavvolto in testa all'anello):
+                       * il watchdog delle DMA identiche lo uccideva dopo 200.000
+                       * letture e il walker restava parcheggiato per sempre
+                       * ("Rendering is stuck on reference value", sessione 28) */
+                      nv = r23 + 16; why = "wrap";
+                  } else { nv = r12; why = "altro"; }
+                  vm_write32((uint32_t)ea, nv);
                   static int _n = 0; if (_n++ < 8 || (_n % 200) == 0)
-                      fprintf(stderr, "[label-unstick] lane %u: label 0x%08X = %08X dentro (%08X, %08X] da %llu ms (%u letture): portato a %08X\n",
-                              li, (uint32_t)ea, v, r12, r5, now - us[li].t0, us[li].n, r12);
+                      fprintf(stderr, "[label-unstick] lane %u (%s): label 0x%08X = %08X blocco (%08X, %08X] r23=%08X r26=%08X da %llu ms (%u letture): portato a %08X\n",
+                              li, why, (uint32_t)ea, v, r12, r5, r23, r26, now - us[li].t0, us[li].n, nv);
                   us[li].ea = 0; }
           } else { us[li].ea = (uint32_t)ea; us[li].v = v; us[li].t0 = now; us[li].n = 1; } } }
 

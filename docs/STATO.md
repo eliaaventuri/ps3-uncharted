@@ -667,8 +667,8 @@ job manager in `func_0074232C`): resta il fronte.
 
 ### Il prossimo passo (sessione 28)
 
-1. Lo stallo all'ingresso del livello con i fragment program veri
-   ("Waiting for batch job list 0"): il PPU spinna su `0x202FFED8`
+1. (risolto, vedi sopra: era il watchdog) Lo stallo all'ingresso del
+   livello con i fragment program veri: il PPU spinnava su `0x202FFED8`
    (`[HOTREAD]`, lr=0x005D78C8) aspettando che diventi != 0. Quella parola
    la scrive il job **ovl 210** (pc 0x6098, `PUT` di 16 byte a 0x202FFED0
    = {1, 0, 1, 0}; visto con `SPU_WRING=202FFE00:100 SPU_WRING_LIVE=1`,
@@ -680,13 +680,20 @@ job manager in `func_0074232C`): resta il fronte.
    0x202FFED8 + kick) vs job 210 (scrittura), con `YDKJ_WWATCH=0x202FFED0`
    per le scritture PPU e `SPU_WRING_LIVE` per quelle SPU.
    Poi guardare finalmente la scena: `RSX_DUMP_FRAME` va riparato prima
-   (fa fermare il livello), oppure catturare la finestra da fuori.
-   Ultime misure (22:20): con i programmi veri e `RSX_OCCLUSION=0` il
-   livello si ferma comunque in ~1 corsa su 2 all'ingresso (c117, c123,
-   c124; c113/c114 no); l'ultima volta il sintomo era "Rendering is stuck
-   on reference value 2121" dopo 5 sblocchi di label -- il walker non
-   arriva a un fence. `run.sh` ora ha `RSX_FP_CACHE_MAX=512` (stabile,
-   scena piatta): togliere il tetto quando si lavora su questo.
+   (fa fermare il livello: il percorso del dump nel present esce prima del
+   commit e degli handler), oppure catturare la finestra da fuori
+   (`screencapture -l <windowid>`; `screencapture -x` prende lo schermo
+   intero e la finestra del gioco puo' essere su un altro spazio).
+   RISOLTO (22:35): nelle corse ferme c'era sempre un `[spu-dma] ...
+   200000 identical GET ... halting the SPU` sul label di una lane: il job
+   aspettava in una TERZA forma (ne' "dentro (r12, r5]" ne' il ramo di
+   wrap), lo sblocco non scattava e il watchdog uccideva il job -> blocco
+   mai patchato -> walker parcheggiato per sempre -> "Rendering is stuck
+   on reference value". Ora lo sblocco dopo 20 ms vale in ogni caso
+   (dentro: label = r12; wrap `r5 > r26 && label <= r23`: label = r23+16;
+   altro: r12). Con programmi veri + occlusion vere: 3 corse su 3 senza
+   fermate (2.800 fotogrammi in 125 s, 8 fps con 5.000-6.000 draw).
+   `run.sh`: `RSX_OCCLUSION=1`, `RSX_FP_CACHE_MAX=8192`.
 2. Velocita': ~8 fps con 5.300 draw; nessun thread saturo (lane ~65%, main
    35%, walker 25%): e' latenza fra PPU, job e walker. Prossima misura:
    la catena critica di UN fotogramma (timestamp di kick job list, fine
