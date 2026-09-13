@@ -604,6 +604,24 @@ azzerato a ogni corsa): ora e' su un contatore mai azzerato.
    sblocchi necessari. Il walker riparte da solo anche dopo la parola di
    flip (prima aspettava il prossimo `put`).
 
+**LA PRIMA SCENA 3D DEL LIVELLO** (`docs/img_s28_dive_boat_007D0000.png`,
+fotogramma 2700 della corsa c131, `RSX_DRAWLIST_MIN=3000
+RSX_DRAWLIST_AFTER=2700 RSX_DUMP_FRAME=1`): nella superficie principale
+007D0000 (A8R8G8B8 MSAA 2x, 2560x720) c'e' il ponte della dive-boat --
+gru a sinistra, parapetti, cime, la struttura della barca -- in
+silhouette nere su cielo azzurro con triangoli verdi, e un quad verde sul
+ponte. Anche 03EE0000 (ombre 2432x1216), 031E0000 e 034B0000 hanno
+contenuto. Il display resta azzurro uniforme perche' il quad finale
+(#6134, fp 00125402) legge 016D0000 (fmt 0x14B FP16, MRT ct=0x17 con
+01E50000/025D0000: 884 draw, il passaggio di illuminazione differita)
+che e' PIATTO, e piatto e' anche 02D50000 (il depth risolto in ARGB dal
+quad del titolo, letto da quei draw come `tex 3:1280x720@2D50000/fA5`).
+Il sospetto e' la catena depth di 007D0000 (Z=F50000, MSAA 2x) -> quad
+di risoluzione -> 02D50000 -> illuminazione: se il depth risolto e'
+costante, l'illuminazione produce un colore costante. Prima misura da
+fare: `RSX_DEBUG_TINT=3` / dump di 02D50000 e del depth F50000 in un
+fotogramma del livello (`[RSX metal] depth 0x..: z min/max`).
+
 **Lo schermo del livello era un azzurro uniforme** (corsa da 600 s,
 `RSX_DUMP_FRAME=300 RSX_DUMP_SKIP=1200`: fotogramma a 169 s, media RGB
 83/186/225): il fade nero del caricamento se n'e' andato, ma con 5.300
@@ -667,6 +685,9 @@ job manager in `func_0074232C`): resta il fronte.
 
 ### Il prossimo passo (sessione 28)
 
+0. Il display: perche' 016D0000 (illuminazione differita, 884 draw MRT
+   FP16) e 02D50000 (depth risolto) sono piatti mentre 007D0000 ha la
+   scena. Vedi "LA PRIMA SCENA 3D DEL LIVELLO". Poi i materiali neri.
 1. (risolto, vedi sopra: era il watchdog) Lo stallo all'ingresso del
    livello con i fragment program veri: il PPU spinnava su `0x202FFED8`
    (`[HOTREAD]`, lr=0x005D78C8) aspettando che diventi != 0. Quella parola
