@@ -322,6 +322,36 @@ static void rsx_report_shadow_set(u32 ea, u32 val)
     for (u32 i = 0; i < RSX_REPORT_SHADOW_N; i++, h = (h + 1) & (RSX_REPORT_SHADOW_N - 1))
         if (s_rsh_ea[h] == ea || s_rsh_ea[h] == 0) { s_rsh_ea[h] = ea; s_rsh_val[h] = val; return; }
 }
+/* Coda dei label ritardati (GCM_LABEL_DELAY_US): FIFO di (ea, valore, quando),
+ * svuotata da rsx_label_delay_flush() -- chiamata dal ticker e all'inizio
+ * di ogni passata del walker -- per le voci scadute, in ordine. */
+#include <time.h>
+static struct { u32 ea, val; unsigned long long due_ns; } s_ldq[4096];
+static unsigned s_ldq_head, s_ldq_tail;
+static unsigned long long rsx_ns_now(void)
+{
+    struct timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (unsigned long long)ts.tv_sec * 1000000000ull + (unsigned long long)ts.tv_nsec;
+}
+void rsx_label_delay_flush(void)
+{
+    extern void vm_write32(uint32_t a, uint32_t v);
+    unsigned long long now = rsx_ns_now();
+    while (s_ldq_head != s_ldq_tail) {
+        unsigned i = s_ldq_head & 4095;
+        if (s_ldq[i].due_ns > now) break;
+        vm_write32(s_ldq[i].ea, s_ldq[i].val);
+        s_ldq_head++;
+    }
+}
+void rsx_label_delay_push(u32 ea, u32 val, unsigned delay_us)
+{
+    extern void vm_write32(uint32_t a, uint32_t v);
+    if (s_ldq_tail - s_ldq_head >= 4096) { rsx_label_delay_flush(); if (s_ldq_tail - s_ldq_head >= 4096) { vm_write32(ea, val); return; } }
+    unsigned i = s_ldq_tail++ & 4095;
+    s_ldq[i].ea = ea; s_ldq[i].val = val; s_ldq[i].due_ns = rsx_ns_now() + (unsigned long long)delay_us * 1000ull;
+}
+
 /* Per il backend: scrive il valore vero di un report ZPASS (ea+8) e aggiorna
  * l'ombra, quando la GPU ha finito il fotogramma. */
 void rsx_report_set_value(u32 ea, u32 val)
@@ -440,7 +470,18 @@ int rsx_process_method(rsx_state* state, u32 method, u32 data)
          * 0x00010000 != 1 and spun forever (gcm/cube sample hang after init).
          * Apply the same swap the hardware does so the pre-swap cancels out. */
         u32 val = (method == 0x1D70) ? ((data & 0xff00ff00u) | ((data >> 16) & 0xffu) | ((data & 0xffu) << 16)) : data;
-        vm_write32(VM_HLE_INJECT_BASE + (s_sem_off & 0x00FFFFFFu), val);
+        /* GCM_LABEL_DELAY_US=<n> (sessione 28): il label della texture-read
+         * release si scrive n microsecondi DOPO che il walker l'ha
+         * incontrato. Sul ferro la release scatta quando le letture delle
+         * texture dei draw precedenti sono finite, cioe' millisecondi dopo
+         * che il command processor ha letto il comando; scriverlo subito
+         * fa vedere ai job SPU una posizione della RSX "nel futuro": il job
+         * di geometria di Uncharted, che scrive il blocco k+1 sopra la coda
+         * del blocco k, trovava il label dentro la propria regione e
+         * aspettava per sempre (livello fermo con GCM_PARK_POLL_US=200). */
+        { static long s_ld = -1; if (s_ld < 0) { const char* e = getenv("GCM_LABEL_DELAY_US"); s_ld = e ? atol(e) : 0; }
+          if (s_ld > 0 && method == 0x1D74) { rsx_label_delay_push(VM_HLE_INJECT_BASE + (s_sem_off & 0x00FFFFFFu), val, (unsigned)s_ld); }
+          else vm_write32(VM_HLE_INJECT_BASE + (s_sem_off & 0x00FFFFFFu), val); }
         { static int _l=0; if(_l++<8) fprintf(stderr,"[RSX] label write @0x%08X = 0x%08X (sync fence, raw 0x%08X)\n", VM_HLE_INJECT_BASE+(s_sem_off&0xFFFFFF), val, data); }
         /* RSX_LABEL_DBG=<hex offset>: tutte le scritture di quel label (il job
          * 215 aspetta il 0x480 = "fin dove la RSX ha consumato l'anello SPU") */

@@ -1022,6 +1022,40 @@ static inline int mfc_submit(mfc_engine* mfc, spu_context* spu, uint32_t cmd)
           }
       } else { s_last_ea = (uint32_t)ea; s_last_lsa = lsa; s_rep = 0; } }
 
+    /* Sblocco dei label (sessione 28). Il job di geometria di Uncharted
+     * aspetta finche' la posizione della RSX (label 0x480+16*lane) esce dal
+     * blocco di mesh output che sta per scrivere. Sul ferro la RSX consuma
+     * il fotogramma PRIMA mentre i job scrivono quello dopo, quindi non e'
+     * mai "dentro" al blocco in scrittura; il nostro walker invece consuma i
+     * blocchi appena patchati e la posizione raggiunge il job: il job
+     * aspetta che la RSX consumi un blocco che deve scrivere lui stesso
+     * (livello fermo dopo ~170 s a 4 ms di tick, subito con
+     * GCM_PARK_POLL_US=200). Se una lane legge lo stesso label con lo stesso
+     * valore per piu' di GCM_LABEL_UNSTICK_MS (default 20), il label viene
+     * portato all'inizio del blocco (r12, escluso dall'intervallo): nel
+     * port e' innocuo, perche' il walker ha gia' copiato i vertici dei
+     * blocchi consumati. */
+    { static long s_unst = -1; if (s_unst < 0) { const char* e = getenv("GCM_LABEL_UNSTICK_MS"); s_unst = e ? atol(e) : 20; }
+      if (s_unst > 0 && size == 4 && (uint32_t)ea >= 0x50000480u && (uint32_t)ea < 0x50000500u && mfc_is_get(cmd)) {
+          extern unsigned long long ps3_ms_now(void);
+          static struct { uint32_t ea, v; unsigned long long t0; unsigned n; } us[8];
+          unsigned li = (((uint32_t)ea - 0x50000480u) >> 4) & 7; uint32_t v = 0;
+          if (mfc_ea_range_committed(ea, 4)) { memcpy(&v, vm_base + (uint32_t)ea, 4); v = __builtin_bswap32(v); }
+          unsigned long long now = ps3_ms_now();
+          uint32_t r12 = spu->gpr[12]._u32[0], r5 = spu->gpr[5]._u32[0];
+          if (us[li].ea == (uint32_t)ea && us[li].v == v) {
+              us[li].n++;
+              if (now - us[li].t0 > (unsigned long long)s_unst && v > r12 && v <= r5) {
+                  extern void vm_write32(uint32_t a, uint32_t v);
+                  /* = r12: l'inizio del blocco e' ESCLUSO dall'intervallo, e
+                   * dice il vero ("consumato fino all'inizio del tuo blocco") */
+                  vm_write32((uint32_t)ea, r12);
+                  static int _n = 0; if (_n++ < 8 || (_n % 200) == 0)
+                      fprintf(stderr, "[label-unstick] lane %u: label 0x%08X = %08X dentro (%08X, %08X] da %llu ms (%u letture): portato a %08X\n",
+                              li, (uint32_t)ea, v, r12, r5, now - us[li].t0, us[li].n, r12);
+                  us[li].ea = 0; }
+          } else { us[li].ea = (uint32_t)ea; us[li].v = v; us[li].t0 = now; us[li].n = 1; } } }
+
     /* SPU_LABEL_POLL=1 (sessione 28): il job 215 di Uncharted aspetta in
      * `func_4B48` che la posizione della RSX (label 0x480+16*lane) esca da
      * un intervallo (r12, r5]: stampa valore e registri di confronto. */

@@ -1336,6 +1336,7 @@ int cellGcm_fifo_parked(void) { return s_parked; }   /* per il ticker: ripassare
 
 void cellGcm_rsx_process_fifo(void)
 {
+    { extern void rsx_label_delay_flush(void); rsx_label_delay_flush(); }   /* label ritardati scaduti (GCM_LABEL_DELAY_US) */
     /* GCM_DRAIN_ONLY_PUT=1: nessun drain a timer. La RSX vera avanza solo
      * quando `put` si muove; un drain a orologio puo' entrare in un segmento
      * che il titolo sta ancora riempiendo, camminare oltre il JUMP di coda del
@@ -1774,6 +1775,14 @@ static void gcm_rsx_process_fifo_unlocked(void)
             s_fifo_getoff += 4;
             s_flip_from_fifo = 1;   /* il walker E' arrivato al flip: tutto il fotogramma prima e' consumato */
             cellGcmSetFlipCommand(w & 0xFFu);
+            /* La RSX vera prosegue subito dopo il flip. Qui la passata si
+             * ferma per il present, e con GCM_DRAIN_ONLY_PUT nessuno la
+             * riprendeva finche' il PPU non muoveva di nuovo `put` -- se
+             * l'aveva gia' mosso (segmento di N+1 scritto prima del flip di
+             * N) il reset dei label e i CALL restavano li' e i job del
+             * fotogramma dopo aspettavano per sempre (sessione 28). Segnare
+             * "c'e' ancora da consumare" fa ripassare il ticker. */
+            s_parked = 1;
             break;
         }
 

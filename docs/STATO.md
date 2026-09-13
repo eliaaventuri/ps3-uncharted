@@ -581,9 +581,35 @@ azzerato a ogni corsa): ora e' su un contatore mai azzerato.
    posizione finale del giro precedente (es. lane 2: label 20C5C380 in
    (20C59A00, 20C5E700]) mentre il walker e' parcheggiato sul PRIMO blocco
    del fotogramma, che deve scrivere proprio quel job. Con il walker a
-   4 ms la posizione della RSX e' vecchia e il controllo non scatta. Per
-   capirlo servono il ramo di wrap di `func_4B48` (r23/r25/r26) e chi
-   scrive il label = base dell'anello (un reset a fine fotogramma?). Il codice
+   4 ms la posizione della RSX e' vecchia e il controllo non scatta.
+   CAPITO E AGGIRATO: ogni fotogramma il mesh output ring riparte dalla
+   base (un comando scrive label = base, poi i blocchi salgono); i blocchi
+   consecutivi dello stesso job si SOVRAPPONGONO (il label del blocco k e'
+   la fine RISERVATA, il blocco k+1 parte dalla fine usata, piu' bassa).
+   Sul ferro non e' mai un problema perche' la RSX consuma il fotogramma
+   PRIMA mentre i job scrivono quello dopo: la sua posizione non e' mai
+   dentro un blocco in scrittura. Il nostro walker consuma i blocchi
+   appena patchati e "raggiunge" il job: il job aspetta che la RSX consumi
+   un blocco che deve scrivere lui stesso. Ritardare i label
+   (`GCM_LABEL_DELAY_US`, 2 e 6 ms) non basta (il label vecchio di un
+   blocco precedente sta comunque dentro la riserva). Rimedio nel runtime
+   SPU (`spu_dma.h`, `GCM_LABEL_UNSTICK_MS`, default 20): se una lane
+   legge lo stesso label con lo stesso valore, dentro il proprio blocco,
+   per piu' di 20 ms, il label viene portato a r12 (inizio del blocco,
+   escluso dall'intervallo): nel port e' vero e innocuo, il walker ha gia'
+   copiato i vertici dei blocchi consumati. Con `GCM_PARK_POLL_US=200`
+   ora il livello parte e va (8 sblocchi in 150 s), ma i fps sono gli
+   stessi del tick a 4 ms: il park non era il collo. Con i default:
+   **420 s di livello senza fermate, 8 fps costanti con 5.300 draw**, 0
+   sblocchi necessari. Il walker riparte da solo anche dopo la parola di
+   flip (prima aspettava il prossimo `put`).
+
+**Lo schermo del livello e' un azzurro uniforme** (corsa da 600 s,
+`RSX_DUMP_FRAME=300 RSX_DUMP_SKIP=1200`: fotogramma a 169 s, media RGB
+83/186/225, 100% dei pixel non neri): il fade nero del caricamento se n'e'
+andato, ma con 5.300 draw per fotogramma il display mostra un colore
+piatto. E' il fronte di rendering: `RSX_DRAWLIST` su un fotogramma del
+livello per vedere che cosa arriva sulla superficie del display. Il codice
 SPU liftato si compila ora a -O2 (`SPU_OPT` in `build.sh`; +30-60% di
 blocchi), e `build.sh` ricompila i moduli liftati quando cambia un header
 di `runtime/spu` (prima un campo aggiunto a `spu_context` dava "Illegal
@@ -618,8 +644,16 @@ job manager in `func_0074232C`): resta il fronte.
 
 ### Il prossimo passo (sessione 28)
 
-1. Velocita' del livello (fatto in parte: vedi "Velocita' delle lane SPU").
-   Prossimo: pool di thread per le lane; poi riprofilare con Instruments.
+1. Rendering del livello: lo schermo e' azzurro uniforme con 5.300 draw.
+   `RSX_DRAWLIST=<frame>` + `RSX_DUMP_FRAME` su un fotogramma del livello:
+   quali draw finiscono sul display (superficie 007D0000?), che cosa
+   disegnano i quad del post-processing, se il tonemap legge la superficie
+   giusta. (I job SPU ora scrivono blocchi veri: la scena c'e' nei buffer
+   fuori schermo?)
+2. Velocita': ~8 fps con 5.300 draw; nessun thread saturo (lane ~65%, main
+   35%, walker 25%): e' latenza fra PPU, job e walker. Prossima misura:
+   la catena critica di UN fotogramma (timestamp di kick job list, fine
+   job list, put, flip).
 2. Corsa lunga (600 s) con `SPURS_IDLE_MAX=0`: il caricamento finisce
    (regioni in stato 5, fade via)? Screenshot con `RSX_DUMP_FRAME` a 300+ s.
 3. Con `SPURS_PM_R4_LO` spento, riprovare LBP (lbp/) prima di
