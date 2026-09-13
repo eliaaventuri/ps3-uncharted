@@ -402,6 +402,7 @@ static struct SpursInst* spurs_inst_find(u32 ea)
 }
 
 
+struct SpursKernArg { struct SpursInst* si; u32 mask; };   /* istanza + workload serviti da questo thread */
 static DWORD WINAPI spurs_kernel_thread(LPVOID p);
 
 
@@ -429,7 +430,19 @@ static s32 spurs_initialize_common(u32 spurs_ea, u32 nspus, const char* prefix)
 
     if (!si->kernel_live) {
         si->kernel_live = 1;
-        CreateThread(NULL, 1u << 20, spurs_kernel_thread, si, 0, NULL);
+        /* SPURS_KERN2_WIDS=<maschera hex>: quei workload girano su un SECONDO
+         * thread kernel, in parallelo agli altri. Sul ferro ogni SPU esegue il
+         * proprio ciclo del kernel e piu' workload avanzano insieme; qui un
+         * solo thread li serializzava: in Uncharted il synth audio (wid 7,
+         * ~1700 corse al secondo) prendeva il 45% del tempo del kernel e la
+         * geometria (wid 12) aspettava (sessione 28, SPURS_LANE_STAT). */
+        static struct SpursKernArg s_ka[MAX_SPURS_INST][2];
+        int slot = (int)(si - s_inst); if (slot < 0 || slot >= MAX_SPURS_INST) slot = 0;
+        u32 m2 = 0; { const char* e = getenv("SPURS_KERN2_WIDS"); if (e && *e) m2 = (u32)strtoul(e, 0, 16); }
+        s_ka[slot][0].si = si; s_ka[slot][0].mask = ~m2;
+        CreateThread(NULL, 1u << 20, spurs_kernel_thread, &s_ka[slot][0], 0, NULL);
+        if (m2) { s_ka[slot][1].si = si; s_ka[slot][1].mask = m2;
+                  CreateThread(NULL, 1u << 20, spurs_kernel_thread, &s_ka[slot][1], 0, NULL); }
     }
 
     printf("[cellSpurs] Initialize \"%s\" ea=0x%08X nSpus=%u (real BE instance + kernel poll)\n",
@@ -1407,20 +1420,45 @@ struct spurs_pm_worker_arg {
     spu_lifted_entry_fn fn; int image_id;
     const uint8_t* pm; uint32_t pm_size;
     uint64_t arg; uint32_t wid, ea, spu_num;
+    unsigned long long ns;   /* durata della corsa (SPURS_LANE_STAT) */
 };
+static unsigned long long spurs_ns_now(void)
+{
+    struct timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (unsigned long long)ts.tv_sec * 1000000000ull + (unsigned long long)ts.tv_nsec;
+}
 static DWORD WINAPI spurs_pm_worker(LPVOID p)
 {
     { ULONG g = 256 * 1024; SetThreadStackGuarantee(&g); }
     struct spurs_pm_worker_arg* a = (struct spurs_pm_worker_arg*)p;
+    unsigned long long t0 = spurs_ns_now();
     spu_run_policy_module(a->fn, a->image_id, a->pm, a->pm_size,
                           a->arg, a->wid, a->ea, a->spu_num);
+    a->ns = spurs_ns_now() - t0;
     return 0;
+}
+/* SPURS_LANE_STAT=1 (sessione 28): ogni 2 s, per workload, quante corse del
+ * PM, quante lane, tempo di parete totale e tempo somma delle lane: dice
+ * se le lane lavorano in parallelo o se una sola fa tutto. */
+static struct { unsigned runs, lanes; unsigned long long wall_ns, lane_ns, max_lane_ns; } s_ls[16];
+static unsigned long long s_ls_t0;
+static void spurs_lane_stat_flush(void)
+{
+    unsigned long long now = spurs_ns_now();
+    if (!s_ls_t0) s_ls_t0 = now;
+    if (now - s_ls_t0 < 2000000000ull) return;
+    for (int w = 0; w < 16; w++) if (s_ls[w].runs)
+        fprintf(stderr, "[lane-stat] wid=%d corse=%u lane/corsa=%.1f parete=%.0f ms lane=%.0f ms (max lane %.0f ms) in %.1f s\n",
+                w, s_ls[w].runs, (double)s_ls[w].lanes / s_ls[w].runs, s_ls[w].wall_ns / 1e6, s_ls[w].lane_ns / 1e6,
+                s_ls[w].max_lane_ns / 1e6, (now - s_ls_t0) / 1e9);
+    memset(s_ls, 0, sizeof s_ls); s_ls_t0 = now;
 }
 
 static DWORD WINAPI spurs_kernel_thread(LPVOID p)
 {
     { ULONG g = 256 * 1024; SetThreadStackGuarantee(&g); }  /* let SO reach the reporter */
-    struct SpursInst* si = (struct SpursInst*)p;
+    struct SpursInst* si = ((struct SpursKernArg*)p)->si;
+    const u32 kern_mask = ((struct SpursKernArg*)p)->mask;
     static volatile long s_pm_off = -1;
     if (s_pm_off < 0) s_pm_off = getenv("PS3_NO_SPURS_PM") ? 1 : 0;
 
@@ -1449,7 +1487,7 @@ static DWORD WINAPI spurs_kernel_thread(LPVOID p)
      * che sulla SPU non esce mai dal suo ciclo. */
     static int s_spin = -1;
     if (s_spin < 0) { const char* e = getenv("SPURS_KERN_SPIN"); s_spin = (e && *e == '0') ? 0 : 1; }
-    static int s_pass_had_work;
+    int s_pass_had_work = 0;   /* per thread: due kernel non devono confondersi */
     for (;;) {
         if (s_spin && s_pass_had_work) { s_pass_had_work = 0;
 #ifdef _WIN32
@@ -1515,6 +1553,7 @@ static DWORD WINAPI spurs_kernel_thread(LPVOID p)
         if (!enabled) continue;
 
         for (u32 wid = 0; wid < 16; wid++) {
+            if (!(kern_mask & (1u << wid))) continue;   /* serve un altro thread kernel */
             /* Perche' un workload NON viene dispacciato. wid=7 di Uncharted --
              * l'unico la cui job list ha comandi dentro -- non gira mai, e con
              * tre condizioni in fila e nessuna traccia non si puo' dire quale
@@ -1577,6 +1616,10 @@ static DWORD WINAPI spurs_kernel_thread(LPVOID p)
 
             WklPm* r = spurs_resolve_pm(wid);
             if (!r) continue;
+            /* SPURS_SKIP_WID=<maschera hex>: NON dispatchare quei workload
+             * (solo per misurare quanto costano agli altri, sessione 28). */
+            { static long s_skip = -1; if (s_skip < 0) { const char* e = getenv("SPURS_SKIP_WID"); s_skip = e ? strtol(e, 0, 16) : 0; }
+              if (s_skip & (1L << wid)) continue; }
 
             /* Idle backoff: running EVERY enabled workload's module EVERY 1ms
              * pass (x N instance threads) burned ~5 host cores on modules that
@@ -1646,10 +1689,13 @@ static DWORD WINAPI spurs_kernel_thread(LPVOID p)
               if (s_fs > 0) maxcont = (u8)(s_fs > 6 ? 6 : s_fs); }
             *(vm_base + ea + SPURS_WKL_CURCONT + wid) = maxcont;
             {
+                static int s_lstat = -1; if (s_lstat < 0) s_lstat = getenv("SPURS_LANE_STAT") ? 1 : 0;
+                unsigned long long t_run0 = s_lstat ? spurs_ns_now() : 0, lane0_ns = 0, lanes_ns = 0, max_ns = 0; unsigned nlanes = 1;
                 const uint8_t* pm = (const uint8_t*)vm_base + (uint32_t)(uintptr_t)s_workloads[wid].pm;
                 uint32_t sz = s_workloads[wid].sizePm;
                 if (maxcont <= 1) {
                     spu_run_policy_module(r->fn, r->image_id, pm, sz, arg, wid, ea, 0);
+                    if (s_lstat) { lane0_ns = spurs_ns_now() - t_run0; lanes_ns = max_ns = lane0_ns; }
                 } else {
                     /* Run the workload's virtual SPUs CONCURRENTLY (see
                      * spurs_pm_worker): each lane advances in parallel so the
@@ -1665,10 +1711,18 @@ static DWORD WINAPI spurs_kernel_thread(LPVOID p)
                         th[nth] = CreateThread(NULL, 1u << 20, spurs_pm_worker, &wa[nth], 0, NULL);
                     }
                     spu_run_policy_module(r->fn, r->image_id, pm, sz, arg, wid, ea, 0);
+                    if (s_lstat) { lane0_ns = spurs_ns_now() - t_run0; lanes_ns = max_ns = lane0_ns; }
                     if (nth) {
                         WaitForMultipleObjects(nth, th, TRUE, INFINITE);
                         for (unsigned k = 0; k < nth; k++) CloseHandle(th[k]);
+                        if (s_lstat) for (unsigned k = 0; k < nth; k++) { lanes_ns += wa[k].ns; if (wa[k].ns > max_ns) max_ns = wa[k].ns; }
+                        nlanes += nth;
                     }
+                }
+                if (s_lstat && wid < 16) {
+                    s_ls[wid].runs++; s_ls[wid].lanes += nlanes; s_ls[wid].wall_ns += spurs_ns_now() - t_run0;
+                    s_ls[wid].lane_ns += lanes_ns; if (max_ns > s_ls[wid].max_lane_ns) s_ls[wid].max_lane_ns = max_ns;
+                    spurs_lane_stat_flush();
                 }
             }
             *(vm_base + ea + SPURS_WKL_CURCONT + wid) = 0;

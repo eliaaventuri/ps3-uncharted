@@ -1046,7 +1046,7 @@ static inline int mfc_submit(mfc_engine* mfc, spu_context* spu, uint32_t cmd)
            * quanto tempo, label/r12/r5 all'inizio e alla fine. */
           static int _n = 0; extern unsigned long long ps3_ms_now(void);
           extern _Atomic unsigned long long g_spu_rddec_count;
-          static struct { uint32_t r12, v0, v1, r5, r12b, r5b, r23, r26; unsigned n, nr12; unsigned long long t0, tlast, dec0; } st[8];
+          static struct { uint32_t r12, v0, v1, r5, r12b, r5b, r23, r26; unsigned n, nr12; unsigned long long t0, tlast, dec0, hops0, steps0; } st[8];
           unsigned li = (((uint32_t)ea - 0x50000480u) >> 4) & 7; uint32_t v = 0;
           if (mfc_ea_range_committed(ea, 4)) { memcpy(&v, vm_base + (uint32_t)ea, 4); v = __builtin_bswap32(v); }
           uint32_t r12 = spu->gpr[12]._u32[0], r5 = spu->gpr[5]._u32[0];
@@ -1056,11 +1056,11 @@ static inline int mfc_submit(mfc_engine* mfc, spu_context* spu, uint32_t cmd)
               if (r12 != st[li].r12 && r12 != st[li].r12b) { st[li].nr12++; st[li].r12b = r12; st[li].r5b = r5; } }
           else {
               if (st[li].n > 1 && _n++ < 4000)
-                  fprintf(stderr, "[label-wait] lane %u: %u letture in %llu ms, label %08X -> %08X, blocco (%08X, %08X] poi (%08X, %08X] (+%u altri r12) r23=%08X r26=%08X rddec=%llu\n",
+                  fprintf(stderr, "[label-wait] lane %u: %u letture in %llu ms, label %08X -> %08X, blocco (%08X, %08X] poi (%08X, %08X] (+%u altri r12) r23=%08X r26=%08X rddec=%llu hops=%llu steps=%llu\n",
                           li, st[li].n, st[li].tlast - st[li].t0, st[li].v0, st[li].v1, st[li].r12, st[li].r5, st[li].r12b, st[li].r5b, st[li].nr12,
-                          st[li].r23, st[li].r26, (unsigned long long)atomic_load(&g_spu_rddec_count) - st[li].dec0);
+                          st[li].r23, st[li].r26, (unsigned long long)atomic_load(&g_spu_rddec_count) - st[li].dec0, (unsigned long long)(spu->hops - st[li].hops0), (unsigned long long)(spu->steps - st[li].steps0));
               st[li].n = 1; st[li].nr12 = 0; st[li].r12 = r12; st[li].r5 = r5; st[li].r12b = 0; st[li].r5b = 0; st[li].v0 = v; st[li].v1 = v; st[li].t0 = now; st[li].tlast = now;
-              st[li].r23 = spu->gpr[23]._u32[0]; st[li].r26 = spu->gpr[26]._u32[0]; st[li].dec0 = atomic_load(&g_spu_rddec_count); } } }
+              st[li].r23 = spu->gpr[23]._u32[0]; st[li].r26 = spu->gpr[26]._u32[0]; st[li].dec0 = atomic_load(&g_spu_rddec_count); st[li].hops0 = spu->hops; st[li].steps0 = spu->steps; } } }
 
     /* Mark tag as in-progress */
     mfc->tag_completed &= ~(1u << tag);

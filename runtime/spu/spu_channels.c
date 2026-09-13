@@ -333,6 +333,16 @@ void spu_atomic_line_unlock(void) { resv_unlock(); }
 /* Total PUTLLC attempts (all SPUs). The PM flow trace (spurs_policy.c) reads
  * the delta across one policy run to find the run that performed a claim. */
 volatile unsigned g_spu_putllc_count = 0;
+/* Percorso veloce della LS (spu_context.h): 1 se una qualunque delle sonde
+ * sugli accessi alla local store e' richiesta dall'ambiente. */
+int g_spu_ls_diag = -1;
+int spu_ls_diag_init(void)
+{
+    static const char* const vars[] = { "LBP_SPU_WATCH", "SPU_LS_LOWREAD", "SPU_LS_WRITE_WATCH", "SPU_LS0_WATCH",
+                                        "SPU_SMC_WATCH", "SPU_WWS_CMDS", "SPU_WWS_STATE", "SPU_LS_DIAG", NULL };
+    for (int i = 0; vars[i]; i++) if (getenv(vars[i])) return 1;
+    return 0;
+}
 _Atomic unsigned long long g_spu_rddec_count = 0;   /* letture di SPU_RdDec (diagnostica, sessione 28) */
 /* PUTLLCs that hit the WATCHED sync line (g_barrier_sync_watch) -- isolates the
  * work-run on the stalled job queue from the dozen idle jobmanager instances. */
@@ -793,6 +803,9 @@ u128 spu_rdch(spu_context* ctx, uint32_t channel)
      * `cgti > 0` test above is written to tolerate it. */
     case SPU_RdDec: {
         atomic_fetch_add(&g_spu_rddec_count, 1);   /* diagnostica: [label-wait] */
+        { static int s_bm = -1; if (s_bm < 0) { s_bm = getenv("SPU_DEC_BENCH") ? 1 : 0;
+              if (s_bm) { uint64_t t0 = spu_host_ns(), acc = 0; for (int i = 0; i < 200000; i++) acc += spu_host_ns();
+                          uint64_t t1 = spu_host_ns(); fprintf(stderr, "[dec-bench] spu_host_ns: %.1f ns/chiamata (thread della lane, acc=%llu)\n", (t1 - t0) / 200000.0, (unsigned long long)(acc & 1)); } } }
         /* Never armed by a WrDec: stamp the base on first read rather than
          * measuring from epoch 0, which would subtract the host's entire
          * uptime and hand back a wild value to code that has every right to

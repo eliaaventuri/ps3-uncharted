@@ -516,6 +516,40 @@ giro precedente: l'ultimo blocco di quella lane non e' mai stato consumato
 Da capire chi resetta il puntatore (r12 torna indietro a meta' anello) e
 perche' il walker non arriva a quel blocco.
 
+**Velocita' delle lane SPU: da ~4.300 a ~45.000 draw al secondo** (misura:
+`RSX_FRAMESTAT=100`, draw per 100 fotogrammi / tempo; il livello passa da
+4 fps con 1.080 draw a 7-8 fps con 5.500-6.000 draw per fotogramma, che e'
+la scena che nel frattempo si e' riempita). Tre cose, tutte misurate con
+Instruments sulle lane (`xcrun xctrace record --template 'Time Profiler'
+--attach <pid> --time-limit 5s`, poi `xctrace export --xpath
+'/trace-toc/run[@number="1"]/data/table[@schema="time-profile"]'` e un
+piccolo parser Python del XML; `sample` sbaglia l'attribuzione):
+1. `spu_shufb` era il **51%** del tempo delle lane: ciclo a byte con tre
+   `if` per byte. Ora NEON (`vrev32q_u8` per portare le parole in ordine
+   SPU, `vqtbl2q_u8` sui 32 byte concatenati, tre `vcgeq_u8` per i casi
+   speciali): 200.000 vettori casuali identici alla versione scalare.
+   Blocchi di comandi per lane: da ~1.600 a ~2.650 al secondo.
+2. `spu_ls_read128/write128` + `spu_ls_watch_hit2` = **37%**: una decina di
+   sonde (statiche, confronti, probe WWS) su ogni accesso alla LS. Ora un
+   percorso veloce (`g_spu_ls_diag`, deciso una volta dalle variabili
+   d'ambiente `LBP_SPU_WATCH SPU_LS_LOWREAD SPU_LS_WRITE_WATCH
+   SPU_LS0_WATCH SPU_SMC_WATCH SPU_WWS_CMDS SPU_WWS_STATE SPU_LS_DIAG`):
+   load/store NEON + inversione dei byte. Blocchi: ~3.600 al secondo.
+3. Il kernel SPURS serializzava i workload su un thread: il synth audio
+   (wid 7, ~1.700 corse al secondo, 0,5 ms l'una) prendeva il **45%** del
+   tempo e la geometria (wid 12, 5 lane) aspettava (`SPURS_LANE_STAT=1`,
+   nuovo). `SPURS_KERN2_WIDS=<maschera>` (in `run.sh`: 0x80) fa girare
+   quei workload su un secondo thread kernel. Provato prima
+   `SPURS_SKIP_WID=80` (non dispatchare l'audio, solo per misurare): 9,5 fps
+   contro 4.
+Ancora nel profilo delle lane: ~16% in creazione/distruzione di thread
+(`CreateThread` per le lane 1..4 a OGNI corsa del PM, ~7.000 thread al
+secondo): il prossimo passo e' un pool di thread persistenti. Il codice
+SPU liftato si compila ora a -O2 (`SPU_OPT` in `build.sh`; +30-60% di
+blocchi), e `build.sh` ricompila i moduli liftati quando cambia un header
+di `runtime/spu` (prima un campo aggiunto a `spu_context` dava "Illegal
+instruction" all'avvio; i campi nuovi vanno comunque IN CODA alla struct).
+
 **Occlusion query vere (lavoro della sessione precedente, non ancora
 raccontato, ora misurato):** `NV4097_GET_REPORT` ZPASS -> visibility buffer
 Metal (`MTLVisibilityResultModeCounting`, uno slot da 8 byte per draw,
@@ -545,11 +579,8 @@ job manager in `func_0074232C`): resta il fronte.
 
 ### Il prossimo passo (sessione 28)
 
-1. Velocita' del livello: 3 fps con 1094 draw. Profilare (`sample`) una
-   corsa dopo i 70 s: quanto e' PPU (`func_0074232C`), quanto walker/Metal
-   (1094 draw = 1094 render pass? no: passaggi per tratto di superficie),
-   quanto SPU (un solo thread SPURS). Un numero prima di toccare la
-   pianificazione.
+1. Velocita' del livello (fatto in parte: vedi "Velocita' delle lane SPU").
+   Prossimo: pool di thread per le lane; poi riprofilare con Instruments.
 2. Corsa lunga (600 s) con `SPURS_IDLE_MAX=0`: il caricamento finisce
    (regioni in stato 5, fade via)? Screenshot con `RSX_DUMP_FRAME` a 300+ s.
 3. Con `SPURS_PM_R4_LO` spento, riprovare LBP (lbp/) prima di

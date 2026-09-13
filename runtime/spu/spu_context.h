@@ -15,6 +15,9 @@
 #include <string.h>
 #include <stdio.h>
 #include <stdlib.h>
+#if defined(__aarch64__) && defined(__ARM_NEON)
+#include <arm_neon.h>
+#endif
 
 #ifdef __cplusplus
 extern "C" {
@@ -54,8 +57,13 @@ static inline unsigned* spu_ls_watch_list(int* out_n) {
 }
 static inline void spu_ls_watch_hit2(uint32_t lsa, int is_write, const uint8_t* p,
                                      uint32_t pc, uint32_t lr) {
+    /* percorso caldo (ogni lettura/scrittura della LS): un solo confronto
+     * quando la watch e' spenta (era il 7.6% del tempo delle lane) */
+    static int s_off = -1;
+    if (s_off > 0) return;
     int n; unsigned* w = spu_ls_watch_list(&n);
-    if (!n) return;
+    if (!n) { s_off = 1; return; }
+    s_off = 0;
     uint32_t a = lsa & (SPU_LS_MASK & ~0xFu);
     for (int i = 0; i < n; i++) {
         if (w[i] == a) {
@@ -362,6 +370,7 @@ typedef struct spu_context {
      * instruction" all'avvio (sessione 28). */
     uint64_t dec_cache_ns;   /* ultimo clock host letto per SPU_RdDec (rinfrescato ogni 64 letture) */
     uint32_t dec_cache_n;    /* letture dall'ultimo rinfresco */
+    uint64_t hops;           /* salti del trampolino (SPU_DRAIN), diagnostica [label-wait] */
 } spu_context;
 
 /* Reserved LS addresses (inside the kernel area, below the 0xA00 policy-module
@@ -432,7 +441,49 @@ static inline void spu_ls_write32(spu_context* ctx, uint32_t lsa, uint32_t val)
 #define SPU_LS_FAST 1
 #endif
 
+/* Percorso veloce degli accessi alla local store (sessione 28). Le due
+ * funzioni *_diag qui sotto portano una decina di sonde ciascuna (statiche,
+ * confronti, probe WWS) e con ~100 milioni di accessi al secondo per lane
+ * erano il 37% del tempo delle lane SPU di Uncharted (Instruments). Se
+ * nessuna variabile di diagnostica della LS e' impostata si passa dal
+ * percorso corto: solo load/store + inversione dei byte di ogni parola. */
+extern int g_spu_ls_diag;   /* spu_channels.c: -1 da decidere, 0 veloce, 1 con le sonde */
+int spu_ls_diag_init(void);  /* spu_channels.c: legge le variabili d'ambiente */
+static inline u128 spu_ls_read128_diag(const spu_context* ctx, uint32_t lsa);
+static inline void spu_ls_write128_diag(spu_context* ctx, uint32_t lsa, u128 val);
 static inline u128 spu_ls_read128(const spu_context* ctx, uint32_t lsa)
+{
+    if (__builtin_expect(g_spu_ls_diag != 0, 0)) {
+        if (g_spu_ls_diag < 0) g_spu_ls_diag = spu_ls_diag_init();
+        if (g_spu_ls_diag) return spu_ls_read128_diag(ctx, lsa);
+    }
+    const uint8_t* p = &ctx->ls[lsa & (SPU_LS_MASK & ~0xFu)];
+    u128 v;
+#if defined(__aarch64__) && defined(__ARM_NEON)
+    vst1q_u8(v._u8, vrev32q_u8(vld1q_u8(p)));
+#else
+    uint32_t w0, w1, w2, w3;
+    memcpy(&w0, p, 4); memcpy(&w1, p + 4, 4); memcpy(&w2, p + 8, 4); memcpy(&w3, p + 12, 4);
+    v._u32[0] = SPU_BSWAP32(w0); v._u32[1] = SPU_BSWAP32(w1); v._u32[2] = SPU_BSWAP32(w2); v._u32[3] = SPU_BSWAP32(w3);
+#endif
+    return v;
+}
+static inline void spu_ls_write128(spu_context* ctx, uint32_t lsa, u128 val)
+{
+    if (__builtin_expect(g_spu_ls_diag != 0, 0)) {
+        if (g_spu_ls_diag < 0) g_spu_ls_diag = spu_ls_diag_init();
+        if (g_spu_ls_diag) { spu_ls_write128_diag(ctx, lsa, val); return; }
+    }
+    uint8_t* p = &ctx->ls[lsa & (SPU_LS_MASK & ~0xFu)];
+#if defined(__aarch64__) && defined(__ARM_NEON)
+    vst1q_u8(p, vrev32q_u8(vld1q_u8(val._u8)));
+#else
+    uint32_t w0 = SPU_BSWAP32(val._u32[0]), w1 = SPU_BSWAP32(val._u32[1]), w2 = SPU_BSWAP32(val._u32[2]), w3 = SPU_BSWAP32(val._u32[3]);
+    memcpy(p, &w0, 4); memcpy(p + 4, &w1, 4); memcpy(p + 8, &w2, 4); memcpy(p + 12, &w3, 4);
+#endif
+}
+
+static inline u128 spu_ls_read128_diag(const spu_context* ctx, uint32_t lsa)
 {
     u128 v;
     /* SPU_LS_LOWREAD=1: a job that reads its OWN first bytes as data is
@@ -511,7 +562,7 @@ static inline u128 spu_ls_read128(const spu_context* ctx, uint32_t lsa)
 }
 
 extern int g_spu_ls0_watch;   /* SPU_LS0_WATCH=1 (spu_channels.c): chi scrive LS 0 */
-static inline void spu_ls_write128(spu_context* ctx, uint32_t lsa, u128 val)
+static inline void spu_ls_write128_diag(spu_context* ctx, uint32_t lsa, u128 val)
 {
     lsa &= SPU_LS_MASK & ~0xFu;
     uint8_t* p = &ctx->ls[lsa];
@@ -770,6 +821,7 @@ static inline void spu_pcwatch(spu_context* ctx)
 #define SPU_DRAIN(ctx) do {                                    \
         spu_depth_guard(ctx);                                  \
         while (g_spu_trampoline_fn) {                           \
+            (ctx)->hops++;                                                    \
             /* L'interrupt si prende PRIMA delle scorciatoie di ritorno.      \
              * Sull'hardware un interrupt abilitato e pendente entra fra due  \
              * istruzioni qualunque, ritorno compreso; qui invece le due      \

@@ -164,6 +164,29 @@ static inline u128 spu_selb(u128 a, u128 b, u128 c) {
  *   sel & 0xC0 == 0xC0 -> 0xFF
  *   sel & 0xC0 == 0x80 -> 0x00
  *   otherwise           -> concat{a,b}[sel & 0x1F] */
+#if defined(__aarch64__) && defined(__ARM_NEON)
+#include <arm_neon.h>
+/* shufb con NEON (sessione 28): la versione a byte qui sotto era il 51% del
+ * tempo delle lane SPU di Uncharted (Instruments, Time Profiler). Le parole
+ * di u128 sono in ordine host (little-endian), quindi i byte SPU di una
+ * parola sono i suoi byte al contrario: vrev32q_u8 porta a, b e il controllo
+ * in ordine SPU, vqtbl2q_u8 fa la ricerca sui 32 byte concatenati, i casi
+ * speciali (s >= 0x80: 0x00, s >= 0xC0: 0xFF, s >= 0xE0: 0x80) con tre
+ * confronti, e un altro vrev32q_u8 riporta il risultato in ordine host. */
+static inline u128 spu_shufb(u128 a, u128 b, u128 c) {
+    uint8x16_t va = vrev32q_u8(vld1q_u8(a._u8));
+    uint8x16_t vb = vrev32q_u8(vld1q_u8(b._u8));
+    uint8x16_t vc = vrev32q_u8(vld1q_u8(c._u8));
+    uint8x16x2_t tab; tab.val[0] = va; tab.val[1] = vb;
+    uint8x16_t look = vqtbl2q_u8(tab, vandq_u8(vc, vdupq_n_u8(0x1F)));
+    uint8x16_t hi    = vcgeq_u8(vc, vdupq_n_u8(0x80));
+    uint8x16_t is_ff = vcgeq_u8(vc, vdupq_n_u8(0xC0));
+    uint8x16_t is_80 = vcgeq_u8(vc, vdupq_n_u8(0xE0));
+    uint8x16_t special = vbslq_u8(is_80, vdupq_n_u8(0x80), vbslq_u8(is_ff, vdupq_n_u8(0xFF), vdupq_n_u8(0x00)));
+    u128 r; vst1q_u8(r._u8, vrev32q_u8(vbslq_u8(hi, special, look)));
+    return r;
+}
+#else
 static inline u128 spu_shufb(u128 a, u128 b, u128 c) {
     /* shufb is defined on SPU byte positions. Our u128 is host-native LE, so SPU
      * byte P lives at _u8[SPU_W(P)]; map every access (the concat source, the
@@ -186,6 +209,7 @@ static inline u128 spu_shufb(u128 a, u128 b, u128 c) {
     }
     return r;
 }
+#endif
 
 /* ---- shift / rotate immediate (word lanes) ---- */
 static inline u128 spu_shli(u128 a, int sh)  { u128 r; sh&=0x3F; for(int i=0;i<4;i++) r._u32[i]=(sh>31)?0:(a._u32[i]<<sh); return r; }
