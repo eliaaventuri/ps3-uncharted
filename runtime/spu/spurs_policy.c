@@ -227,10 +227,32 @@ int spu_run_policy_module(spu_lifted_entry_fn entry, int image_id,
      * 0x13F0, via func_3038 -> 2418), i.e. r4's SECOND word. Both word 0
      * (attach) and word 1 (claim) must carry the 32-bit EA; the hi half
      * rides in words 2-3. */
-    ctx->gpr[4]._u32[0] = (uint32_t)wkl_data;          /* attach reads word0  */
-    ctx->gpr[4]._u32[1] = (uint32_t)wkl_data;          /* claim reads word1   */
-    ctx->gpr[4]._u32[2] = (uint32_t)(wkl_data >> 32);
-    ctx->gpr[4]._u32[3] = (uint32_t)(wkl_data >> 32);
+    /* Sessione 28: la lettura sopra era sbagliata. Il kernel SPURS vero (e
+     * RPCS3, cellSpursSpu.cpp: `spu.gpr[4]._u64[1] = wklInfo->arg`) passa
+     * l'argomento come u64 big-endian nelle parole 0-1: word0 = meta' ALTA,
+     * word1 = meta' bassa. Il PM WwsJob di Uncharted (entry 0x2340) prende
+     * la job list da `shlqbyi r4,4` = word1, e passa r4 grezzo alla routine
+     * 0x1E70 che legge word0 come EA di un buffer OPZIONALE (l'audit
+     * buffer: `biz` se zero). Con la EA della lista anche in word0 quella
+     * routine trattava la job list come audit buffer e ci scriveva 16 byte
+     * di 0xFF a +0x40+16*spuNum: le intestazioni dei job 4-5 -- da cui
+     * l'assert `joblist.cpp(578) m_jobHeaderCommand == kNoJobYet` sul thread
+     * audio quando il PPU accodava il job 4 dopo quella scrittura (4 corse
+     * su 6). SPURS_PM_R4_LO=1 ripristina il layout {lo,lo,hi,hi} per
+     * riprovare LBP, dove quel layout era stato introdotto. */
+    { static int s_lo = -1;
+      if (s_lo < 0) { const char* e = getenv("SPURS_PM_R4_LO"); s_lo = (e && *e && *e != '0') ? 1 : 0; }
+      if (s_lo) {
+          ctx->gpr[4]._u32[0] = (uint32_t)wkl_data;          /* attach reads word0  */
+          ctx->gpr[4]._u32[1] = (uint32_t)wkl_data;          /* claim reads word1   */
+          ctx->gpr[4]._u32[2] = (uint32_t)(wkl_data >> 32);
+          ctx->gpr[4]._u32[3] = (uint32_t)(wkl_data >> 32);
+      } else {
+          ctx->gpr[4]._u32[0] = (uint32_t)(wkl_data >> 32);
+          ctx->gpr[4]._u32[1] = (uint32_t)wkl_data;
+          ctx->gpr[4]._u32[2] = 0;
+          ctx->gpr[4]._u32[3] = 0;
+      } }
     ctx->gpr[5]._u32[0] = 0;                           /* poll status */
 
     g_spurs_pm_polls  = 0;

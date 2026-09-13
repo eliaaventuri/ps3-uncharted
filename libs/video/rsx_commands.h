@@ -387,6 +387,11 @@ typedef struct rsx_backend {
 
     /* Texture */
     void (*bind_texture)(void* userdata, u32 unit, const rsx_texture_state* tex);
+    /* Occlusion query (opzionali). report_clear = CLEAR_REPORT_VALUE;
+     * report_zpass = GET_REPORT di tipo ZPASS_PIXEL_CNT: il backend scrive il
+     * conteggio vero a ea+8 quando la GPU ha finito il fotogramma. */
+    void (*report_clear)(void* userdata);
+    void (*report_zpass)(void* userdata, u32 ea);
 } rsx_backend;
 
 /* Register a backend. Call before any RSX processing. */

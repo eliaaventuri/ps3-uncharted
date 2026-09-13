@@ -25,6 +25,7 @@
 #include "../platform/win32_compat.h"      /* LONG/SIZE_T, _Interlocked*, YieldProcessor on POSIX */
 extern "C" uint32_t ppu_prof_resolve_host(void* ra);
 extern "C" void ppu_guest_callstack(const char* tag);
+extern "C" void spu_wring_dump_ext(void);   /* runtime/spu/spu_channels.c */
 
 /* Resolve the GUEST function on the host stack (closest lifted entry below
  * each frame) -- the same trick the [BLOCK] profiler uses. */
@@ -1612,6 +1613,7 @@ extern "C" void ppu_guest_trap(ppu_context* ctx, unsigned int addr)
             fputc('\n', stderr);
         }
         ppu_dump_guest_stack(ctx, "trap");
+        spu_wring_dump_ext();   /* SPU_WRING: le ultime scritture SPU nella finestra osservata */
         fflush(stderr);
     }
     if (!s_fatal) return;

@@ -16,6 +16,10 @@
 #define SPU_DMA_H
 
 #include "spu_context.h"
+#ifndef _WIN32
+#include <execinfo.h>
+#include <dlfcn.h>
+#endif
 #include <stdint.h>
 #include <string.h>
 #include <stdlib.h>
@@ -181,6 +185,68 @@ static inline int mfc_is_fence(uint32_t cmd)
  * Execute a single DMA transfer between local store and main memory.
  * Returns 0 on success, -1 on error.
  */
+/* SPU_WRING=<ea>:<len> -- anello delle ultime scritture SPU (DMA PUT e
+ * commit atomici) dentro quella finestra guest, con pc/lr e i byte scritti;
+ * lo scarica ppu_guest_trap (l'assert del titolo) insieme alla finestra.
+ * Serve quando il titolo trova un valore che non si aspetta e la scrittura
+ * responsabile e' avvenuta troppo prima per un trace lineare. */
+enum { SPU_WRING_N = 48, SPU_WRING_BYTES = 32 };
+typedef struct { uint32_t ea, size, pc, lr; int img, ovl; char kind[12]; uint8_t data[SPU_WRING_BYTES]; unsigned long long t; char who[160]; } spu_wring_ent;
+static spu_wring_ent s_wring[SPU_WRING_N];
+static unsigned s_wring_n;
+static uint32_t s_wring_lo, s_wring_hi;
+static inline int spu_wring_on(void)
+{
+    static int s_on = -1;
+    if (s_on < 0) { const char* e = getenv("SPU_WRING"); s_on = 0;
+        if (e && *e) { char* c = NULL; s_wring_lo = (uint32_t)strtoul(e, &c, 16);
+            s_wring_hi = s_wring_lo + (uint32_t)((c && *c == ':') ? strtoul(c + 1, 0, 16) : 0x80); s_on = 1; } }
+    return s_on;
+}
+static inline void spu_wring_note(spu_context* spu, const char* kind, uint32_t ea, uint32_t size, const uint8_t* data)
+{
+    if (!spu_wring_on() || ea >= s_wring_hi || ea + size <= s_wring_lo) return;
+    extern unsigned long long ps3_ms_now(void);
+    spu_wring_ent* w = &s_wring[s_wring_n++ % SPU_WRING_N];
+    w->ea = ea; w->size = size; w->pc = (uint32_t)spu->pc & SPU_LS_MASK; w->lr = spu->gpr[0]._u32[0] & SPU_LS_MASK;
+    w->img = spu->image_id; w->ovl = spu->resident_ovl; w->t = ps3_ms_now();
+    snprintf(w->kind, sizeof w->kind, "%s", kind);
+    /* i byte scritti a partire dall'inizio della finestra (se la copre) */
+    uint32_t from = ea < s_wring_lo ? s_wring_lo - ea : 0;
+    memset(w->data, 0, sizeof w->data);
+    if (from < size) memcpy(w->data, data + from, (size - from) < SPU_WRING_BYTES ? (size - from) : SPU_WRING_BYTES);
+    w->ea = ea + from;
+    /* chi ha emesso il comando: le funzioni SPU liftate hanno nomi host
+     * (spurs_policy_func_XXXX, jobmod_..._func_XXXX), e il pc del contesto
+     * si aggiorna solo ai salti */
+    w->who[0] = 0;
+#ifndef _WIN32
+    { void* fr[10]; int nf = backtrace(fr, 10); int p = 0;
+      for (int i = 2; i < nf && p < (int)sizeof w->who - 24; i++) {
+          Dl_info di; if (!dladdr(fr[i], &di) || !di.dli_sname) continue;
+          if (strstr(di.dli_sname, "func_") || strstr(di.dli_sname, "spu_")) 
+              p += snprintf(w->who + p, sizeof w->who - p, "%s%.40s+0x%lx", p ? " < " : "", di.dli_sname, (unsigned long)((char*)fr[i] - (char*)di.dli_saddr)); } }
+#endif
+}
+static inline void spu_wring_dump(void)
+{
+    if (!spu_wring_on()) return;
+    extern uint8_t* vm_base;
+    fprintf(stderr, "[wring] finestra 0x%08X..0x%08X ora:\n", s_wring_lo, s_wring_hi);
+    for (uint32_t a = s_wring_lo; a < s_wring_hi; a += 32) {
+        fprintf(stderr, "[wring]   %08X:", a);
+        for (uint32_t k = 0; k < 32 && a + k < s_wring_hi; k++) fprintf(stderr, "%s%02X", (k % 4) ? "" : " ", vm_base[a + k]);
+        fputc('\n', stderr); }
+    unsigned n = s_wring_n < SPU_WRING_N ? s_wring_n : SPU_WRING_N;
+    fprintf(stderr, "[wring] ultime %u scritture SPU (di %u):\n", n, s_wring_n);
+    for (unsigned i = s_wring_n - n; i < s_wring_n; i++) {
+        spu_wring_ent* w = &s_wring[i % SPU_WRING_N];
+        fprintf(stderr, "[wring]   t=%llu %-7s img=%d ovl=%d pc=0x%05X lr=0x%05X ea=0x%08X size=%u:", w->t, w->kind, w->img, w->ovl, w->pc, w->lr, w->ea, w->size);
+        for (unsigned k = 0; k < SPU_WRING_BYTES && k < w->size; k++) fprintf(stderr, "%s%02X", (k % 4) ? "" : " ", w->data[k]);
+        fprintf(stderr, "  [%s]\n", w->who); }
+    fflush(stderr);
+}
+
 static inline int mfc_do_transfer(spu_context* spu, uint32_t lsa, uint64_t ea,
                                    uint32_t size, uint32_t cmd)
 {
@@ -201,6 +267,10 @@ static inline int mfc_do_transfer(spu_context* spu, uint32_t lsa, uint64_t ea,
                               " size=%u covers 0x%08X\n",
                       (uint32_t)spu->pc & SPU_LS_MASK, cmd, lsa, (uint32_t)ea, size,
                       (uint32_t)s_w); } }
+    if (mfc_is_put(cmd)) { char kb[12]; snprintf(kb, sizeof kb, "P%02X@%X", cmd & 0xFF, lsa >> 4);
+        spu_wring_note(spu, kb, (uint32_t)ea, size, &spu->ls[lsa]); }
+    else if (mfc_is_get(cmd) && spu_wring_on()) { extern uint8_t* vm_base; char kb[12]; snprintf(kb, sizeof kb, "G%02X@%X", cmd & 0xFF, lsa >> 4);
+        spu_wring_note(spu, kb, (uint32_t)ea, size, vm_base + (uint32_t)ea); }   /* le letture: dicono la base che il codice SPU usa */
     /* SPU_DMA_LSWATCH=<hex>: ogni GET (verso la local store) la cui finestra
      * LS copre quell'indirizzo -- per trovare chi sovrascrive il codice del
      * policy module (Uncharted: LS 0x3528 clobberata durante il livello). */

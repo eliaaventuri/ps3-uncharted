@@ -113,6 +113,7 @@ static u32        s_vert_count;
 static MtlDraw    s_draws[MTL_MAX_DRAWS];
 static u32        s_draw_count;
 unsigned rsx_backend_draw_count(void) { return s_draw_count; }   /* per RSX_MTRACE (rsx_commands.c) */
+static u32 s_draw_count_peek(void) { return s_draw_count; }
 static u32        s_dropped_draws;
 
 /* ---- vertex program del guest (sessione 27) --------------------------------
@@ -217,8 +218,45 @@ static void mtl_draw_indexed(void*, u32, u32, u32);
 static void mtl_draw_inline(void*, u32, const float*, u32);
 static void mtl_bind_texture(void*, u32, const rsx_texture_state*);
 
+/* ---- occlusion query (NV4097_GET_REPORT ZPASS_PIXEL_CNT) ----------------
+ * Ogni draw ha uno slot da 8 byte nel visibility buffer del fotogramma
+ * (MTLVisibilityResultModeCounting: campioni che passano il depth test).
+ * CLEAR_REPORT_VALUE segna l'inizio; GET_REPORT registra {ea, primo draw,
+ * ultimo draw}; a GPU finita, il completed handler somma gli slot e scrive
+ * il conteggio vero a ea+8 (il job 215 lo legge il fotogramma dopo, come
+ * sul ferro dove la GPU sta un fotogramma dietro). */
+enum { MTL_MAX_REPORTS = 8192, MTL_VIS_RING = 3 };
+#include <stdatomic.h>
+static atomic_int s_gpu_pending;   /* fotogrammi con report ancora in volo sulla GPU */
+int rsx_metal_backend_gpu_busy(void) { return atomic_load(&s_gpu_pending) > 0; }
+/* Aspetta (al massimo max_us) che la GPU finisca i fotogrammi con report in
+ * volo. Rimandare il flip al tick successivo costava un tick intero per
+ * fotogramma: menu a 33 fps invece di 55 (misurato, sessione 28). */
+int rsx_metal_backend_gpu_wait(unsigned max_us)
+{
+    for (unsigned w = 0; w < max_us && atomic_load(&s_gpu_pending) > 0; w += 100) usleep(100);
+    return atomic_load(&s_gpu_pending) == 0;
+}
+typedef struct { u32 ea, first, last; } MtlReport;
+static MtlReport      s_reports[MTL_MAX_REPORTS];
+static u32            s_report_count, s_report_start;
+static id<MTLBuffer>  s_vis_buf[MTL_VIS_RING];
+static u32            s_vis_idx;
+static u32            s_draw_count_peek(void);
+static void mtl_report_clear(void* ud) { (void)ud; s_report_start = s_draw_count_peek(); }
+static void mtl_report_zpass(void* ud, u32 ea)
+{
+    (void)ud;
+    if (s_report_count >= MTL_MAX_REPORTS) return;
+    u32 now = s_draw_count_peek();
+    s_reports[s_report_count].ea = ea; s_reports[s_report_count].first = s_report_start; s_reports[s_report_count].last = now;
+    s_report_count++;
+}
+
 static rsx_backend s_backend_vtable = {
     .userdata          = NULL,
+    .report_clear      = mtl_report_clear,
+    .report_zpass      = mtl_report_zpass,
     .clear             = mtl_clear,
     .set_render_target = mtl_set_render_target,
     .set_vertex_attribs = mtl_set_vertex_attribs,
@@ -1714,6 +1752,16 @@ void rsx_metal_backend_present(void)
           } }
         id<MTLCommandBuffer> cb = [s_queue commandBuffer];
 
+        /* Visibility buffer del fotogramma (anello di 3: il precedente puo'
+         * essere ancora in volo sulla GPU). Zero: i draw non codificati
+         * (RSX_DRAW_LIMIT, pass saltati) contano 0. */
+        id<MTLBuffer> vis = nil;
+        if (s_report_count) {
+            if (!s_vis_buf[s_vis_idx]) s_vis_buf[s_vis_idx] = [s_dev newBufferWithLength:(NSUInteger)MTL_MAX_DRAWS * 8 options:MTLResourceStorageModeShared];
+            vis = s_vis_buf[s_vis_idx]; s_vis_idx = (s_vis_idx + 1) % MTL_VIS_RING;
+            if (vis) memset([vis contents], 0, (size_t)MTL_MAX_DRAWS * 8);
+        }
+
         /* Un passaggio di rendering per ogni tratto CONSECUTIVO di draw che
          * condividono la superficie: e' l'ordine in cui il titolo li ha
          * emessi, e cambiare superficie e' esattamente cambiare bersaglio.
@@ -1771,6 +1819,7 @@ void rsx_metal_backend_present(void)
                         if (s_draws[q].tex[t]) { MtlZeta* z = zeta_by_rgba(s_draws[q].tex[t]); if (z) zeta_refresh_rgba(cb, z); }
             MTLRenderPassDescriptor* rp = [MTLRenderPassDescriptor renderPassDescriptor];
             rp.colorAttachments[0].texture = pass_target;
+            if (vis) rp.visibilityResultBuffer = vis;
             /* MRT: i bersagli B/C/D del primo draw del tratto, stessa dimensione e formato */
             if (!to_display && s_draws[i].n_mrt > 1) {
                 u32 offs[3] = { s_draws[i].surf1, s_draws[i].surf2, s_draws[i].surf3 };
@@ -1890,6 +1939,7 @@ void rsx_metal_backend_present(void)
                         [enc setFragmentSamplerState:s_sampler atIndex:t];
                     }
                 }
+                if (vis) [enc setVisibilityResultMode:MTLVisibilityResultModeCounting offset:(NSUInteger)i * 8];
                 [enc drawPrimitives:d->topology vertexStart:(d->vp >= 0 && vpb && cbb) ? 0 : d->base
                         vertexCount:d->count];
             }
@@ -2139,22 +2189,63 @@ void rsx_metal_backend_present(void)
               if (drawable) [drawable present];
               if (!s_headless) dispatch_semaphore_signal(s_inflight);
               s_draw_count = 0; s_vert_count = 0; s_vpd_used = 0; s_cb_count = 0;
+              s_report_count = 0; s_report_start = 0;
               return;
           } }
 
-        if (drawable) [cb presentDrawable:drawable];
+        /* Il present va su un SECONDO command buffer, accodato dopo il
+         * rendering: cosi' il completed handler dei report (sotto) scatta
+         * quando i passaggi sono finiti, non quando il drawable e' stato
+         * mostrato al vsync. Con present e rendering nello stesso buffer il
+         * flip del titolo (che aspetta i report, cellGcmTickFlip) restava
+         * legato al vsync e il menu andava a 33 fps invece di 55. */
+        id<MTLCommandBuffer> cbp = nil;
+        if (drawable) { cbp = [s_queue commandBuffer]; [cbp presentDrawable:drawable]; }
+
+        /* Occlusion: a GPU finita somma gli slot di ogni report e scrive il
+         * conteggio vero (copia della lista: la prossima registrazione la
+         * sovrascrive subito). */
+        if (vis && s_report_count) {
+            /* il flip del titolo (cellGcmTickFlip) aspetta che questo fotogramma
+             * sia finito sulla GPU: i report vanno letti dal job 215 gia' veri */
+            atomic_fetch_add(&s_gpu_pending, 1);
+            u32 nrep = s_report_count;
+            MtlReport* reps = (MtlReport*)malloc(sizeof(MtlReport) * nrep);
+            memcpy(reps, s_reports, sizeof(MtlReport) * nrep);
+            id<MTLBuffer> visb = vis;
+            [cb addCompletedHandler:^(id<MTLCommandBuffer> _u) {
+                (void)_u;
+                extern void rsx_report_set_value(u32 ea, u32 val);
+                const uint64_t* cnt = (const uint64_t*)[visb contents];
+                static int s_dbg = -1; if (s_dbg < 0) s_dbg = getenv("RSX_OCCLUSION_DBG") ? 1 : 0;
+                u32 vis_n = 0;
+                for (u32 r = 0; r < nrep; r++) {
+                    uint64_t sum = 0;
+                    for (u32 k = reps[r].first; k < reps[r].last && k < MTL_MAX_DRAWS; k++) sum += cnt[k];
+                    u32 v = sum > 0xFFFFFFFFull ? 0xFFFFFFFFu : (u32)sum;
+                    rsx_report_set_value(reps[r].ea, v);
+                    if (v) vis_n++;
+                }
+                if (s_dbg) fprintf(stderr, "[occlusion] %u report, %u visibili\n", nrep, vis_n);
+                free(reps);
+                atomic_fetch_sub(&s_gpu_pending, 1);
+            }];
+        }
+        s_report_count = 0; s_report_start = 0;
 
         if (s_headless) {
             /* The readback below must see a completed frame. */
             [cb commit];
+            if (cbp) [cbp commit];
             [cb waitUntilCompleted];
         } else {
             dispatch_semaphore_t sem = s_inflight;
-            [cb addCompletedHandler:^(id<MTLCommandBuffer> _unused) {
+            [(cbp ? cbp : cb) addCompletedHandler:^(id<MTLCommandBuffer> _unused) {
                 (void)_unused;
                 dispatch_semaphore_signal(sem);
             }];
             [cb commit];        /* no wait: the CPU goes on to the next frame */
+            if (cbp) [cbp commit];
         }
 
         if (s_dropped_draws) {

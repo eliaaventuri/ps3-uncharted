@@ -38,6 +38,7 @@ uint32_t g_ydkj_real_spurs_ea   = 0;   /* real CellSpurs instance EA (for the ta
 #else
 #include <pthread.h>
 #include <time.h>
+#include <sched.h>   /* sched_yield: passata del kernel SPURS senza dormire */
 #endif
 
 /* ---------------------------------------------------------------------------
@@ -1129,8 +1130,8 @@ s32 cellSpursAddWorkload(CellSpurs* spurs, CellSpursWorkloadId* wid,
 
             /* wid out-param is guest BE */
             vm_write32((u32)(uintptr_t)wid, i);
-            printf("[cellSpurs] AddWorkload(wid=%u, pm=%p, size=%u)\n",
-                   i, pm, sizePm);
+            printf("[cellSpurs] AddWorkload(wid=%u, pm=%p, size=%u, arg=0x%llx)\n",
+                   i, pm, sizePm, (unsigned long long)data);
             /* SPU_PM_DUMP=<dir>: write the guest's policy module out as it is
              * registered. The image a title hands to SPURS is not always one
              * that extract_spu_images.py can find in the EBOOT -- Uncharted's
@@ -1439,8 +1440,33 @@ static DWORD WINAPI spurs_kernel_thread(LPVOID p)
     int watch = getenv("SPURS_KERN_WATCH") ? 1 : 0;
     int changes_logged = 0;
 
+    /* SPURS_KERN_SPIN=0 ripristina la passata ogni 1 ms fissa. Misurato su
+     * Uncharted: ~360 corse del PM per fotogramma, ciascuna dopo Sleep(1) =
+     * il PPU aspetta il job manager per ~360 ms a fotogramma (2 fps) mentre
+     * questo thread dorme il 64% del tempo. Se nell'ultima passata un modulo
+     * ha trovato lavoro, la prossima parte subito (yield), come il PM vero
+     * che sulla SPU non esce mai dal suo ciclo. */
+    static int s_spin = -1;
+    if (s_spin < 0) { const char* e = getenv("SPURS_KERN_SPIN"); s_spin = (e && *e == '0') ? 0 : 1; }
+    static int s_pass_had_work;
     for (;;) {
-        Sleep(1);
+        if (s_spin && s_pass_had_work) { s_pass_had_work = 0;
+#ifdef _WIN32
+            SwitchToThread();
+#else
+            sched_yield();
+#endif
+        } else {
+            /* SPURS_KERN_SLEEP_US=<n>: pausa quando l'ultima passata non ha
+             * trovato lavoro (default 200 us; 1000 = il vecchio Sleep(1)). */
+            static long s_us = -1;
+            if (s_us < 0) { const char* e = getenv("SPURS_KERN_SLEEP_US"); s_us = e ? atol(e) : 200; }
+#ifdef _WIN32
+            Sleep(s_us >= 1000 ? (DWORD)(s_us / 1000) : 1);
+#else
+            { struct timespec ts = { 0, s_us * 1000L }; nanosleep(&ts, NULL); }
+#endif
+        }
         u32 ea = si->ea;
         if (!ea || s_pm_off) continue;
 
@@ -1670,7 +1696,7 @@ static DWORD WINAPI spurs_kernel_thread(LPVOID p)
              * an idle module exits immediately with polls==0. Grow the idle
              * streak on the latter, reset on the former. */
             if (g_spurs_pm_polls == 0) { if (s_idle[wid] < 8) s_idle[wid]++; }
-            else s_idle[wid] = 0;
+            else { s_idle[wid] = 0; s_pass_had_work = 1; }
             }
         }
     }

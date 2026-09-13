@@ -1,6 +1,6 @@
 # Stato del progetto
 
-Ultimo aggiornamento: **13 settembre 2026** — sessione 27 (quarta parte).
+Ultimo aggiornamento: **13 settembre 2026** — sessione 28.
 
 ## Dove siamo
 
@@ -418,6 +418,91 @@ La lista dei comandi ora viene percorsa fino in fondo — sei coppie
 risultati in memoria principale.** Non era mai successo in nessuna sessione.
 Riproducibile: **tre corse su tre**, identiche -- 14 comandi, un overlay
 residente, zero microstep, cinque stall e due interrupt per corsa.
+
+## Sessione 28 — l'assert della job list audio era il nostro kernel SPURS: r4 con il layout sbagliato
+
+**Assert `joblist.cpp(578) m_jobHeaderCommand == kNoJobYet` (thread 14,
+audio) RISOLTO: 4 corse su 4 da 120 s pulite, prima 4 su 6 (e 4 su 4 nelle
+ultime prove, fra 4 e 60 s dall'avvio).**
+
+Percorso, in ordine:
+
+1. Prima ipotesi (sbagliata, ma la correzione resta perche' e' giusta):
+   il commit del PUTLLC copiava tutta la linea da 128 byte, e un store del
+   PPU caduto fra il `memcmp` e la `memcpy` veniva annullato dalla copia
+   stantia. Ora il commit scrive SOLO i byte che la SPU ha cambiato rispetto
+   allo snapshot del GETLLAR (`SPU_PUTLLC_FULL=1` ripristina la copia
+   intera). Misura: 3 corse su 3 ancora con l'assert -> non era quello.
+2. Strumento nuovo, `SPU_WRING=<ea>:<len>`: anello delle ultime 48
+   scritture SPU (DMA PUT/GET e commit atomici) dentro una finestra guest,
+   con la catena host (i nomi delle funzioni SPU liftate) e i byte scritti;
+   `ppu_guest_trap` (l'assert del titolo) lo scarica insieme alla finestra.
+   Job list audio = wid 7, arg `0x108DFD00` (ora `AddWorkload` stampa
+   `arg=`). Alla trap: intestazione `00040001` (4 job, 1 preso), slot 0-3
+   scritti dal PPU, **slot 4-5 = `FFFFFFFF x4`**, scritti da un **DMA PUT di
+   16 byte dal PM** (`P20@B0`, LS 0xB00 -> EA list+0x40, funzione SPU
+   0x1E70, chiamata dall'entry del PM 0x2340 con r3 = spuNum e r4 = l'arg
+   grezzo). Il PPU accodava il job 4 e trovava lo slot non vuoto.
+3. La routine 0x1E70: `biz r4` (word 0), GET di 256 byte da r4.w0, poi PUT
+   di 0xFF a `+0x40 + 16*spuNum`: e' la gestione dell'**audit buffer** di
+   WwsJob, OPZIONALE, indirizzata dalla **meta' alta** dell'argomento del
+   workload. Il kernel SPURS vero (RPCS3 `cellSpursSpu.cpp`:
+   `spu.gpr[4]._u64[1] = wklInfo->arg`) passa l'arg come u64 big-endian
+   nelle parole 0-1: word0 = alta (0), word1 = bassa (la job list; il PM la
+   estrae con `shlqbyi r4,4`). Il nostro `spurs_policy.c` (sessione LBP)
+   metteva la EA della lista in ENTRAMBE le parole: word0 != 0 -> il PM
+   scambiava la job list per l'audit buffer e ci scriveva sopra.
+4. Fix in `runtime/spu/spurs_policy.c`: r4 = {hi, lo, 0, 0}.
+   `SPURS_PM_R4_LO=1` ripristina il vecchio layout per riprovare LBP (il
+   commento che lo giustificava diceva che con {hi,lo} "l'attach usciva
+   subito": e' l'audit che DEVE uscire subito quando non c'e').
+
+**Occlusion query vere (lavoro della sessione precedente, non ancora
+raccontato, ora misurato):** `NV4097_GET_REPORT` ZPASS -> visibility buffer
+Metal (`MTLVisibilityResultModeCounting`, uno slot da 8 byte per draw,
+anello di 3 buffer), `CLEAR_REPORT_VALUE` segna l'inizio; il completed
+handler somma gli slot e scrive il conteggio vero a ea+8
+(`rsx_report_set_value`). Nel livello: **216 report per fotogramma, 124
+visibili** (`RSX_OCCLUSION_DBG=1`); nel menu 4 report. `RSX_OCCLUSION=0` lo
+spegne (valore fisso). Il flip (`cellGcmTickFlip`, `GCM_FLIP_FIFO`) aspetta
+che la GPU abbia finito il fotogramma con i report, perche' il job 215 li
+legge subito dopo il flip; il present ora sta DOPO il flip nel ticker.
+Costo misurato e ripagato: rimandare il flip al tick dopo faceva 33 fps nel
+menu contro 55 senza occlusion; ora `rsx_metal_backend_gpu_wait(8 ms)` nel
+flip + **present su un secondo command buffer** (cosi' il completed handler
+dei report non aspetta il vsync del drawable): 2700 fotogrammi in 54 s
+(~50 fps) contro 2900 senza occlusion.
+
+**Kernel SPURS senza dormire fra le passate** (idem, sessione precedente):
+`SPURS_KERN_SPIN` (default 1): se l'ultima passata ha trovato lavoro la
+prossima parte subito (`sched_yield`), altrimenti pausa di
+`SPURS_KERN_SLEEP_US` (default 200; 1000 = il vecchio `Sleep(1)`).
+
+**Ritmo del gioco ora** (`RSX_FRAMESTAT=100`, corse `run_s28_c9..c15`):
+autosave/loghi/menu ~50 fps con ~19 draw; dal fotogramma ~2200 (63 s) il
+livello dive-boat: 376 poi **1094 draw per fotogramma a ~3 fps**, 97
+`RequestLevel` in 120 s. E' la fase lenta gia' misurata (PPU che spinna sul
+job manager in `func_0074232C`): resta il fronte.
+
+### Il prossimo passo (sessione 28)
+
+1. Velocita' del livello: 3 fps con 1094 draw. Profilare (`sample`) una
+   corsa dopo i 70 s: quanto e' PPU (`func_0074232C`), quanto walker/Metal
+   (1094 draw = 1094 render pass? no: passaggi per tratto di superficie),
+   quanto SPU (un solo thread SPURS). Un numero prima di toccare la
+   pianificazione.
+2. Corsa lunga (600 s) con `SPURS_IDLE_MAX=0`: il caricamento finisce
+   (regioni in stato 5, fade via)? Screenshot con `RSX_DUMP_FRAME` a 300+ s.
+3. Con `SPURS_PM_R4_LO` spento, riprovare LBP (lbp/) prima di
+   risincronizzare con l'upstream: il layout {lo,lo,hi,hi} era nato li'.
+
+### Strumenti nuovi (sessione 28)
+
+- `SPU_WRING=<ea>:<len>` (anello scritture SPU in una finestra, scaricato
+  alla trap del titolo; `[wring]`), `SPU_PUTLLC_FULL=1`, `SPURS_PM_R4_LO=1`,
+  `arg=` in `[cellSpurs] AddWorkload`.
+- `RSX_OCCLUSION=0`, `RSX_OCCLUSION_DBG=1` (`[occlusion] N report, M
+  visibili` per fotogramma), `SPURS_KERN_SPIN=0`, `SPURS_KERN_SLEEP_US=<n>`.
 
 ## Sessione 27 — il main loop non disegnava: CR6 mai scritto dai confronti vettoriali
 

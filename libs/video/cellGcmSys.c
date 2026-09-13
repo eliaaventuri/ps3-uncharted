@@ -663,7 +663,14 @@ void cellGcmTickFlip(void)
     { static int need = -1;
       if (need < 0) { const char* e = getenv("GCM_FLIP_FIFO"); need = (e && *e && *e != '0') ? 1 : 0; }
       if (need) { u32 put = vm_read32(GCM_CONTROL_GUEST_ADDR + 0);
-                  if (s_fifo_getoff != put) return; } }
+                  if (s_fifo_getoff != put) return;
+#ifdef __APPLE__
+                  /* ...e che la GPU abbia finito il fotogramma presentato: i
+                   * report delle occlusion query (GET_REPORT) vengono scritti
+                   * a GPU finita e il job 215 li legge subito dopo il flip. */
+                  { extern int rsx_metal_backend_gpu_wait(unsigned); if (!rsx_metal_backend_gpu_wait(8000)) return; }
+#endif
+                } }
     GCM_PENDING_SET(2);
 }
 

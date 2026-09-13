@@ -501,7 +501,23 @@ static int spu_mfc_atomic(spu_context* ctx, uint32_t cmd)
         resv_lock();
         if (ctx->resv_valid && ctx->resv_ea == ea &&
             memcmp(mem, ctx->resv_line, MFC_ATOMIC_LINE) == 0) {
-            memcpy(mem, ls, MFC_ATOMIC_LINE);          /* commit local store */
+            /* Commit ONLY the bytes the SPU changed since GETLLAR. The PPU
+             * stores to these lines without taking this lock (the lifted code
+             * writes guest memory directly), so a store that lands between the
+             * compare above and a whole-line copy would be silently undone by
+             * the SPU's stale copy of the untouched bytes. Seen on Uncharted:
+             * the audio thread's ResetList zeroes the WwsJob job headers that
+             * share the 128-byte line with the list core the job manager
+             * updates with PUTLLC; a full-line copy resurrected an old header
+             * and the next AddJob hit "m_jobHeaderCommand == kNoJobYet"
+             * (joblist.cpp:578). On real hardware the PPU store would drop
+             * the reservation instead. SPU_PUTLLC_FULL=1 restores the copy. */
+            static int s_full = -1;
+            if (s_full < 0) { const char* e = getenv("SPU_PUTLLC_FULL"); s_full = (e && *e && *e != '0') ? 1 : 0; }
+            if (s_full) memcpy(mem, ls, MFC_ATOMIC_LINE);   /* commit local store */
+            else for (int i = 0; i < MFC_ATOMIC_LINE; i++)
+                if (ls[i] != ctx->resv_line[i]) mem[i] = ls[i];
+            spu_wring_note(ctx, "PUTLLC", (uint32_t)ea, MFC_ATOMIC_LINE, ls);
             ctx->atomic_stat = 0;                      /* PUTLLC_SUCCESS */
         } else {
             ctx->atomic_stat = 1;                      /* PUTLLC_FAILURE -> retry */
@@ -529,6 +545,7 @@ static int spu_mfc_atomic(spu_context* ctx, uint32_t cmd)
     case MFC_PUTQLLUC_CMD:
         resv_lock();
         memcpy(mem, ls, MFC_ATOMIC_LINE);              /* unconditional store */
+        spu_wring_note(ctx, "PUTLLUC", (uint32_t)ea, MFC_ATOMIC_LINE, ls);
         ctx->resv_valid = 0; ctx->atomic_stat = 0;
         resv_unlock();
         return 1;
@@ -537,6 +554,8 @@ static int spu_mfc_atomic(spu_context* ctx, uint32_t cmd)
         return 0;
     }
 }
+
+void spu_wring_dump_ext(void) { spu_wring_dump(); }   /* per ppu_guest_trap */
 
 /* Per il watchdog delle corse del PM (spurs_policy.c): i tag completati. */
 uint32_t spu_mfc_tag_completed(spu_context* ctx)

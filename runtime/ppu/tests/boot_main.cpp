@@ -292,7 +292,6 @@ static DWORD WINAPI vblank_ticker(LPVOID)
         int fired = 0;
         while ((long long)(now - next_tick) >= 0 && fired < 240) {
             cellGcmTickVBlank();
-            cellGcmTickFlip();
             /* Present a pending flip BEFORE draining further: the flip fires
              * at a get==put frame boundary (guest thread), so the batch held
              * right now is exactly the completed frame. Presenting on a raw
@@ -304,6 +303,10 @@ static DWORD WINAPI vblank_ticker(LPVOID)
                     last_flip = cellGcm_flip_request_count();
                 }
             }
+            /* Il flip si completa DOPO il present: con le occlusion query il
+             * present aspetta la GPU e scrive i report veri prima che il
+             * titolo (job 215 del fotogramma dopo) li legga. */
+            cellGcmTickFlip();
             /* Drain the game's GCM FIFO every tick -- this writes the RSX sync-fence
              * labels (e.g. @0x03000410) that the game's per-frame logic blocks on.
              * Doing it here (not after present) keeps those fences advancing at 60Hz

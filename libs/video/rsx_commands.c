@@ -322,6 +322,14 @@ static void rsx_report_shadow_set(u32 ea, u32 val)
     for (u32 i = 0; i < RSX_REPORT_SHADOW_N; i++, h = (h + 1) & (RSX_REPORT_SHADOW_N - 1))
         if (s_rsh_ea[h] == ea || s_rsh_ea[h] == 0) { s_rsh_ea[h] = ea; s_rsh_val[h] = val; return; }
 }
+/* Per il backend: scrive il valore vero di un report ZPASS (ea+8) e aggiorna
+ * l'ombra, quando la GPU ha finito il fotogramma. */
+void rsx_report_set_value(u32 ea, u32 val)
+{
+    extern void vm_write32(uint32_t a, uint32_t v);
+    vm_write32(ea + 8, val);
+    rsx_report_shadow_set(ea, val);
+}
 int rsx_report_shadow_get(u32 ea, u32* val)
 {
     if (s_rsh_on <= 0) return 0;
@@ -391,7 +399,7 @@ int rsx_process_method(rsx_state* state, u32 method, u32 data)
      * ancora un'occlusion query in Metal: il conteggio ZPASS e' un valore
      * fisso non nullo (RSX_ZPASS_COUNT, default 0x1000 = "visibile"). */
     if (method == 0x01A8) { s_report_ctx = data; return 0; }
-    if (method == 0x17C8) { return 0; }             /* CLEAR_REPORT_VALUE */
+    if (method == 0x17C8) { if (s_backend && s_backend->report_clear) s_backend->report_clear(s_backend->userdata); return 0; }   /* CLEAR_REPORT_VALUE */
     if (method == 0x1800) {
         extern void vm_write32(uint32_t a, uint32_t v);
         u32 type = data >> 24, off = data & 0x00FFFFFFu, ea = 0;
@@ -402,7 +410,10 @@ int rsx_process_method(rsx_state* state, u32 method, u32 data)
         u32 val = (type == 1) ? (u32)s_zp : 0;
         if (ea) { unsigned long long ts = ps3_ms_now() * 1000ull;
             vm_write32(ea, (u32)(ts >> 32)); vm_write32(ea + 4, (u32)ts); vm_write32(ea + 8, val); vm_write32(ea + 12, 0);
-            rsx_report_shadow_set(ea, val); }
+            rsx_report_shadow_set(ea, val);
+            /* il conteggio vero arriva dal backend a fotogramma finito (RSX_OCCLUSION=0 lo spegne) */
+            { static int s_oq = -1; if (s_oq < 0) { const char* e = getenv("RSX_OCCLUSION"); s_oq = (e && *e == '0') ? 0 : 1; }
+              if (s_oq && type == 1 && s_backend && s_backend->report_zpass) s_backend->report_zpass(s_backend->userdata, ea); } }
         { static int _n = 0; if (_n++ < 4 || getenv("RSX_REPORT_DBG")) fprintf(stderr, "[RSX] report tipo %u offset 0x%06X -> ea 0x%08X = %u (ctx 0x%08X)\n", type, off, ea, val, s_report_ctx); }
         return 0;
     }
