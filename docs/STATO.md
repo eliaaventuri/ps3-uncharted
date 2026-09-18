@@ -1,6 +1,7 @@
 # Stato del progetto
 
-Ultimo aggiornamento: **13 settembre 2026** — sessione 28.
+Ultimo aggiornamento: **18 settembre 2026** — sessione 29 (lavoro del 14 settembre,
+documentato il 18).
 
 ## Dove siamo
 
@@ -124,6 +125,19 @@ un puntatore nullo letto dai propri dati, e la scena 3D non si vede ancora
 (nero: i buchi dei draw nei buffer SPU restano NOP). Tastiera = pad 0 nella
 finestra (frecce, Spazio/X = CROSS, C = CERCHIO, Invio = START); `PAD_SCRIPT`
 per le corse senza nessuno. Dettagli in "Sessione 27".
+
+**Dalla sessione 29 il livello si vede a schermo, con l'HUD.**
+`docs/img_s29_dive_boat_display.png`: il ponte della dive-boat con casse e
+pavimento texturizzati, cielo con nuvole, "1 Ambushed", "Press (O) to take
+cover when next to an object", il contatore "40". Quattro difetti in fila
+(dettagli in "Sessione 29"): le costanti dei fragment program fuori
+dall'hash della cache (da 8192 "programmi" a ~120), la copia
+memoria-a-memoria della RSX (NV0039) con cui il titolo compatta il proprio
+heap texture (senza, cielo/pavimento/sfondo di pausa a rumore), le texture
+in streaming che la cache serviva stantie dal primo bind, e le normali
+compresse (tipo CMP) non decodificate. Restano triangoli neri in alto a
+sinistra, superfici verdi piatte a destra, ~1.000 draw per fotogramma
+scartati dal tetto `MTL_MAX_VERTS`, ~8 fps.
 
 Quanto arriva a fare, dal log:
 
@@ -418,6 +432,94 @@ La lista dei comandi ora viene percorsa fino in fondo — sei coppie
 risultati in memoria principale.** Non era mai successo in nessuna sessione.
 Riproducibile: **tre corse su tre**, identiche -- 14 comandi, un overlay
 residente, zero microstep, cinque stall e due interrupt per corsa.
+
+## Sessione 29 — il livello a schermo: costanti FP, NV0039, texture in streaming, normali CMP
+
+Lavoro del 14 settembre (corse `run_s29_c1..c25`, ~60-120 s l'una), non
+documentato al momento e ricostruito il 18 dal codice e dai log. Il worker
+Gemini ha estratto i numeri delle corse, poi e' caduto (quota): il resoconto
+e' fatto sui commenti "sessione 29" nel codice e sui `RSX_FRAMESTAT`.
+
+**1. Costanti dei fragment program fuori dall'hash (passo 0 della s.28,
+RISOLTO).** Il titolo patcha le costanti dentro il microcodice FP a ogni draw
+(job SPU): la cache per contenuto vedeva un programma nuovo per ogni
+variante (8192 piene in ~2.400 fotogrammi, poi tutti i draw con la coppia
+incorporata). Ora hash e MSL sono strutturali (`rsx_fp_structural_hash`,
+decompilazione in modalita' buffered: `fp_constants[]` in `[[buffer(1)]]`)
+e i valori vanno per draw in un'arena da 16 MB (`s_fpc`, `fpc_block`,
+blocchi allineati a 256, dedup con il blocco precedente). Misura: **~120 FP
+e ~28 VP distinti per corsa**, arena 86-116 KB per fotogramma.
+
+**2. NV0039 (`cellGcmSetTransferData`, copia memoria-a-memoria della RSX)
+NON ERA IMPLEMENTATO (RISOLTO).** Uncharted compatta il proprio heap texture
+in `func_004D19B8`: un blocco per fotogramma spostato in basso della misura
+del buco, con il descrittore aggiornato subito e la copia affidata alla RSX
+nell'ordine della FIFO. Senza la copia i descrittori puntavano a dati non
+spostati: le texture grandi (cielo, pavimento, sfondo di pausa) uscivano a
+rumore con le prime righe di spazzatura (`docs/img_s29_prima_del_nv0039.png`:
+cielo a coriandoli verdi, pavimento ciano). Ora `nv0039_copy` in
+`cellGcmSys.c` (lineare o per righe, `memmove` perche' sorgente e
+destinazione si sovrappongono; `GCM_NV0039=0` la spegne, `[NV0039]` nel
+log: 4 copie da 4 MB nella corsa c25).
+
+**3. Texture in streaming servite stantie (RISOLTO).** Il primo bind di una
+texture trova l'indirizzo con dati parziali, e la cache per (offset, formato,
+misura) serviva per sempre quella decodifica. Ora ogni voce porta
+un'impronta dei byte guest (`tex_fingerprint`: 64 campioni da 16 byte, ~1 KB
+letto): se cambia, la voce viene ridecodificata; la texture vecchia resta
+viva fino a fine fotogramma (`s_tex_graveyard`, i draw registrati la puntano
+senza ritenerla). `RSX_TEX_FP=0` spegne il controllo; `redec=` in
+`RSX_FRAMESTAT` (9-12 ridecodifiche per corsa).
+
+**4. Normali compresse (RISOLTO).** Il tipo di attributo 6 (CMP: x/y/z a
+11/11/10 bit con segno in una parola BE, RPCS3 `RSXVertexFetch.glsl`) non era
+gestito in `rsx_vertex_fetch.c`; Uncharted ci mette le normali (attributo 2,
+size 1): ogni superficie illuminata usciva a rumore.
+
+**5. Pad.** `LBP_AUTOPRESS=0` ora vuol dire spento (prima contava come
+acceso); `LBP_AUTOPRESS_UNTIL=<s>` (in `run.sh`: 28) ferma gli impulsi dopo
+s secondi, perche' nel livello START mette in pausa e CROSS fa saltare o
+sparare.
+
+**Esperimento aperto: `RSX_EQUAL_LEQUAL=<bias>`.** Il passaggio di colore
+usa il test di profondita' EQUAL contro lo z del prepass e su alcune mesh
+fallisce (pavimento e fondale mostrano il colore del prepass, mai coperto):
+la variabile forza LEQUAL con un depth bias negativo sul draw. Non e' un
+fix: la causa (z del prepass diverso da quello del passaggio di colore,
+probabilmente per un VP/attributi diversi fra i due) e' da trovare.
+
+**Ritmo delle corse (`RSX_FRAMESTAT=100`):** 2.300-2.800 fotogrammi in
+~120 s, 7,4-8,3 fps nel livello con 5.500-6.000 draw per fotogramma;
+**`dropped` 200-1.500 draw per fotogramma** (`MTL_MAX_VERTS` = 1M vertici:
+il tetto scarta geometria vera, da alzare o da spezzare in piu' command
+buffer); c7 e c13 sono cadute con SIGSEGV fuori dalla finestra guest con
+`RSX_VP_DBG`/`RSX_VP_DBG_STAT` attivi (diagnostica, non riprodotta senza).
+
+### Fronte aperto (dopo la sessione 29)
+
+1. **Triangoli neri** grandi in alto a sinistra del display (davanti al
+   cielo) e **superfici verdi piatte** a destra (ponte/oggetti lontani):
+   `RSX_FP_PROBE=all` (colore = hash del programma) sul dump della
+   superficie per risalire al programma; poi `RSX_FP_PROBE=<hash>:<espr>`
+   per capire quale ingresso porta il difetto.
+2. `MTL_MAX_VERTS`: ~1.000 draw scartati per fotogramma.
+3. L'EQUAL del passaggio di colore (vedi sopra).
+4. Velocita': 8 fps, nessun thread saturo (s.28).
+
+### Strumenti nuovi (sessione 29)
+
+- `RSX_TEXOFF_TRACE=<lo>:<hi>` (`[texoff]`: ogni SET_TEXTURE_OFFSET nella
+  finestra, con l'indirizzo FIFO della parola, per risalire con `SPU_WRING` a
+  chi l'ha scritta), `RSX_TEX_TRACE=<w>x<h>` (`[textrace]`: ogni cambio di
+  offset di una texture di quella misura), `RSX_TEX_SAVE=<n>` (quante
+  salvarne) + `RSX_TEX_SAVE_WH=<w>x<h>[/<fmt>]` (solo quelle: gli offset
+  cambiano da corsa a corsa), `RSX_TEX_FP=0`.
+- `RSX_FP_PROBE=<hash>:<espressione MSL>[;...]` (il programma esce con
+  quell'espressione, es. `float4(input.tc0.xy,0,1)`), `RSX_FP_PROBE=all`
+  (colore = 24 bit dell'hash), `RSX_FP_DUMP=<hash>` (anche per hash, non solo
+  per indirizzo), `RSX_EQUAL_LEQUAL=<bias>`, `RSX_VP_DBG_STAT=1` (min/max di
+  ogni attributo su tutti i vertici del draw), `attr_ts` in `RSX_DRAWLIST`
+  ((tipo<<4)|size degli attributi abilitati), `GCM_NV0039=0`.
 
 ## Sessione 28 — l'assert della job list audio era il nostro kernel SPURS: r4 con il layout sbagliato
 
