@@ -497,23 +497,51 @@ cielo e il disegno circolare della bombola sulla schiena, il container verde
 acido e' diventato grigio-azzurro: la tavolozza e' quella di RPCS3.
 `RSX_CUBE=0` per l'A/B, `RSX_CUBE_DBG=1` stampa cubemap e varianti.
 
-**Il personaggio E' a pezzi** (correzione della nota di s.30): in RPCS3 sta in
-piedi con le braccia lungo i fianchi; da noi la mano fluttua sopra la testa,
-il busto e' deformato e delle gambe restano frammenti ai piedi. Skinning o
-matrici delle ossa: e' il fronte.
+**Il personaggio ERA a pezzi, e non era lo skinning: era `fi`.** (Correzione
+della nota di s.30: in RPCS3 Drake sta in piedi con le braccia lungo i
+fianchi; da noi la mano fluttuava sopra la testa, il busto era deformato e
+delle gambe restavano frammenti.) `spu_fi(a, b)` faceva il passo di Newton
+del reciproco `b*(2-a*b)`: giusto dopo `frest`, SBAGLIATO dopo `frsqest`
+(b = 1/sqrt(a): con a=4 dava 0, con a=0.25 dava 3). Sull'hardware `fi`
+completa l'una o l'altra stima leggendo il passo codificato nei bit bassi
+della stima; le nostre stime sono gia' esatte, quindi `fi` e' l'identita'.
+Ogni normalizzazione di vettori/quaternioni del codice SPU (skinning,
+normali, camera) passa da `frsqest+fi` (es. job 215 a 0x...: `frsqest; fi;
+fm; fnms; fma` = sqrt con un passo di Newton). Risultato
+(`docs/img_s31_drake_fi.jpg`): Drake intero, in piedi, muta, gambe e piedi
+nudi, e ANCHE la camera e' ora quella di RPCS3 (dietro di lui, vicina).
+Insieme: `frsqest` in valore assoluto e senza inf (0 -> float massimo, come
+la saturazione dell'hardware), `frest(0)` idem; e due UB trovati con UBSan
+sui moduli liftati (`SPU_OPT="-O1 -fsanitize=undefined" SPU_LDFLAGS=
+-fsanitize=undefined RT_BUILD=build-ubsan ./build.sh`): NaN -> int in
+`cflts/cfltu` (ora 0) e `<< 16` di un prodotto negativo in `mpyh` (ora
+senza segno). Resta sul personaggio una semi-trasparenza (gambe e pistola si
+vedono attraverso).
 
-**Meta' dei fotogrammi presentati e' PIATTA** (misurato con `RSX_DUMP_COUNT=10`:
-OK OK PIATTO PIATTO OK OK ..., colore uniforme 0x363A4E + HUD, ~2000 draw
-anche loro). Preesistente (`RSX_CUBE=0` uguale). Da capire: composizione che
-legge la superficie sbagliata a fotogrammi alterni, o artefatto del dump.
+**Trappola costata due ore: `RSX_DUMP_COUNT>1` rompe i fotogrammi dopo il
+primo.** Con `RSX_DUMP_COUNT=4` il fotogramma 1 e' giusto, 2 e 3 escono
+PIATTI (colore uniforme 0x363A4E + HUD) e il 4 esce con le sagome piatte e il
+ponte mancante: NON e' il gioco, e' il percorso del dump (readback/stato dopo
+il primo salvataggio). L'avevo preso per una regressione del rebuild dei
+moduli SPU (ho cancellato `obj/spu_*.o` e ricompilato: identico, era il
+dump). Regola: per un confronto UN solo dump per corsa (`RSX_DUMP_COUNT=1`,
+o `RSX_DRAWLIST_AFTER=<n> RSX_DUMP_FRAME=100000`). Da sistemare il dump, o
+misurare "meta' fotogrammi piatti" con uno screenshot della finestra.
+`build.sh`: con `set -e`, un `.o` mancante faceva uscire lo script in
+silenzio nel controllo degli header (`hdr_new`): corretto; `RT_BUILD=<dir>`
+sceglie la libreria runtime, `SPU_LDFLAGS` va al link.
 
 ### Fronte aperto (dopo la sessione 31)
 
-1. Skinning del personaggio (v. sopra). Confronto: `img_s31_rpcs3_dive_boat.jpg`.
-2. Fotogrammi piatti alternati.
+1. Semi-trasparenza del personaggio (gambe/pistola visibili attraverso il
+   corpo, `img_s31_drake_fi.jpg`); confronto: `img_s31_rpcs3_dive_boat.jpg`.
+2. Il dump multi-fotogramma (`RSX_DUMP_COUNT>1`) corrompe i fotogrammi
+   successivi; verificare se anche a schermo alterna fotogrammi piatti.
 3. RPCS3 dice anche: `TEX3D` in 62 punti (volumi, unit 1/2) e `TEX1D(15)` —
    da noi tutto 2D. Da verificare cosa si perde.
-4. Stallo del report (s.30), velocita' 8 fps.
+4. Audit degli helper SPU contro RPCS3 (`tasks/TASK.md`, Gemini era a quota
+   esaurita): `fi` e' il precedente per cui vale la pena.
+5. Stallo del report (s.30), velocita' 8 fps.
 
 ## Sessione 30 — il livello come nel gioco: draw coalescenti, maschera di colore, crash del present
 

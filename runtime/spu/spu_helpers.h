@@ -117,8 +117,13 @@ static inline u128 spu_mpy(u128 a, u128 b)  { u128 r; for(int i=0;i<4;i++) r._s3
 static inline u128 spu_mpya(u128 a, u128 b, u128 c) { u128 r; for(int i=0;i<4;i++) r._s32[i]=(int32_t)a._s16[i*2]*(int32_t)b._s16[i*2]+c._s32[i]; return r; }
 /* sfx: extended subtract rb-ra-1+carry; carry-in = low bit of old rt (RT is 3rd src). */
 static inline u128 spu_sfx(u128 a, u128 b, u128 t) { u128 r; for(int i=0;i<4;i++) r._u32[i]=b._u32[i]+~a._u32[i]+(t._u32[i]&1u); return r; }
-/* fi: floating interpolate (reciprocal refine after frest) — Newton-step approximation. */
-static inline u128 spu_fi(u128 a, u128 b)   { u128 r; for(int i=0;i<4;i++){ float y=b._f32[i]; r._f32[i]=y*(2.0f-a._f32[i]*y); } return r; }
+/* fi: floating interpolate. On hardware it completes the estimate of frest OR
+ * frsqest (the step is encoded in the estimate's low mantissa bits). Our
+ * estimates are already exact, so fi is the identity: the old Newton step
+ * b*(2-a*b) was right after frest but wrong after frsqest (b = 1/sqrt(a):
+ * a=4 gave 0, a=0.25 gave 3), and every SPU vector normalization goes through
+ * frsqest+fi -- the skinned character came out with scaled/collapsed limbs. */
+static inline u128 spu_fi(u128 a, u128 b)   { (void)a; return b; }
 static inline u128 spu_mpyu(u128 a, u128 b) { u128 r; for(int i=0;i<4;i++) r._u32[i]=(uint32_t)a._u16[i*2]*(uint32_t)b._u16[i*2]; return r; }
 static inline u128 spu_mpyi(u128 a, int32_t imm) { u128 r; for(int i=0;i<4;i++) r._s32[i]=(int32_t)a._s16[i*2]*(int16_t)imm; return r; }
 
@@ -247,9 +252,9 @@ static inline u128 spu_fs(u128 a, u128 b) { u128 r; for(int i=0;i<4;i++) r._f32[
  * (job 215, `cflts $r,$r,172` on the projected vertices) saw every triangle as
  * degenerate and drew nothing. */
 static inline u128 spu_cflts(u128 a, int i8){ u128 r; float f=exp2f((float)(173-i8));
-    for(int i=0;i<4;i++){ double v=(double)a._f32[i]*f; if(v>2147483647.0)v=2147483647.0; if(v<-2147483648.0)v=-2147483648.0; r._s32[i]=(int32_t)v; } return r; }
+    for(int i=0;i<4;i++){ double v=(double)a._f32[i]*f; if(v!=v)v=0; if(v>2147483647.0)v=2147483647.0; if(v<-2147483648.0)v=-2147483648.0; r._s32[i]=(int32_t)v; } return r; }   /* NaN -> 0 (era UB) */
 static inline u128 spu_cfltu(u128 a, int i8){ u128 r; float f=exp2f((float)(173-i8));
-    for(int i=0;i<4;i++){ double v=(double)a._f32[i]*f; if(v<0)v=0; if(v>4294967295.0)v=4294967295.0; r._u32[i]=(uint32_t)v; } return r; }
+    for(int i=0;i<4;i++){ double v=(double)a._f32[i]*f; if(v!=v)v=0; if(v<0)v=0; if(v>4294967295.0)v=4294967295.0; r._u32[i]=(uint32_t)v; } return r; }   /* NaN -> 0 (era UB) */
 static inline u128 spu_csflt(u128 a, int i8){ u128 r; float f=exp2f((float)(i8-155));
     for(int i=0;i<4;i++) r._f32[i]=(float)a._s32[i]*f; return r; }
 static inline u128 spu_cuflt(u128 a, int i8){ u128 r; float f=exp2f((float)(i8-155));
@@ -373,16 +378,19 @@ static inline u128 spu_sumb(u128 a, u128 b) {
 static inline u128 spu_bg(u128 a, u128 b)   { u128 r; for(int i=0;i<4;i++) r._u32[i]=(uint32_t)(((uint64_t)b._u32[i]+(uint64_t)(~a._u32[i])+1u)>>32); return r; }
 static inline u128 spu_addx(u128 a, u128 b, u128 t) { u128 r; for(int i=0;i<4;i++) r._u32[i]=a._u32[i]+b._u32[i]+(t._u32[i]&1); return r; }
 /* LE host: high half of word i = _s16[2i+1], low half = _s16[2i]. */
-static inline u128 spu_mpyh(u128 a, u128 b) { u128 r; for(int i=0;i<4;i++) r._s32[i]=((int32_t)a._s16[2*i+1] * (int32_t)b._s16[2*i]) << 16; return r; }
+static inline u128 spu_mpyh(u128 a, u128 b) { u128 r; for(int i=0;i<4;i++) r._u32[i]=(uint32_t)((int32_t)a._s16[2*i+1] * (int32_t)b._s16[2*i]) << 16; return r; }   /* shift senza segno: << di un negativo e' UB */
 static inline u128 spu_mpyhh(u128 a, u128 b){ u128 r; for(int i=0;i<4;i++) r._s32[i]=(int32_t)a._s16[2*i+1] * (int32_t)b._s16[2*i+1]; return r; }
 static inline u128 spu_mpys(u128 a, u128 b) { u128 r; for(int i=0;i<4;i++){ int32_t p=(int32_t)a._s16[2*i]*(int32_t)b._s16[2*i]; r._s32[i]=(int16_t)(p>>16); } return r; }
 static inline u128 spu_mpyui(u128 a, int32_t imm) { u128 r; for(int i=0;i<4;i++) r._u32[i]=(uint32_t)a._u16[2*i]*(uint32_t)(uint16_t)imm; return r; }
 static inline u128 spu_fcmeq(u128 a, u128 b){ u128 r; for(int i=0;i<4;i++){ float fa=fabsf(a._f32[i]),fb=fabsf(b._f32[i]); r._u32[i]=(fa==fb)?0xFFFFFFFFu:0; } return r; }
 static inline u128 spu_fcmgt(u128 a, u128 b){ u128 r; for(int i=0;i<4;i++){ float fa=fabsf(a._f32[i]),fb=fabsf(b._f32[i]); r._u32[i]=(fa>fb)?0xFFFFFFFFu:0; } return r; }
-static inline u128 spu_frsqest(u128 a){ u128 r; for(int i=0;i<4;i++) r._f32[i]= a._f32[i]>0.0f ? 1.0f/sqrtf(a._f32[i]) : 0.0f; return r; }
-/* frest: reciprocal estimate (refined by the following spu_fi Newton step).
- * Full-precision 1/x is exact after fi and >= HW-estimate accuracy. */
-static inline u128 spu_frest(u128 a){ u128 r; for(int i=0;i<4;i++) r._f32[i]= 1.0f/a._f32[i]; return r; }
+/* frsqest: 1/sqrt(|a|) (the sign is ignored, CBEA). The SPU has no inf: a
+ * zero gives the largest float instead of inf (which would turn into NaN on
+ * the first 0*inf downstream, where hardware gives a finite value). */
+static inline u128 spu_frsqest(u128 a){ u128 r; for(int i=0;i<4;i++){ float x=fabsf(a._f32[i]); r._f32[i]= x>0.0f ? 1.0f/sqrtf(x) : 3.4028235e38f; } return r; }
+/* frest: reciprocal estimate; exact 1/x (fi is then the identity). Zero ->
+ * largest float with the sign of the input, as the hardware saturates. */
+static inline u128 spu_frest(u128 a){ u128 r; for(int i=0;i<4;i++){ float x=a._f32[i]; r._f32[i]= x!=0.0f ? 1.0f/x : copysignf(3.4028235e38f, x); } return r; }
 
 /* ---- Phase 3: sign extension ----
  * LE host: low sub-lane = _u8[2i] / _s16[2i] / _s32[2i] (the byte/half/word
