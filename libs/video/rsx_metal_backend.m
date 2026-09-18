@@ -2163,6 +2163,13 @@ void rsx_metal_backend_present(void)
                           i, d->surf, cellGcmOffsetIsDisplay(d->surf) ? "*" : " ", d->surf_fmt, d->color_target, d->surf_pitch0, d->surf1, d->zeta_off, d->depth_test, d->depth_func, d->depth_mask, d->shader_ctrl,
                           d->vp >= 0 ? "" : "-", d->vp >= 0 ? s_vps[d->vp].hash : 0u, d->fp_addr, d->fp_hash, d->count, (int)d->topology,
                           d->blend_enable, d->blend_sfactor, d->blend_dfactor, d->color_mask, d->cull, d->attr0_off, d->first, d->shadow_key, d->sx, d->sy, d->sw, d->sh);
+                  /* RSX_DRAWLIST_FPC=<hash>: le costanti inline (fp_constants[]) del primo draw con quel FP (s.30) */
+                  { static long s_fpch = -2; static int s_done2 = 0; if (s_fpch == -2) { const char* e = getenv("RSX_DRAWLIST_FPC"); s_fpch = e ? (long)strtoul(e, 0, 16) : -1; }
+                    if (!s_done2 && s_fpch >= 0 && (long)d->fp_hash == s_fpch && d->fpc_n && s_fpc) { s_done2 = 1;
+                        const float* c = (const float*)(s_fpc + d->fpc_off);
+                        fprintf(stderr, "\n[fpc] fp %08X: %u costanti", d->fp_hash, d->fpc_n);
+                        for (u32 k = 0; k < d->fpc_n; k++) fprintf(stderr, "%s c%u=(%g %g %g %g)", (k % 4) ? "" : "\n[fpc]  ", k, c[k*4], c[k*4+1], c[k*4+2], c[k*4+3]);
+                        fprintf(stderr, "\n"); } }
                   /* il microcodice del FP e' ancora quello del draw? (anello riusato) */
                   if (d->fp_addr) { u32 hn = fp_ucode_hash(d->fp_addr); if (hn != d->fp_hash) fprintf(stderr, " fp-ora=%08X", hn); }
                   for (u32 t = 0; t < RSX_MAX_TEXTURES; t++) if (d->tex[t])

@@ -550,6 +550,21 @@ Il personaggio (Drake) usciva nero e "a pezzi". Misure e fix, in ordine:
   personaggio scuro. Il blocco piatto sotto il personaggio in
   `img_s30_cull.png` e' la sua ombra sul ponte (il termine 0 li' e' giusto,
   ma la resa piatta no: con FORCE=0 il ponte in ombra ha la texture).
+- Ultime misure (sera): il pass forward disegna SOLO la testa (27 chunk di
+  vp 7BC2B163 = pelle/capelli); la giacca e le gambe sono differite (color
+  pass 806F9D7E/1002B8B8 + composizione) e ANCHE loro leggono la shadow map
+  (con `RSX_SHADOW_FORCE=1` la giacca esce bianca, con la lettura vera resta
+  scura). Le costanti inline del FP 5F6F3ABD (`RSX_DRAWLIST_FPC=5F6F3ABD`,
+  53 costanti) sono plausibili: c24=(1,0,0,0), c31=(0.0021,-0.0033,-0.0028,
+  0.622), c36=(0.9994,0,0.889,0.671); tc4 = o[11] del VP = posizione MONDO
+  (dot con c4..c6) con w = clip w. Il riferimento e' quindi
+  `0.9994 * (pos_mondo . c31.xyz + 0.622)`, cioe' una profondita' in spazio
+  luce LEGGERMENTE minore dello z del caster stesso: con la semantica GL
+  (ref >= texel, RPCS3 la usa cosi') un ricevitore illuminato che e' anche
+  caster fallisce sempre. O la shadow map del titolo e' "invertita" (piu'
+  grande = piu' vicino) e il nostro pass la scrive al contrario, o il
+  confronto va fatto sul texel a 16 bit. Serve l'oracolo: RPCS3 con
+  RenderDoc sullo stesso fotogramma (shadow map 03EE0000 e zfunc).
 - Misure fatte e scartate: `RSX_DEPTH_CLAMP` (nessun effetto), il
   ricontrollo dei buchi di zeri nelle CALL (`GCM_ZERO_TRACE=50`: 919 su 1,3
   milioni scritti dopo il passaggio del walker, tutti parole 00020000 /
