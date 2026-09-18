@@ -76,6 +76,7 @@ typedef struct {
     u32 surf;        /* surface_color_offset[0] al momento del draw          */
     u32 sx, sy, sw, sh;  /* rettangolo di ritaglio (scissor) al momento del draw */
     float vx, vy, vw, vh;  /* viewport del guest (SET_VIEWPORT scale/offset) in pixel della superficie, s.30 */
+    u8  cull;              /* 0 = niente, 1 = BACK, 2 = FRONT, 3 = entrambe (SET_CULL_FACE_ENABLE/CULL_FACE, s.30); bit 4 = front face CW */
     u32 surf_w, surf_h;  /* dimensione della superficie (SURFACE_CLIP) al momento del draw */
     u32 tex_off[RSX_MAX_TEXTURES]; /* offset guest delle texture legate (per RSX_DRAWLIST) */
     u32 tex_fmt[RSX_MAX_TEXTURES]; /* formato (TEXTURE_FORMAT) delle texture legate */
@@ -117,6 +118,18 @@ static id<MTLLibrary> guest_fp_library(u32 fp_addr, int vp, u32 ctrl, u32 mrt, u
  * superficie) va bene, ma le due cascate delle shadow map di Uncharted sono
  * viewport da 1216x1216 nelle due meta' di una superficie 2432x1216 e i
  * caster finivano fuori dal ritaglio: shadow map vuote, tutto in ombra. */
+/* Culling (s.30): SET_CULL_FACE 0x0404 = FRONT, 0x0405 = BACK, 0x0408 = FRONT_AND_BACK;
+ * SET_FRONT_FACE 0x0900 = CW, 0x0901 = CCW (default). Non era applicato: le
+ * shadow map tenevano le facce davanti invece di quelle dietro. RSX_CULL=0 spegne. */
+static u8 cull_from_state(const rsx_state* st)
+{
+    static int s_on = -1; if (s_on < 0) { const char* e = getenv("RSX_CULL"); s_on = (e && *e == '0') ? 0 : 1; }
+    if (!st || !s_on) return 0;
+    u8 c = 0;
+    if (st->cull_face_enable) c = (st->cull_face == 0x0404u) ? 2 : (st->cull_face == 0x0408u) ? 3 : 1;
+    if (st->front_face == 0x0900u) c |= 0x10;
+    return c;
+}
 static void draw_viewport_setup(MtlDraw* d, const rsx_state* st)
 {
     if (!st || st->viewport_scale[0] == 0.0f || st->viewport_scale[1] == 0.0f) { d->vx = d->vy = 0; d->vw = d->vh = 0; return; }
@@ -776,6 +789,7 @@ static void record_draw(const rsx_state* st, u32 prim, u32 base, u32 count,
     d->sx = st->scissor_x; d->sy = st->scissor_y;
     d->sw = st->scissor_w; d->sh = st->scissor_h;
     draw_viewport_setup(d, st);
+    d->cull = cull_from_state(st);
     if (vpdbg_common(d, st, prim, wrote, "array")) {
           for (int a = 0; a < 16; a++) if (s_vps[d->vp].mask & (1u << a))
               fprintf(stderr, "[vpdbg]   attr%d: fmt=%08X off=%08X\n", a, st->vertex_attribs[a].format, st->vertex_attribs[a].offset);
@@ -915,6 +929,7 @@ done:
     d->sx = s_state ? s_state->scissor_x : 0; d->sy = s_state ? s_state->scissor_y : 0;
     d->sw = s_state ? s_state->scissor_w : 4096; d->sh = s_state ? s_state->scissor_h : 4096;
     draw_viewport_setup(d, s_state);
+    d->cull = cull_from_state(s_state);
     if (s_state) vpdbg_common(d, s_state, primitive, wrote, "inline");
 
     memset(d->mvp, 0, sizeof d->mvp);
@@ -1136,7 +1151,14 @@ static id<MTLDepthStencilState> dss_for(int test, u32 func, int mask)
      * draw): esperimento sul passaggio di colore che fallisce l'EQUAL con lo
      * z del prepass su alcune mesh (sessione 29: rumore su pavimento e
      * fondale = il colore del prepass mai coperto) */
-    static int s_eql = -2; if (s_eql == -2) { const char* e = getenv("RSX_EQUAL_LEQUAL"); s_eql = e ? 1 : 0; }
+    /* Default ACCESO (s.30): la RSX confronta z a 24 bit FISSI, quindi due
+     * vertex program che calcolano la stessa posizione con arrotondamenti
+     * diversi (prepass con MVP, colore con world*viewproj) danno lo stesso z;
+     * il nostro Depth32Float no, e l'EQUAL del passaggio di colore falliva a
+     * chunk interi (pavimento, gambe: restava il colore di clear decodificato,
+     * blocchi piatti grigio-blu). LEQUAL + 4 ulp di bias emula la tolleranza.
+     * RSX_EQUAL_LEQUAL=0 spegne, =<n> cambia il bias. */
+    static int s_eql = -2; if (s_eql == -2) { const char* e = getenv("RSX_EQUAL_LEQUAL"); s_eql = (e && *e == '0') ? 0 : 1; }
     if (s_eql && test && (func & 7) == 2) func = 3;
     static id<MTLDepthStencilState> cache[2][8][2];
     u32 f = test ? (func & 7) : 7; int t = test ? 1 : 0, m = (test && mask) ? 1 : (test ? 0 : 0);
@@ -2137,10 +2159,10 @@ void rsx_metal_backend_present(void)
                       s_frame_no, s_draw_count, s_vert_count, s_cb_count);
               for (u32 i = 0; i < s_draw_count; i++) {
                   const MtlDraw* d = &s_draws[i];
-                  fprintf(stderr, "[drawlist] #%-3u surf=%08X%s[fmt=%X ct=%X pitch=%u B=%X Z=%X dt=%d/%X/%d sc=%X] vp=%s%08X fp=%08X/%08X n=%-5u topo=%d blend=%d(%03X,%03X) cm=%X va=%08X+%u sh=%X sc=%u,%u %ux%u tex:",
+                  fprintf(stderr, "[drawlist] #%-3u surf=%08X%s[fmt=%X ct=%X pitch=%u B=%X Z=%X dt=%d/%X/%d sc=%X] vp=%s%08X fp=%08X/%08X n=%-5u topo=%d blend=%d(%03X,%03X) cm=%X cull=%X va=%08X+%u sh=%X sc=%u,%u %ux%u tex:",
                           i, d->surf, cellGcmOffsetIsDisplay(d->surf) ? "*" : " ", d->surf_fmt, d->color_target, d->surf_pitch0, d->surf1, d->zeta_off, d->depth_test, d->depth_func, d->depth_mask, d->shader_ctrl,
                           d->vp >= 0 ? "" : "-", d->vp >= 0 ? s_vps[d->vp].hash : 0u, d->fp_addr, d->fp_hash, d->count, (int)d->topology,
-                          d->blend_enable, d->blend_sfactor, d->blend_dfactor, d->color_mask, d->attr0_off, d->first, d->shadow_key, d->sx, d->sy, d->sw, d->sh);
+                          d->blend_enable, d->blend_sfactor, d->blend_dfactor, d->color_mask, d->cull, d->attr0_off, d->first, d->shadow_key, d->sx, d->sy, d->sw, d->sh);
                   /* il microcodice del FP e' ancora quello del draw? (anello riusato) */
                   if (d->fp_addr) { u32 hn = fp_ucode_hash(d->fp_addr); if (hn != d->fp_hash) fprintf(stderr, " fp-ora=%08X", hn); }
                   for (u32 t = 0; t < RSX_MAX_TEXTURES; t++) if (d->tex[t])
@@ -2283,6 +2305,12 @@ void rsx_metal_backend_present(void)
              * zclamp): i caster delle shadow map finivano fuori da [0,1]? */
             { static int s_dc = -1; if (s_dc < 0) s_dc = getenv("RSX_DEPTH_CLAMP") ? 1 : 0;
               if (s_dc) [enc setDepthClipMode:MTLDepthClipModeClamp]; }
+            /* Verso della faccia frontale per [[front_facing]] (l'ingresso FACING
+             * del FP, s.30): la RSX ha CCW di default (SET_FRONT_FACE 0x0901);
+             * Metal ha CW. RSX_FRONT_FACE=cw per l'A/B. */
+            { static int s_ff = -1; if (s_ff < 0) { const char* e = getenv("RSX_FRONT_FACE"); s_ff = (e && (*e == 'c' && e[1] == 'w')) ? 0 : 1; }
+              [enc setFrontFacingWinding:s_ff ? MTLWindingCounterClockwise : MTLWindingClockwise]; }
+            u8 cur_cull = 0xFF;
             if (vb) {
                 [enc setVertexBuffer:vb offset:0 atIndex:MTL_VB_INDEX];
                 MTLViewport vp = { 0.0, 0.0, (double)pass_w, (double)pass_h, 0.0, 1.0 };
@@ -2344,7 +2372,13 @@ void rsx_metal_backend_present(void)
                       if (gv.width > 0 && gv.height > 0) [enc setViewport:gv]; } }
                 [enc setRenderPipelineState:pso];
                 if (pass_zeta) [enc setDepthStencilState:dss_for(d->depth_test, d->depth_func, d->depth_mask)];
-                { static float s_eqb = -1; if (s_eqb < 0) { const char* e = getenv("RSX_EQUAL_LEQUAL"); s_eqb = e ? (float)atof(e) : 0; }
+                if (d->cull != cur_cull) { cur_cull = d->cull;
+                    /* con il front face CW del guest si inverte il verso, non la modalita' */
+                    { static int s_ff2 = -1; if (s_ff2 < 0) { const char* e = getenv("RSX_FRONT_FACE"); s_ff2 = (e && (*e == 'c' && e[1] == 'w')) ? 0 : 1; }
+                      int ccw = s_ff2 ^ ((d->cull & 0x10) ? 1 : 0);
+                      [enc setFrontFacingWinding:ccw ? MTLWindingCounterClockwise : MTLWindingClockwise]; }
+                    [enc setCullMode:((d->cull & 3) == 1) ? MTLCullModeBack : ((d->cull & 3) == 2) ? MTLCullModeFront : MTLCullModeNone]; }
+                { static float s_eqb = -1; if (s_eqb < 0) { const char* e = getenv("RSX_EQUAL_LEQUAL"); s_eqb = e ? (float)atof(e) : 4.0f; }   /* default 4 ulp (v. dss_for) */
                   if (s_eqb > 0 && pass_zeta) [enc setDepthBias:(d->depth_test && (d->depth_func & 7) == 2) ? -s_eqb : 0 slopeScale:0 clamp:0]; }
                 if (d->vp >= 0 && vpb && cbb) {
                     [enc setVertexBuffer:vpb offset:d->vbase atIndex:MTL_VB_INDEX];

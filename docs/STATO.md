@@ -513,6 +513,48 @@ livello **1563 draw su 2920 hanno maschera 0** e 1094 maschera RGB senza
 alpha. `docs/img_s30_dive_boat_colormask.png`: la scena e' quella del
 gioco.
 
+**7. Il personaggio: tre cose in fila, e un fronte preciso (pomeriggio).**
+Il personaggio (Drake) usciva nero e "a pezzi". Misure e fix, in ordine:
+- Le parti "mancanti" (gambe) e i blocchi piatti grigio-blu sul ponte erano
+  l'EQUAL del passaggio di colore che fallisce contro lo z del prepass su
+  chunk interi (i due VP calcolano la posizione con arrotondamenti diversi;
+  la RSX confronta z a 24 bit fissi e non se ne accorge, il nostro
+  Depth32Float si'). Ora `RSX_EQUAL_LEQUAL` e' acceso di default (LEQUAL +
+  4 ulp di bias, `=0` per spegnere): ponte intero, gambe al loro posto.
+- Il personaggio e' forward-lit nel pass 016D0000 (fp 5F6F3ABD, 27 draw
+  dopo il quad di composizione) e il suo FP legge la shadow map (unit 12 =
+  03EE0000, 2432x1216, formato depth 0xB2 con zfunc GEQUAL nel bit 28-31 di
+  TEXTURE_ADDRESS): tre cose non c'erano: (a) la lettura "shadow" (confronto
+  invece del texel: ora `rsx_shadowN()` nel FP, confronto a mano sul texel
+  piu' vicino della copia A8R8G8B8 del depth, `rsx_fp_set_shadow`, la
+  maschera nella chiave della cache dei FP: `sh=` nel drawlist); (b)
+  l'ingresso FACING (input 0xE, SSA) del FP, che il titolo usa come
+  predicato per applicare l'ombra e per la luce a due facce (`input_facing`
+  da `[[front_facing]]`); (c) le shadow map erano VUOTE: le due cascate sono
+  viewport 1216x1216 nelle due meta' della superficie e il backend mappava
+  l'NDC su tutta la superficie (caster fuori dal ritaglio) -- ora la viewport
+  del guest e' per draw (`draw_viewport_setup`, `RSX_VIEWPORT=0`); e i pass
+  solo-profondita' (colore e zeta allo stesso offset) ricostruivano lo zeta
+  dal colore fantasma al pass dopo (`synced_seq`).
+- Culling: non era applicato (`SET_CULL_FACE`, `SET_FRONT_FACE`): ora per
+  draw (`cull=` nel drawlist; il pass 031E0000 usa FRONT, gli altri BACK;
+  `RSX_CULL=0`). Con culling + ombre + facing il personaggio riceve luce
+  (`docs/img_s30_cull.png`).
+- APERTO: il termine d'ombra e' ancora quasi sempre 0 sui ricevitori:
+  `RSX_SHADOW_FORCE=4` (mostra il riferimento c.z) da' ~0 su ponte e
+  personaggio, `=3` (il texel) da' valori sensati. Il riferimento e'
+  `r2.x*c36.x + c36.y` con `r2.x = dot(tc4.xyz|c24.x, c31)` e tc4 = o[11]
+  del VP (posizione in spazio luce): o le costanti inline c24/c31/c36 sono
+  numerate male, o o[11] esce sbagliato. Con `RSX_SHADOW_FORCE=1` la giacca
+  e' bianca (troppa luce), con `=0` la scena e' tutta normale ma il
+  personaggio scuro. Il blocco piatto sotto il personaggio in
+  `img_s30_cull.png` e' la sua ombra sul ponte (il termine 0 li' e' giusto,
+  ma la resa piatta no: con FORCE=0 il ponte in ombra ha la texture).
+- Misure fatte e scartate: `RSX_DEPTH_CLAMP` (nessun effetto), il
+  ricontrollo dei buchi di zeri nelle CALL (`GCM_ZERO_TRACE=50`: 919 su 1,3
+  milioni scritti dopo il passaggio del walker, tutti parole 00020000 /
+  40680100 di riempimento, non draw persi), occlusion off (uguale).
+
 **Stallo intermittente visto una volta (c2)**: `[spu-dma] ovl=215
 pc=0x086F4: 200000 identical GET ... ea=0x210157F0 (valore 0)` poi
 `Rendering is stuck on reference value 2144`: il job di geometria
@@ -522,18 +564,23 @@ nessun timestamp). 1 corsa su 9. Da capire; un rimedio nello stile di
 
 ### Fronte aperto (dopo la sessione 30)
 
-1. **Il personaggio esce a pezzi staccati e scuro** (mano che fluttua,
-   busto, gambe separate: `img_s30_dive_boat_colormask.png`): lo skinning.
-   Nel drawlist i draw del personaggio nel buffer illuminato usano
-   vp A488B4A5 / fp 0F97C001 (memoria locale); da vedere se le matrici
-   delle ossa arrivano dalle costanti del VP o da un job SPU, e con
-   `RSX_VP_DBG_STAT` dove finiscono le posizioni.
+1. **Il termine d'ombra e' ~0 sui ricevitori** (v. punto 7): partire dal
+   riferimento `c.z` (RSX_SHADOW_FORCE=4) -- costanti inline c24/c31/c36 del
+   FP 5F6F3ABD (RSX_FP_DUMP=5F6F3ABD) e o[11] del VP 7BC2B163 (RSX_VP_DUMP=1).
+   Lo skinning NON e' il problema: la mano "che fluttua" e' il braccio alzato
+   del personaggio (posa vera), il resto era l'EQUAL.
 2. Lo stallo del report (sopra), 1 corsa su 9.
 3. Velocita': 7,5-8 fps nel livello con ~2.900 draw (nessun thread saturo).
 
 ### Strumenti nuovi (sessione 30)
 
 - `RSX_DRAW_COALESCE=0` (parole DRAW una per una, come prima).
+- `RSX_EQUAL_LEQUAL=0` (torna all'EQUAL vero), `RSX_CULL=0`, `RSX_VIEWPORT=0`,
+  `RSX_COLOR_MASK=0`, `RSX_FRONT_FACE=cw`, `RSX_DEPTH_CLAMP=1`,
+  `RSX_SHADOW_FORCE=0/1/3/4` (ombra fissa / texel / riferimento),
+  `RSX_VP_DBG_FROM=<fotogramma>`, `GCM_ZERO_TRACE=<ms>`; nel drawlist
+  `cull=`, `sh=`, `va=`, `/z<zfunc>` sulle texture depth; `[vpstat]` stampa
+  anche `o0` del primo vertice trasformato con c0..c3 e la z di viewport.
 - `cm=<maschera>` nel `RSX_DRAWLIST`; il messaggio `decompile failed` dice
   quanti byte fino al bit END e il tetto.
 - `RSX_DUMP_FRAME` ora non ferma il livello: con `RSX_DRAWLIST_MIN=1500
