@@ -1549,8 +1549,41 @@ void cellGcm_on_put_write(void)
     in = 0;
 }
 
+/* GCM_ZERO_TRACE=1 (sessione 30): ogni corsa di zeri attraversata dentro una
+ * CALL (il "buco" dove il job SPU patcha i DRAW) viene ricontrollata alla
+ * passata dopo: se nel frattempo e' stata scritta, il walker era passato
+ * PRIMA del job e quei draw sono persi (sospetto per i pezzi mancanti del
+ * personaggio). Riassunto in [wstat] / ogni 2 s, e le prime 16 in dettaglio. */
+static struct { u32 io, len; unsigned long long t; } s_zr[4096]; static unsigned s_zr_n, s_zr_seen, s_zr_late, s_zr_total;
+static int s_zt = -1;   /* GCM_ZERO_TRACE=<ms>: ricontrollo dopo almeno ms millisecondi (default 50) */
+static void gcm_zero_note(u32 io, u32 len)
+{
+    if (s_zt < 0) { const char* e = getenv("GCM_ZERO_TRACE"); s_zt = e ? (atoi(e) > 1 ? atoi(e) : 50) : 0; }
+    if (!s_zt) return;
+    s_zr_total++;
+    if (s_zr_n < 4096) { s_zr[s_zr_n].io = io; s_zr[s_zr_n].len = len; s_zr[s_zr_n].t = ps3_ms_now(); s_zr_n++; }
+}
+static void gcm_zero_recheck(void)
+{
+    if (s_zt <= 0) return;
+    unsigned long long now0 = ps3_ms_now(); unsigned keep = 0;
+    for (unsigned i = 0; i < s_zr_n; i++) {
+        if (now0 - s_zr[i].t < (unsigned long long)s_zt) { s_zr[keep++] = s_zr[i]; continue; }
+        u32 nz = 0, first = 0;
+        for (u32 k = 0; k < s_zr[i].len; k++) { u32 pe = gcm_io2ea(s_zr[i].io + k * 4); u32 w2 = pe ? vm_read32(pe) : 0;
+            if (w2 != 0 && (w2 >> 29) != 1) { if (!nz) first = w2; nz++; } }   /* i JUMP sono la reinizializzazione del blocco per il giro dopo: non contano */
+        s_zr_seen++;
+        if (nz) { s_zr_late++;
+            static int _n = 0; if (_n++ < 16) fprintf(stderr, "[zero-late] buco a IO %08X (%u parole): %u scritte DOPO il passaggio del walker (prima %08X)\n", s_zr[i].io, s_zr[i].len, nz, first); }
+    }
+    s_zr_n = keep;
+    static unsigned long long s_last = 0; unsigned long long now = ps3_ms_now();
+    if (now - s_last >= 2000) { s_last = now;
+        if (s_zr_seen) fprintf(stderr, "[zero-trace] corse di zeri in CALL: %u, ricontrollate %u, scritte dopo il passaggio: %u\n", s_zr_total, s_zr_seen, s_zr_late); }
+}
 static void gcm_rsx_process_fifo_unlocked(void)
 {
+    gcm_zero_recheck();
     s_parked = 0;   /* si riparte: se il park e' ancora li' lo si ritrova */
     { static unsigned _n = 0; static unsigned long long _t0 = 0;
       extern unsigned long long ps3_ms_now(void);
@@ -1668,7 +1701,7 @@ static void gcm_rsx_process_fifo_unlocked(void)
             if (s_fifo_calloff) {
                 u32 z = 0, io2 = s_fifo_getoff;
                 while (z < 65536) { u32 pe = gcm_io2ea(io2); if (!pe || vm_read32(pe) != 0) break; z++; io2 += 4; }
-                if (z < 65536 && gcm_io2ea(io2)) { s_fifo_getoff = io2; continue; }
+                if (z < 65536 && gcm_io2ea(io2)) { gcm_zero_note(s_fifo_getoff, z); s_fifo_getoff = io2; continue; }
             }
             u32 z = 0, probe_io = s_fifo_getoff;
             while (z < 4) {

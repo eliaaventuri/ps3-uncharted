@@ -117,6 +117,8 @@ int rsx_fp_decompile_buffered_ex(
  * the texture/sampler banks at [[texture(0)]]/[[sampler(0)]] and, when
  * buffered, the constants at [[buffer(1)]] and the alpha ref at [[buffer(2)]]. */
 void rsx_fp_set_mrt_count(int n);
+/* Unita' in modalita' shadow (depth compare): 16 byte, zfunc per unita' (0 = no). */
+void rsx_fp_set_shadow(const u8* zfunc16);
 int rsx_fp_decompile_lang(
     const u8* ucode, u32 max_bytes, u32 ctrl, u32 tex_cube_mask, int buffered,
     rsx_fp_lang lang, char* out, u32 out_size, u32* out_constant_count);

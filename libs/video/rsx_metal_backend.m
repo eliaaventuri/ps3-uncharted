@@ -75,11 +75,15 @@ typedef struct {
     int tex0;        /* texture unit 0 enabled: pick the sampling built-in */
     u32 surf;        /* surface_color_offset[0] al momento del draw          */
     u32 sx, sy, sw, sh;  /* rettangolo di ritaglio (scissor) al momento del draw */
+    float vx, vy, vw, vh;  /* viewport del guest (SET_VIEWPORT scale/offset) in pixel della superficie, s.30 */
     u32 surf_w, surf_h;  /* dimensione della superficie (SURFACE_CLIP) al momento del draw */
     u32 tex_off[RSX_MAX_TEXTURES]; /* offset guest delle texture legate (per RSX_DRAWLIST) */
     u32 tex_fmt[RSX_MAX_TEXTURES]; /* formato (TEXTURE_FORMAT) delle texture legate */
     u8  attr_ts[16];               /* (tipo<<4)|size degli attributi abilitati, 0 = spento (RSX_DRAWLIST, s.29) */
     u8  color_mask;                /* MTLColorWriteMask (s.30): SET_COLOR_MASK del guest, 0 = solo depth/stencil */
+    u32 attr0_off, first;          /* offset guest dell'attributo 0 e primo vertice (RSX_DRAWLIST `va=`, s.30: per appaiare prepass e colore) */
+    u8  tex_zfunc[16];             /* unita' in modalita' shadow: zfunc (TEXTURE_ADDRESS bit 28-31) se la texture e' depth, 0 altrimenti (s.30) */
+    u32 shadow_key;                /* impronta di tex_zfunc, nei bit alti dell'argomento mrt di guest_fp_library (variante del FP) */
     u32 zeta_off;                  /* SURFACE_ZETA_OFFSET al momento del draw */
     int depth_test; u32 depth_func; int depth_mask; /* stato del test di profondita' */
     u32 shader_ctrl;               /* SET_SHADER_CONTROL (0x1D60): bit 0xE = export della profondita' */
@@ -103,6 +107,36 @@ typedef struct {
 static u32 fp_ucode_hash(u32 fp_addr);
 static u32 fpc_block(u32 fp_addr, u32* out_n);
 static id<MTLLibrary> guest_fp_library(u32 fp_addr, int vp, u32 ctrl, u32 mrt, u32 hash);
+/* Modalita' shadow delle unita' (s.30): formato depth (0xB0..0xB3, bit 8-15 di
+ * TEXTURE_FORMAT) e zfunc != NEVER -> il FP confronta invece di leggere il
+ * texel. La tabella per draw va nel decompilatore (rsx_fp_set_shadow) prima
+ * di ogni traduzione, e la sua impronta nella chiave della cache dei FP. */
+/* Viewport del guest (s.30): SET_VIEWPORT_SCALE/OFFSET in pixel della
+ * superficie: x0 = off - |scale|, w = 2|scale|. Prima il backend mappava
+ * l'NDC su TUTTA la superficie: per il passaggio principale (viewport =
+ * superficie) va bene, ma le due cascate delle shadow map di Uncharted sono
+ * viewport da 1216x1216 nelle due meta' di una superficie 2432x1216 e i
+ * caster finivano fuori dal ritaglio: shadow map vuote, tutto in ombra. */
+static void draw_viewport_setup(MtlDraw* d, const rsx_state* st)
+{
+    if (!st || st->viewport_scale[0] == 0.0f || st->viewport_scale[1] == 0.0f) { d->vx = d->vy = 0; d->vw = d->vh = 0; return; }
+    float sx = fabsf(st->viewport_scale[0]), sy = fabsf(st->viewport_scale[1]);
+    d->vx = st->viewport_offset[0] - sx; d->vw = 2.0f * sx;
+    d->vy = st->viewport_offset[1] - sy; d->vh = 2.0f * sy;
+}
+static const u8* s_fp_shadow_cur;   /* tabella del draw in corso di traduzione */
+static u32 draw_shadow_setup(MtlDraw* d, const rsx_state* st)
+{
+    u32 key = 0;
+    memset(d->tex_zfunc, 0, sizeof d->tex_zfunc);
+    if (st) for (u32 u = 0; u < 16; u++) {
+        const rsx_texture_state* t = &st->textures[u];
+        if (!(t->control0 & 0x80000000u)) continue;
+        u32 fmt = (t->format >> 8) & 0x9Fu, zf = (t->address >> 28) & 0xFu;
+        if (fmt >= 0x90u && fmt <= 0x93u && zf) { d->tex_zfunc[u] = (u8)zf;   /* DEPTH24_D8 0x90 .. DEPTH16_FLOAT 0x93, senza LN/UN */ key |= (zf & 7u) << (u * 2); key ^= 0x80000000u >> (u & 15); } }
+    d->shadow_key = key ? (key * 2654435761u >> 8) | 1u : 0;
+    return d->shadow_key;
+}
 
 /* One MTLTexture per unit, rebuilt when the guest rebinds a different image. */
 typedef struct {
@@ -450,6 +484,8 @@ static void fetch_vp_vertex(const rsx_state* st, u32 vi)
  * finivano a schermo come sagome nere (sessione 30). */
 static u8 color_mask_to_metal(u32 m)
 {
+    static int s_on = -1; if (s_on < 0) { const char* e = getenv("RSX_COLOR_MASK"); s_on = (e && *e == '0') ? 0 : 1; }   /* RSX_COLOR_MASK=0: ignora (A/B) */
+    if (!s_on) return 0xF;
     return (u8)(((m & 0x00010000u) ? MTLColorWriteMaskRed   : 0) | ((m & 0x00000100u) ? MTLColorWriteMaskGreen : 0) |
                 ((m & 0x00000001u) ? MTLColorWriteMaskBlue  : 0) | ((m & 0x01000000u) ? MTLColorWriteMaskAlpha : 0));
 }
@@ -644,7 +680,8 @@ static int vpdbg_common(const MtlDraw* d, const rsx_state* st, u32 prim, u32 wro
     static long s_fpf = -2; if (s_fpf == -2) { const char* e = getenv("RSX_VP_DBG_FP"); s_fpf = e ? (long)strtoul(e, 0, 16) : -1; }
     static long s_sff = -2; if (s_sff == -2) { const char* e = getenv("RSX_VP_DBG_SURF"); s_sff = e ? (long)strtoul(e, 0, 16) : -1; }
     static long s_vpf = -2; if (s_vpf == -2) { const char* e = getenv("RSX_VP_DBG_VP"); s_vpf = e ? (long)strtoul(e, 0, 16) : -1; }
-    if (!(d->vp >= 0 && s_vn < s_vd && (!s_gate || g_hle_trace_armed) && (s_fpf < 0 || (long)d->fp_addr == s_fpf) && (s_sff < 0 || (long)d->surf == s_sff)
+    static long s_from = -2; if (s_from == -2) { const char* e = getenv("RSX_VP_DBG_FROM"); s_from = e ? atol(e) : 0; }   /* dal fotogramma n (s.30) */
+    if (!(d->vp >= 0 && s_vn < s_vd && (long)s_frame_no >= s_from && (!s_gate || g_hle_trace_armed) && (s_fpf < 0 || (long)d->fp_addr == s_fpf) && (s_sff < 0 || (long)d->surf == s_sff)
           && (s_vpf < 0 || (long)s_vps[d->vp].hash == s_vpf))) return 0;
     s_vn++;
     fprintf(stderr, "[vpdbg] %s draw#%u vp=%08X mask=%04X prim=%u count=%u surf=%08X fp=%08X blend=%d\n",
@@ -654,6 +691,11 @@ static int vpdbg_common(const MtlDraw* d, const rsx_state* st, u32 prim, u32 wro
      * vertici del draw (per vedere i dati stantii/sovrascritti, s.29) */
     { static int s_st = -1; if (s_st < 0) s_st = getenv("RSX_VP_DBG_STAT") ? 1 : 0;
       if (s_st) { fprintf(stderr, "[vpstat] draw#%u vp=%08X fp=%08X n=%u", s_draw_count - 1, s_vps[d->vp].hash, d->fp_addr, wrote);
+          /* o0 = c[0..3] x v0 del primo vertice, e la z finale con la viewport (s.30: shadow map a z=0) */
+          if (st && wrote) { const float* v0 = base_f; float o[4];
+              for (int k = 0; k < 4; k++) o[k] = v0[0] * st->vertex_constants[k][0] + v0[1] * st->vertex_constants[k][1] + v0[2] * st->vertex_constants[k][2] + st->vertex_constants[k][3];
+              fprintf(stderr, " v0=(%.3g %.3g %.3g) o0=(%.3g %.3g %.3g %.3g) zv=%.4g vpz=%g/%g", v0[0], v0[1], v0[2], o[0], o[1], o[2], o[3],
+                      o[3] != 0 ? (o[2] / o[3]) * st->viewport_scale[2] + st->viewport_offset[2] : 0.0f, st->viewport_scale[2], st->viewport_offset[2]); }
           u32 rank = 0;
           for (int a = 0; a < 16; a++) { if (!(s_vps[d->vp].mask & (1u << a))) continue;
               float mn[4] = {1e30f,1e30f,1e30f,1e30f}, mx[4] = {-1e30f,-1e30f,-1e30f,-1e30f}; int nan = 0;
@@ -714,6 +756,8 @@ static void record_draw(const rsx_state* st, u32 prim, u32 base, u32 count,
     d->tex0           = (st->textures[0].control0 & 0x80000000u) != 0;
     for (int a = 0; a < 16; a++) { const rsx_vertex_attrib* va = &st->vertex_attribs[a];
         d->attr_ts[a] = (va->enabled && va->stride) ? (u8)(((va->type & 0xF) << 4) | (va->size & 0xF)) : 0; }
+    d->attr0_off = st->vertex_attribs[0].offset; d->first = base;
+    draw_shadow_setup(d, st);
     for (u32 t = 0; t < RSX_MAX_TEXTURES; t++) {
         d->tex[t] = (st->textures[t].control0 & 0x80000000u) ? tex_with_remap(s_tex[t].tex, st->textures[t].control1) : nil;
         d->tex_off[t] = st->textures[t].offset; d->tex_fmt[t] = st->textures[t].format; }
@@ -727,10 +771,11 @@ static void record_draw(const rsx_state* st, u32 prim, u32 base, u32 count,
     /* Il programma va tradotto ORA, finche' il microcodice in memoria e' quello
      * del draw: il titolo riusa il ring dei FP e alla codifica (present) ci
      * sarebbe gia' il programma del fotogramma dopo. */
-    if (d->fp_addr) (void)guest_fp_library(d->fp_addr, (d->vp >= 0 && s_vps[d->vp].ok) ? d->vp : -1, d->shader_ctrl, d->n_mrt, d->fp_hash);
+    if (d->fp_addr) { s_fp_shadow_cur = d->tex_zfunc; (void)guest_fp_library(d->fp_addr, (d->vp >= 0 && s_vps[d->vp].ok) ? d->vp : -1, d->shader_ctrl, d->n_mrt | (d->shadow_key << 8), d->fp_hash); }
     d->surf_w = st->surface_clip_w ? st->surface_clip_w : s_width; d->surf_h = st->surface_clip_h ? st->surface_clip_h : s_height;
     d->sx = st->scissor_x; d->sy = st->scissor_y;
     d->sw = st->scissor_w; d->sh = st->scissor_h;
+    draw_viewport_setup(d, st);
     if (vpdbg_common(d, st, prim, wrote, "array")) {
           for (int a = 0; a < 16; a++) if (s_vps[d->vp].mask & (1u << a))
               fprintf(stderr, "[vpdbg]   attr%d: fmt=%08X off=%08X\n", a, st->vertex_attribs[a].format, st->vertex_attribs[a].offset);
@@ -852,6 +897,7 @@ done:
     d->fp_hash        = d->fp_addr ? fp_ucode_hash(d->fp_addr) : 0;
     d->fpc_off        = d->fp_hash ? fpc_block(d->fp_addr, &d->fpc_n) : 0;
     memset(d->attr_ts, 0, sizeof d->attr_ts);
+    draw_shadow_setup(d, s_state);
     d->tex0           = s_state && (s_state->textures[0].control0 & 0x80000000u) != 0;
     d->zeta_off = s_state ? s_state->surface_zeta_offset : 0;
     d->depth_test = s_state ? s_state->depth_test_enable : 0; d->depth_func = s_state ? s_state->depth_func : 0x207; d->depth_mask = s_state ? s_state->depth_mask : 1;
@@ -862,12 +908,13 @@ done:
     d->surf_fmt = s_state ? s_state->surface_format : 0; d->color_target = s_state ? s_state->color_target : 0;
     d->surf2 = s_state ? s_state->surface_color_offset[2] : 0; d->surf3 = s_state ? s_state->surface_color_offset[3] : 0;
     d->n_mrt = (d->color_target == 0x13) ? 2 : (d->color_target == 0x17) ? 3 : (d->color_target == 0x1F) ? 4 : 1;
-    if (d->fp_addr) (void)guest_fp_library(d->fp_addr, (d->vp >= 0 && s_vps[d->vp].ok) ? d->vp : -1, d->shader_ctrl, d->n_mrt, d->fp_hash);
+    if (d->fp_addr) { s_fp_shadow_cur = d->tex_zfunc; (void)guest_fp_library(d->fp_addr, (d->vp >= 0 && s_vps[d->vp].ok) ? d->vp : -1, d->shader_ctrl, d->n_mrt | (d->shadow_key << 8), d->fp_hash); }
     d->surf_pitch0 = s_state ? s_state->surface_color_pitch[0] : 0; d->surf1 = s_state ? s_state->surface_color_offset[1] : 0;
     d->surf_w = (s_state && s_state->surface_clip_w) ? s_state->surface_clip_w : s_width;
     d->surf_h = (s_state && s_state->surface_clip_h) ? s_state->surface_clip_h : s_height;
     d->sx = s_state ? s_state->scissor_x : 0; d->sy = s_state ? s_state->scissor_y : 0;
     d->sw = s_state ? s_state->scissor_w : 4096; d->sh = s_state ? s_state->scissor_h : 4096;
+    draw_viewport_setup(d, s_state);
     if (s_state) vpdbg_common(d, s_state, primitive, wrote, "inline");
 
     memset(d->mvp, 0, sizeof d->mvp);
@@ -1634,7 +1681,8 @@ static id<MTLLibrary> guest_fp_library(u32 fp_addr, int vp, u32 ctrl, u32 mrt, u
         static char msl[128 * 1024];   /* un FP da 1024 istruzioni tradotto supera i 32 KB */
         /* la parola di controllo vera (0x1D60) solo per l'export della
          * profondita': per il resto restano le euristiche (RSX_FP_CTRL_AUTO) */
-        rsx_fp_set_mrt_count((int)mrt);
+        rsx_fp_set_mrt_count((int)(mrt & 0xFFu));
+        { extern void rsx_fp_set_shadow(const u8* zfunc16); rsx_fp_set_shadow((mrt >> 8) ? s_fp_shadow_cur : NULL); }
         /* La parola di controllo vera (0x1D60) decide anche il registro di
          * uscita: 0x40 = r0 (32 bit), altrimenti h0. L'euristica sceglieva r0
          * appena qualcuno lo scriveva come temporaneo: il resolve del depth di
@@ -1804,7 +1852,8 @@ static id<MTLRenderPipelineState> pso_for(MtlDraw* d)
      * nero". */
     static int s_fb = -1;
     if (s_fb < 0) s_fb = getenv("RSX_FORCE_BUILTIN") ? 1 : 0;
-    id<MTLLibrary> glib = (d->fp_addr && !s_fb) ? guest_fp_library(d->fp_addr, vp, d->shader_ctrl, d->n_mrt ? d->n_mrt : 1, d->fp_hash) : nil;
+    s_fp_shadow_cur = d->tex_zfunc;
+    id<MTLLibrary> glib = (d->fp_addr && !s_fb) ? guest_fp_library(d->fp_addr, vp, d->shader_ctrl, (d->n_mrt ? d->n_mrt : 1) | (d->shadow_key << 8), d->fp_hash) : nil;
     if (!glib && vp >= 0) {
         /* il VP non compila: si riprova la coppia con il VS incorporato */
         vp = -1; d->vp = -1;
@@ -1816,7 +1865,7 @@ static id<MTLRenderPipelineState> pso_for(MtlDraw* d)
             vd.attributes[i].bufferIndex = MTL_VB_INDEX;
         }
         vd.layouts[MTL_VB_INDEX].stride = sizeof(MtlVertex);
-        glib = (d->fp_addr && !s_fb) ? guest_fp_library(d->fp_addr, -1, d->shader_ctrl, d->n_mrt ? d->n_mrt : 1, d->fp_hash) : nil;
+        glib = (d->fp_addr && !s_fb) ? guest_fp_library(d->fp_addr, -1, d->shader_ctrl, (d->n_mrt ? d->n_mrt : 1) | (d->shadow_key << 8), d->fp_hash) : nil;
     }
     if (glib) {
         static int s_dtg = -1;
@@ -2088,14 +2137,14 @@ void rsx_metal_backend_present(void)
                       s_frame_no, s_draw_count, s_vert_count, s_cb_count);
               for (u32 i = 0; i < s_draw_count; i++) {
                   const MtlDraw* d = &s_draws[i];
-                  fprintf(stderr, "[drawlist] #%-3u surf=%08X%s[fmt=%X ct=%X pitch=%u B=%X Z=%X dt=%d/%X/%d sc=%X] vp=%s%08X fp=%08X/%08X n=%-5u topo=%d blend=%d(%03X,%03X) cm=%X sc=%u,%u %ux%u tex:",
+                  fprintf(stderr, "[drawlist] #%-3u surf=%08X%s[fmt=%X ct=%X pitch=%u B=%X Z=%X dt=%d/%X/%d sc=%X] vp=%s%08X fp=%08X/%08X n=%-5u topo=%d blend=%d(%03X,%03X) cm=%X va=%08X+%u sh=%X sc=%u,%u %ux%u tex:",
                           i, d->surf, cellGcmOffsetIsDisplay(d->surf) ? "*" : " ", d->surf_fmt, d->color_target, d->surf_pitch0, d->surf1, d->zeta_off, d->depth_test, d->depth_func, d->depth_mask, d->shader_ctrl,
                           d->vp >= 0 ? "" : "-", d->vp >= 0 ? s_vps[d->vp].hash : 0u, d->fp_addr, d->fp_hash, d->count, (int)d->topology,
-                          d->blend_enable, d->blend_sfactor, d->blend_dfactor, d->color_mask, d->sx, d->sy, d->sw, d->sh);
+                          d->blend_enable, d->blend_sfactor, d->blend_dfactor, d->color_mask, d->attr0_off, d->first, d->shadow_key, d->sx, d->sy, d->sw, d->sh);
                   /* il microcodice del FP e' ancora quello del draw? (anello riusato) */
                   if (d->fp_addr) { u32 hn = fp_ucode_hash(d->fp_addr); if (hn != d->fp_hash) fprintf(stderr, " fp-ora=%08X", hn); }
                   for (u32 t = 0; t < RSX_MAX_TEXTURES; t++) if (d->tex[t])
-                      fprintf(stderr, " %u:%lux%lu@%X/f%02X", t, (unsigned long)d->tex[t].width, (unsigned long)d->tex[t].height, d->tex_off[t], (d->tex_fmt[t] >> 8) & 0xFF);
+                      fprintf(stderr, " %u:%lux%lu@%X/f%02X%s%X", t, (unsigned long)d->tex[t].width, (unsigned long)d->tex[t].height, d->tex_off[t], (d->tex_fmt[t] >> 8) & 0xFF, d->tex_zfunc[t] ? "/z" : "", d->tex_zfunc[t]);
                   fprintf(stderr, " at:");   /* attributi: indice=tipo/size (tipo 2=F 3=SF 4=UB 1=S1 5=S32K 6=CMP 7=UB256) */
                   for (int a = 0; a < 16; a++) if (d->attr_ts[a]) fprintf(stderr, " %d=%u/%u", a, d->attr_ts[a] >> 4, d->attr_ts[a] & 0xF);
                   fprintf(stderr, "\n");
@@ -2223,7 +2272,17 @@ void rsx_metal_backend_present(void)
             /* la superficie di colore di questo pass viene scritta ora */
             s_pass_seq++;
             for (u32 q = 0; q < s_surf_count; q++) if (s_surf[q].tex == pass_target) s_surf[q].write_seq = s_pass_seq;
+            /* Pass solo-profondita' (shadow map: colore e zeta allo STESSO offset,
+             * maschera di colore 0): il "colore" e' un fantasma e non deve
+             * ricostruire lo zeta al pass dopo (zeta_from_color): le shadow map
+             * uscivano con due soli valori, il colore di clear decodificato
+             * come profondita', e tutto era in ombra (sessione 30). */
+            if (pass_zeta && !to_display && s_draws[i].surf == s_draws[i].zeta_off) pass_zeta->synced_seq = s_pass_seq;
             id<MTLRenderCommandEncoder> enc = [cb renderCommandEncoderWithDescriptor:rp];
+            /* RSX_DEPTH_CLAMP=1 (s.30): niente clipping su z (come la RSX con
+             * zclamp): i caster delle shadow map finivano fuori da [0,1]? */
+            { static int s_dc = -1; if (s_dc < 0) s_dc = getenv("RSX_DEPTH_CLAMP") ? 1 : 0;
+              if (s_dc) [enc setDepthClipMode:MTLDepthClipModeClamp]; }
             if (vb) {
                 [enc setVertexBuffer:vb offset:0 atIndex:MTL_VB_INDEX];
                 MTLViewport vp = { 0.0, 0.0, (double)pass_w, (double)pass_h, 0.0, 1.0 };
@@ -2274,6 +2333,15 @@ void rsx_metal_backend_present(void)
                       MTLScissorRect sr = { x, y, w, h };
                       [enc setScissorRect:sr];
                   } }
+                /* viewport del guest (v. draw_viewport_setup); RSX_VIEWPORT=0 torna a quella dell'intera superficie */
+                { static int s_vpe = -1; if (s_vpe < 0) { const char* e = getenv("RSX_VIEWPORT"); s_vpe = (e && *e == '0') ? 0 : 1; }
+                  if (s_vpe && d->vw > 0 && d->vh > 0) {
+                      MTLViewport gv = { (double)d->vx * sc_ax, (double)d->vy * sc_ay, (double)d->vw * sc_ax, (double)d->vh * sc_ay, 0.0, 1.0 };
+                      if (gv.originX < 0) { gv.width += gv.originX; gv.originX = 0; }
+                      if (gv.originY < 0) { gv.height += gv.originY; gv.originY = 0; }
+                      if (gv.originX + gv.width  > (double)pass_w) gv.width  = (double)pass_w - gv.originX;
+                      if (gv.originY + gv.height > (double)pass_h) gv.height = (double)pass_h - gv.originY;
+                      if (gv.width > 0 && gv.height > 0) [enc setViewport:gv]; } }
                 [enc setRenderPipelineState:pso];
                 if (pass_zeta) [enc setDepthStencilState:dss_for(d->depth_test, d->depth_func, d->depth_mask)];
                 { static float s_eqb = -1; if (s_eqb < 0) { const char* e = getenv("RSX_EQUAL_LEQUAL"); s_eqb = e ? (float)atof(e) : 0; }

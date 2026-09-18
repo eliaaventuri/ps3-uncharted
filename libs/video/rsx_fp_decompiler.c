@@ -329,6 +329,7 @@ static void decode_src(u32 w, int abs_bit, Src* s)
 /* HLSL expression for the interpolated input selected by OPDEST.INPUT_SRC.
  * The backend's passthrough VS forwards COL0/COL1/FOG/TEXCOORD0..7; WPOS maps
  * to SV_POSITION (screen-space — an approximation of the RSX window coord). */
+static int s_fp_msl_facing;   /* 1 mentre si traduce in MSL (input_facing esiste solo li') */
 static const char* input_expr(u32 input_src)
 {
     static const char* tc[8] = {
@@ -341,7 +342,8 @@ static const char* input_expr(u32 input_src)
     case 0x3: return "input.fog";      /* FOGC */
     default:
         if (input_src >= 0x4 && input_src <= 0xB) return tc[input_src - 0x4]; /* TC0..7 */
-        return "float4(0,0,0,0)";      /* TC8/TC9/FACING not plumbed */
+        if (input_src == 0xE && s_fp_msl_facing) return "input_facing";   /* SSA: +1/-1 (solo MSL: v. rsx_front) */
+        return "float4(0,0,0,0)";      /* TC8/TC9 not plumbed */
     }
 }
 
@@ -391,6 +393,17 @@ static void dest_mask(u32 op0, char* m)
  * (color = r0); when clear, output is fp16 (color = h0). Matches RPCS3
  * FragmentProgramDecompiler::BuildCode (gcm_enums.h). */
 static int s_fp_mrt;
+/* Unita' in modalita' "shadow" (sessione 30): texture in formato depth
+ * (0xB0..0xB3) con zfunc (TEXTURE_ADDRESS bit 28-31) != NEVER. Sul ferro la
+ * lettura restituisce 0/1 = (z della coordinata) zfunc (z del texel), non il
+ * texel: senza, il termine d'ombra del personaggio (forward-lit, tex12 = la
+ * shadow map) era un valore di profondita' e il personaggio usciva nero.
+ * Il backend Metal lega le superfici di profondita' come copia A8R8G8B8
+ * (A=Z[23:16], R=Z[15:8], G=Z[7:0], kernel depth_to_rgba): il confronto si
+ * fa a mano sul texel piu' vicino (niente PCF). */
+static u8 s_fp_shadow[16];
+void rsx_fp_set_shadow(const u8* zfunc16) { if (zfunc16) memcpy(s_fp_shadow, zfunc16, 16); else memset(s_fp_shadow, 0, 16); }
+static const char* fp_zfunc_op(u32 f) { static const char* o[8] = { "false", "<", "==", "<=", ">", "!=", ">=", "true" }; return o[f & 7]; }
 #define FP_CTRL_32BIT_EXPORTS 0x40u
 
 int rsx_fp_decompile(const u8* ucode, u32 max_bytes, u32 ctrl, char* out, u32 out_size)
@@ -406,6 +419,7 @@ static int rsx_fp_decompile_internal(
     /* The two dialects diverge in a handful of places only; `msl` selects the
      * Metal spelling at each of them. */
     const int msl = (lang == RSX_FP_LANG_MSL);
+    s_fp_msl_facing = msl;
     if (!ucode || !out || out_size == 0) return -1;
 
     u32 buffered_constant_count = 0;
@@ -434,6 +448,24 @@ static int rsx_fp_decompile_internal(
             "    float4 tc0; float4 tc1; float4 tc2; float4 tc3;\n"
             "    float4 tc4; float4 tc5; float4 tc6; float4 tc7;\n"
             "};\n");
+        /* lettura "shadow" per unita' (v. s_fp_shadow): texel piu' vicino della
+         * copia A8R8G8B8 del depth, decodifica a 24 bit, confronto con zfunc */
+        for (u32 u = 0; u < 16; u++) if (s_fp_shadow[u]) {
+            char cmp[32], fn[400];
+            const u32 zf = s_fp_shadow[u] & 7u;
+            static int s_force = -1; if (s_force < 0) { const char* e = getenv("RSX_SHADOW_FORCE"); s_force = e ? atoi(e) : -1; }   /* RSX_SHADOW_FORCE=0/1: risultato fisso (A/B) */
+            if (s_force == 0 || s_force == 1) snprintf(cmp, sizeof cmp, "%s", s_force ? "true" : "false");
+            else if (s_force == 3) snprintf(cmp, sizeof cmp, "z");        /* 3: il texel, 4: il riferimento (diagnostica) */
+            else if (s_force == 4) snprintf(cmp, sizeof cmp, "c.z");
+            else if (zf == 0 || zf == 7) snprintf(cmp, sizeof cmp, "%s", fp_zfunc_op(zf));
+            else snprintf(cmp, sizeof cmp, "c.z %s z", fp_zfunc_op(zf));
+            snprintf(fn, sizeof fn,
+                "static float rsx_shadow%u(texture2d<float> t, float3 c) {\n"
+                "    uint2 p = uint2(clamp(c.xy, 0.0f, 1.0f) * float2(t.get_width() - 1, t.get_height() - 1));\n"
+                "    float4 v = t.read(p); float z = dot(float3(v.w, v.x, v.y), float3(65536.0f, 256.0f, 1.0f)) * (255.0f / 16777215.0f);\n"
+                "    return float(%s); }\n", u, cmp);
+            out_puts(&o, fn);
+        }
     } else {
     out_puts(&o,
         "struct PSInput {\n"
@@ -484,10 +516,16 @@ static int rsx_fp_decompile_internal(
                 ",\n    constant float4* fp_constants [[buffer(1)]]"
                 ",\n    constant float4& fp_alpha [[buffer(2)]]");
         }
+        /* SSA (input 0xE, "facing"): +1 fronte / -1 retro. Il FP del personaggio
+         * di Uncharted lo moltiplica in una condizione che abilita la lettura
+         * della shadow map (sessione 30): con 0 il termine d'ombra non veniva
+         * mai applicato e il personaggio era nero. */
+        out_puts(&o, ",\n    bool rsx_front [[front_facing]]");
         out_puts(&o, ")\n{\n"
             "    float4 r[48]; float4 h[48];\n"
             "    for (int _i = 0; _i < 48; _i++) { r[_i] = float4(0); h[_i] = float4(0); }\n"
-            "    float4 cc0 = float4(0); float4 cc1 = float4(0);\n");
+            "    float4 cc0 = float4(0); float4 cc1 = float4(0);\n"
+            "    const float4 input_facing = float4(rsx_front ? 1.0f : -1.0f);\n");
     } else if (tex_cube_mask == 0) {
         out_puts(&o, "Texture2D    rsx_tex[16] : register(t0);\n");
     } else {
@@ -684,7 +722,9 @@ static int rsx_fp_decompile_internal(
                      msl ? "float4((%s) == (%s))" : "(float4)((%s) == (%s))",
                      a, b); break;
         case OP_TEX:
-            if ((tex_cube_mask >> tex_unit) & 1u)
+            if (msl && tex_unit < 16 && s_fp_shadow[tex_unit])
+                snprintf(rhs, sizeof(rhs), tex_cube_mask ? "rsx_shadow%u(rsx_tex%u, (%s).xyz)" : "rsx_shadow%u(rsx_tex[%u], (%s).xyz)", tex_unit, tex_unit, a);
+            else if ((tex_cube_mask >> tex_unit) & 1u)
                 /* Cubemap: sample with the full 3-component direction vector. */
                 snprintf(rhs, sizeof(rhs),
                          msl ? "rsx_tex%u.sample(rsx_samp[%u], (%s).xyz)"
@@ -699,7 +739,9 @@ static int rsx_fp_decompile_internal(
                             : "rsx_tex[%u].Sample(rsx_samp[%u], (%s).xy)", tex_unit, tex_unit, a);
             break;
         case OP_TXP:
-            if ((tex_cube_mask >> tex_unit) & 1u)
+            if (msl && tex_unit < 16 && s_fp_shadow[tex_unit])
+                snprintf(rhs, sizeof(rhs), tex_cube_mask ? "rsx_shadow%u(rsx_tex%u, (%s).xyz / (%s).w)" : "rsx_shadow%u(rsx_tex[%u], (%s).xyz / (%s).w)", tex_unit, tex_unit, a, a);
+            else if ((tex_cube_mask >> tex_unit) & 1u)
                 /* Projective divide is meaningless for a cube lookup; sample
                  * the direction directly. */
                 snprintf(rhs, sizeof(rhs),
