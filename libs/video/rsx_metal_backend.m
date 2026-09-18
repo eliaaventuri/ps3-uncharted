@@ -79,6 +79,7 @@ typedef struct {
     u32 tex_off[RSX_MAX_TEXTURES]; /* offset guest delle texture legate (per RSX_DRAWLIST) */
     u32 tex_fmt[RSX_MAX_TEXTURES]; /* formato (TEXTURE_FORMAT) delle texture legate */
     u8  attr_ts[16];               /* (tipo<<4)|size degli attributi abilitati, 0 = spento (RSX_DRAWLIST, s.29) */
+    u8  color_mask;                /* MTLColorWriteMask (s.30): SET_COLOR_MASK del guest, 0 = solo depth/stencil */
     u32 zeta_off;                  /* SURFACE_ZETA_OFFSET al momento del draw */
     int depth_test; u32 depth_func; int depth_mask; /* stato del test di profondita' */
     u32 shader_ctrl;               /* SET_SHADER_CONTROL (0x1D60): bit 0xE = export della profondita' */
@@ -443,6 +444,15 @@ static void fetch_vp_vertex(const rsx_state* st, u32 vi)
  * come from rsx_primitives.h now -- this file used to answer the first
  * question with its own list, which disagreed with the one in that header
  * about LINE_LOOP and POLYGON. Only the Metal enum mapping stays here. */
+/* SET_COLOR_MASK (0x0324): B bit 0, G bit 8, R bit 16, A bit 24 -> MTLColorWriteMask.
+ * Non era applicato: i volumi delle luci dell'illuminazione differita (sfera,
+ * emisfero) che il titolo disegna SOLO nello stencil/depth (maschera 0)
+ * finivano a schermo come sagome nere (sessione 30). */
+static u8 color_mask_to_metal(u32 m)
+{
+    return (u8)(((m & 0x00010000u) ? MTLColorWriteMaskRed   : 0) | ((m & 0x00000100u) ? MTLColorWriteMaskGreen : 0) |
+                ((m & 0x00000001u) ? MTLColorWriteMaskBlue  : 0) | ((m & 0x01000000u) ? MTLColorWriteMaskAlpha : 0));
+}
 static MTLPrimitiveType topo_to_metal(rsx_topology t)
 {
     switch (t) {
@@ -697,6 +707,7 @@ static void record_draw(const rsx_state* st, u32 prim, u32 base, u32 count,
     d->blend_sfactor  = st->blend_sfactor;
     d->blend_dfactor  = st->blend_dfactor;
     d->blend_equation = st->blend_equation;
+    d->color_mask     = color_mask_to_metal(st->color_mask);
     d->fp_addr        = st->shader_program;
     d->fp_hash        = fp_ucode_hash(st->shader_program);
     d->fpc_off        = d->fp_hash ? fpc_block(st->shader_program, &d->fpc_n) : 0;
@@ -836,6 +847,7 @@ done:
     d->blend_sfactor  = s_state ? s_state->blend_sfactor  : 0;
     d->blend_dfactor  = s_state ? s_state->blend_dfactor  : 0;
     d->blend_equation = s_state ? s_state->blend_equation : 0;
+    d->color_mask     = s_state ? color_mask_to_metal(s_state->color_mask) : 0xF;
     d->fp_addr        = s_state ? s_state->shader_program : 0;
     d->fp_hash        = d->fp_addr ? fp_ucode_hash(d->fp_addr) : 0;
     d->fpc_off        = d->fp_hash ? fpc_block(d->fp_addr, &d->fpc_n) : 0;
@@ -1742,12 +1754,15 @@ static u32 pso_key(const MtlDraw* d)
     /* l'export della profondita' (SHADER_CONTROL & 0xE) cambia il programma */
     const u32 fp = d->fp_addr ? (1u | (((d->fp_hash ? d->fp_hash : d->fp_addr) ^ ((d->shader_ctrl & 0xEu) << 28) ^ (d->pass_pf * 0x9E3779B1u) ^ (d->n_mrt * 0x85EBCA77u)) * 2654435761u)) : 0u;
     const u32 tx = d->tex0 ? 0x40000000u : 0u;
-    if (!d->blend_enable) return (fp << 1) | tx;
-    return 1u | ((d->blend_sfactor & 0xFFFu) << 1)
+    /* la maschera di scrittura fa parte della pipeline; con la maschera piena
+     * (il caso comune) la chiave resta quella di prima */
+    const u32 cm = (d->color_mask == 0xF) ? 0u : ((u32)(d->color_mask ^ 0xF) * 0x9E3779B1u);
+    if (!d->blend_enable) return ((fp << 1) | tx) ^ cm;
+    return (1u | ((d->blend_sfactor & 0xFFFu) << 1)
               | ((d->blend_dfactor & 0xFFFu) << 13)
               | ((d->blend_equation & 0x7u) << 25)
               | ((d->pass_pf == MTLPixelFormatRGBA16Float) ? 0x10000000u : (d->pass_pf == MTLPixelFormatRGBA32Float) ? 0x20000000u : 0u)
-              | (fp & 0x80000000u) | tx;
+              | (fp & 0x80000000u) | tx) ^ cm;
 }
 
 static id<MTLRenderPipelineState> pso_for(MtlDraw* d)
@@ -1829,6 +1844,7 @@ static id<MTLRenderPipelineState> pso_for(MtlDraw* d)
     pd.vertexDescriptor = vd;
     pd.colorAttachments[0].pixelFormat = d->pass_pf ? (MTLPixelFormat)d->pass_pf : MTLPixelFormatBGRA8Unorm;
     for (u32 k = 1; k < d->n_mrt && k < 4; k++) pd.colorAttachments[k].pixelFormat = pd.colorAttachments[0].pixelFormat;
+    for (u32 k = 0; k < (d->n_mrt ? d->n_mrt : 1) && k < 4; k++) pd.colorAttachments[k].writeMask = (MTLColorWriteMask)d->color_mask;
     if (rsx_depth_enabled()) pd.depthAttachmentPixelFormat = MTLPixelFormatDepth32Float;
     if (d->blend_enable) for (u32 k = 0; k < (d->n_mrt ? d->n_mrt : 1) && k < 4; k++) {
         MTLRenderPipelineColorAttachmentDescriptor* ca = pd.colorAttachments[k];
@@ -2072,10 +2088,10 @@ void rsx_metal_backend_present(void)
                       s_frame_no, s_draw_count, s_vert_count, s_cb_count);
               for (u32 i = 0; i < s_draw_count; i++) {
                   const MtlDraw* d = &s_draws[i];
-                  fprintf(stderr, "[drawlist] #%-3u surf=%08X%s[fmt=%X ct=%X pitch=%u B=%X Z=%X dt=%d/%X/%d sc=%X] vp=%s%08X fp=%08X/%08X n=%-5u topo=%d blend=%d(%03X,%03X) sc=%u,%u %ux%u tex:",
+                  fprintf(stderr, "[drawlist] #%-3u surf=%08X%s[fmt=%X ct=%X pitch=%u B=%X Z=%X dt=%d/%X/%d sc=%X] vp=%s%08X fp=%08X/%08X n=%-5u topo=%d blend=%d(%03X,%03X) cm=%X sc=%u,%u %ux%u tex:",
                           i, d->surf, cellGcmOffsetIsDisplay(d->surf) ? "*" : " ", d->surf_fmt, d->color_target, d->surf_pitch0, d->surf1, d->zeta_off, d->depth_test, d->depth_func, d->depth_mask, d->shader_ctrl,
                           d->vp >= 0 ? "" : "-", d->vp >= 0 ? s_vps[d->vp].hash : 0u, d->fp_addr, d->fp_hash, d->count, (int)d->topology,
-                          d->blend_enable, d->blend_sfactor, d->blend_dfactor, d->sx, d->sy, d->sw, d->sh);
+                          d->blend_enable, d->blend_sfactor, d->blend_dfactor, d->color_mask, d->sx, d->sy, d->sw, d->sh);
                   /* il microcodice del FP e' ancora quello del draw? (anello riusato) */
                   if (d->fp_addr) { u32 hn = fp_ucode_hash(d->fp_addr); if (hn != d->fp_hash) fprintf(stderr, " fp-ora=%08X", hn); }
                   for (u32 t = 0; t < RSX_MAX_TEXTURES; t++) if (d->tex[t])
