@@ -317,8 +317,11 @@ static inline int mfc_do_transfer(spu_context* spu, uint32_t lsa, uint64_t ea,
       static int s_one = -1; if (s_one < 0) s_one = getenv("SPU_DMA_EAWIN_ONE") ? 1 : 0;
       /* SPU_DMA_EAWIN_OVL=<n>: solo i contesti con quel modulo di job residente */
       static int s_ovl = -2; if (s_ovl == -2) { const char* e = getenv("SPU_DMA_EAWIN_OVL"); s_ovl = e ? atoi(e) : -1; }
+      /* SPU_DMA_EAWIN_FROM=<fotogramma>: solo da quel fotogramma RSX in poi (s.32) */
+      static long s_from = -2; if (s_from == -2) { const char* e = getenv("SPU_DMA_EAWIN_FROM"); s_from = e ? atol(e) : 0; }
+      extern unsigned rsx_backend_frame_no(void);
       if (s_hi && (!s_gate || g_hle_trace_armed) && (!s_one || g_spu_trace_lock_ctx == spu) &&
-          (s_ovl < 0 || spu->resident_ovl == s_ovl) &&
+          (s_ovl < 0 || spu->resident_ovl == s_ovl) && (s_from <= 0 || (long)rsx_backend_frame_no() >= s_from) &&
           (uint32_t)ea < (uint32_t)s_hi && (uint32_t)ea + size > (uint32_t)s_lo) {
           static int _n = 0;
           if (_n++ < 100000)
@@ -330,10 +333,12 @@ static inline int mfc_do_transfer(spu_context* spu, uint32_t lsa, uint64_t ea,
            * chiamante non si trova staticamente. Il registro di collegamento
            * della SPU (gpr[0], slot preferito) e' l'indirizzo di ritorno, cioe'
            * chi ha chiesto il trasferimento. */
-          if (_n <= 100000)
-              fprintf(stderr, "            ritorno a 0x%05X  (r7=0x%08X r8=0x%08X r9=0x%08X)\n",
+          if (_n <= 100000) {
+              uint32_t lab[5]; for (int k = 0; k < 5; k++) { uint32_t w = 0; memcpy(&w, vm_base + 0x50000480u + 16u * (uint32_t)k, 4); lab[k] = __builtin_bswap32(w); }
+              fprintf(stderr, "            ritorno a 0x%05X  (r7=0x%08X r8=0x%08X r9=0x%08X) r12=%08X r5=%08X r26=%08X label=%08X %08X %08X %08X %08X\n",
                       spu->gpr[0]._u32[0] & SPU_LS_MASK,
-                      spu->gpr[7]._u32[0], spu->gpr[8]._u32[0], spu->gpr[9]._u32[0]);
+                      spu->gpr[7]._u32[0], spu->gpr[8]._u32[0], spu->gpr[9]._u32[0],
+                      spu->gpr[12]._u32[0], spu->gpr[5]._u32[0], spu->gpr[26]._u32[0], lab[0], lab[1], lab[2], lab[3], lab[4]); }
           /* Il PPU aspetta un BIT dentro la parola trasferita: sapere che il
            * DMA e' partito non basta, serve il valore che porta. */
           if (_n <= 100000 && mfc_is_put(cmd)) {
@@ -1076,13 +1081,44 @@ static inline int mfc_submit(mfc_engine* mfc, spu_context* spu, uint32_t cmd)
                        * ("Rendering is stuck on reference value", sessione 28) */
                       nv = r23 + 16; why = "wrap";
                   } else { nv = r12; why = "altro"; }
-                  vm_write32((uint32_t)ea, nv);
-                  static int _n = 0; if (_n++ < 8 || (_n % 200) == 0)
+                  /* "altro" = label gia' fuori dall'intervallo (v == r12): il job
+                   * non sta aspettando, e riscrivere lo STESSO valore gareggiava
+                   * con la RELEASE del walker: il label tornava indietro, il job
+                   * credeva la RSX prima del suo blocco e lo riscriveva prima
+                   * della copia (s.32: 187-337 draw spazzatura su 3000 con lo
+                   * sblocco acceso, 0 spento; tutti gli sblocchi erano "altro"). */
+                  if (nv != v) vm_write32((uint32_t)ea, nv);
+                  static int _n = 0; static int s_ulog = -1; if (s_ulog < 0) s_ulog = getenv("GCM_LABEL_UNSTICK_LOG") ? 1 : 0;
+                  if (s_ulog && (_n++ < 8 || (_n % 200) == 0))
                       fprintf(stderr, "[label-unstick] lane %u (%s): label 0x%08X = %08X blocco (%08X, %08X] r23=%08X r26=%08X da %llu ms (%u letture): portato a %08X\n",
                               li, why, (uint32_t)ea, v, r12, r5, r23, r26, now - us[li].t0, us[li].n, nv);
                   us[li].ea = 0; }
           } else { us[li].ea = (uint32_t)ea; us[li].v = v; us[li].t0 = now; us[li].n = 1; } } }
 
+    /* Guardia dell'anello (s.32, v. rsx_ring_guard_check in rsx_commands.c):
+     * prima della GET del label, se il blocco (r12, r5] del job supererebbe
+     * il walker di un giro, nel label si mette un valore dentro l'intervallo
+     * e il job aspetta; altrimenti il label vero. */
+    if (size == 4 && (uint32_t)ea >= 0x50000480u && (uint32_t)ea < 0x500004D0u && mfc_is_get(cmd)) {
+        extern int rsx_ring_guard_check(unsigned, uint32_t, uint32_t, uint32_t, uint32_t, uint32_t*, uint32_t*);
+        uint32_t fake = 0, real = 0;
+        int r = rsx_ring_guard_check((((uint32_t)ea - 0x50000480u) >> 4) & 7, spu->gpr[12]._u32[0], spu->gpr[5]._u32[0],
+                                     spu->gpr[23]._u32[0], spu->gpr[26]._u32[0], &fake, &real);
+        if (r == 1) { uint32_t w = __builtin_bswap32(fake); memcpy(vm_base + (uint32_t)ea, &w, 4); }
+        else if (r == 0 && real) { uint32_t w = __builtin_bswap32(real); memcpy(vm_base + (uint32_t)ea, &w, 4); }
+    }
+    /* GCM_RING_TRACE=1 (s.32): ogni lettura del label della RSX da parte del
+     * job (0x480+16*lane) con il blocco (r12, r5] che vuole scrivere, dal
+     * fotogramma SPU_DMA_EAWIN_FROM in poi; insieme alle RELEASE del walker
+     * (rsx_commands.c) dice se il job supera il walker di un giro. */
+    { static int s_rt = -1; if (s_rt < 0) s_rt = getenv("GCM_RING_TRACE") ? 1 : 0;
+      if (s_rt && size == 4 && (uint32_t)ea >= 0x50000480u && (uint32_t)ea < 0x50000500u && mfc_is_get(cmd)) {
+          static long s_from = -2; if (s_from == -2) { const char* e = getenv("SPU_DMA_EAWIN_FROM"); s_from = e ? atol(e) : 0; }
+          extern unsigned rsx_backend_frame_no(void);
+          if ((long)rsx_backend_frame_no() >= s_from) { static int _n = 0; if (_n++ < 60000) {
+              uint32_t v = 0; memcpy(&v, vm_base + (uint32_t)ea, 4); v = __builtin_bswap32(v);
+              fprintf(stderr, "[ring] lane %u check r12=%08X r5=%08X label=%08X r23=%08X r26=%08X pc=%05X\n", (((uint32_t)ea - 0x50000480u) >> 4) & 7,
+                      spu->gpr[12]._u32[0], spu->gpr[5]._u32[0], v, spu->gpr[23]._u32[0], spu->gpr[26]._u32[0], (uint32_t)spu->pc & SPU_LS_MASK); } } } }
     /* SPU_LABEL_POLL=1 (sessione 28): il job 215 di Uncharted aspetta in
      * `func_4B48` che la posizione della RSX (label 0x480+16*lane) esca da
      * un intervallo (r12, r5]: stampa valore e registri di confronto. */

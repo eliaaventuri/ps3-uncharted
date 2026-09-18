@@ -80,6 +80,7 @@ typedef struct {
     u32 surf_w, surf_h;  /* dimensione della superficie (SURFACE_CLIP) al momento del draw */
     u32 tex_off[RSX_MAX_TEXTURES]; /* offset guest delle texture legate (per RSX_DRAWLIST) */
     u32 tex_fmt[RSX_MAX_TEXTURES]; /* formato (TEXTURE_FORMAT) delle texture legate */
+    u16 tex_samp[RSX_MAX_TEXTURES]; /* chiave del sampler per unita' (wrap s/t, filtri) da SET_TEXTURE_ADDRESS/FILTER (s.32) */
     u8  attr_ts[16];               /* (tipo<<4)|size degli attributi abilitati, 0 = spento (RSX_DRAWLIST, s.29) */
     u8  color_mask;                /* MTLColorWriteMask (s.30): SET_COLOR_MASK del guest, 0 = solo depth/stencil */
     u32 attr0_off, first;          /* offset guest dell'attributo 0 e primo vertice (RSX_DRAWLIST `va=`, s.30: per appaiare prepass e colore) */
@@ -721,7 +722,8 @@ static int vpdbg_common(const MtlDraw* d, const rsx_state* st, u32 prim, u32 wro
               for (int k = 0; k < 3; k++) if (!(f[k] == f[k]) || fabsf(f[k]) > 1e6f) ok = 0;
               if (!ok) { nb++; if (v < nb_first) nb_first = v; nb_last = v; continue; }
               for (int k = 0; k < 3; k++) { if (f[k] < mn[k]) mn[k] = f[k]; if (f[k] > mx[k]) mx[k] = f[k]; } }
-          fprintf(stderr, "[vpbbox] draw#%u surf=%08X vp=%08X fp=%08X n=%u spazzatura=%u (vertici %u..%u) bbox=[%.2f..%.2f %.2f..%.2f %.2f..%.2f] va=%08X\n", s_draw_count - 1, d->surf, s_vps[d->vp].hash, d->fp_hash, wrote, nb, nb ? nb_first : 0, nb ? nb_last : 0, mn[0], mx[0], mn[1], mx[1], mn[2], mx[2], d->attr0_off);
+          fprintf(stderr, "[vpbbox] draw#%u surf=%08X vp=%08X fp=%08X n=%u spazzatura=%u (vertici %u..%u) bbox=[%.2f..%.2f %.2f..%.2f %.2f..%.2f] va=%08X ea=%08X f#%lu\n", s_draw_count - 1, d->surf, s_vps[d->vp].hash, d->fp_hash, wrote, nb, nb ? nb_first : 0, nb ? nb_last : 0, mn[0], mx[0], mn[1], mx[1], mn[2], mx[2], d->attr0_off,
+                  (d->attr0_off & 0x80000000u) ? cellGcmResolveLocated(0, d->attr0_off & 0x7FFFFFFFu) : cellGcmResolveLocated(1, d->attr0_off), s_frame_no);
           /* RSX_VA_RECHECK: il blocco intero (float3 BE, passo dal formato) riletto al present */
           { static int s_rc = -1; if (s_rc < 0) s_rc = getenv("RSX_VA_RECHECK") ? 1 : 0;
             const rsx_vertex_attrib* va0 = &st->vertex_attribs[0];
@@ -744,7 +746,8 @@ static int vpdbg_common(const MtlDraw* d, const rsx_state* st, u32 prim, u32 wro
               rank++;
               fprintf(stderr, " a%d=[%.3g..%.3g %.3g..%.3g %.3g..%.3g %.3g..%.3g]%s", a, mn[0], mx[0], mn[1], mx[1], mn[2], mx[2], mn[3], mx[3], nan ? " NaN" : ""); }
           fprintf(stderr, "\n"); return 1; } }
-    for (u32 v = 0; v < 4 && v < wrote; v++) {
+    static long s_nv = -1; if (s_nv < 0) { const char* e = getenv("RSX_VP_DBG_VERTS"); s_nv = e ? atol(e) : 4; }   /* quanti vertici stampare (s.32) */
+    for (u32 v = 0; v < (u32)s_nv && v < wrote; v++) {
         fprintf(stderr, "[vpdbg]   v%u:", v);
         u32 rank = 0;
         for (int a = 0; a < 16; a++) { if (!(s_vps[d->vp].mask & (1u << a))) continue;
@@ -763,6 +766,48 @@ static int vpdbg_common(const MtlDraw* d, const rsx_state* st, u32 prim, u32 wro
         fprintf(stderr, "[vpdbg]   tex%u: %lux%lu off=%08X fmt=%08X ctrl0=%08X ctrl1(remap)=%08X\n", t, (unsigned long)d->tex[t].width,
                 (unsigned long)d->tex[t].height, st->textures[t].offset, st->textures[t].format, st->textures[t].control0, st->textures[t].control1);
     return 1;
+}
+
+/* Sampler per unita' (s.32). Prima c'era UN sampler (LINEAR + REPEAT) per
+ * tutto: la LUT 4x1 delle cascate d'ombra (tex15) veniva interpolata fra due
+ * cascate, e le letture in spazio schermo fuori da [0,1] si ripetevano.
+ * SET_TEXTURE_ADDRESS: bit 0-3 wrap s, 8-11 wrap t (1 WRAP, 2 MIRROR,
+ * 3 CLAMP_TO_EDGE, 4 BORDER, 5 CLAMP, 6-8 MIRROR_ONCE_*); SET_TEXTURE_FILTER:
+ * bit 16-18 min (1 = NEAREST), 24-26 mag (1 = NEAREST). Le nostre texture non
+ * hanno mip. RSX_SAMPLERS=0 torna al sampler unico. */
+static u16 sampler_key(const rsx_texture_state* t)
+{
+    return (u16)((t->address & 0xFu) | (((t->address >> 8) & 0xFu) << 4) |
+                 ((((t->filter >> 16) & 7u) == 1u) ? 0x100u : 0u) | ((((t->filter >> 24) & 7u) == 1u) ? 0x200u : 0u));
+}
+static MTLSamplerAddressMode wrap_to_metal(u32 w)
+{
+    switch (w) {
+    case 2:  return MTLSamplerAddressModeMirrorRepeat;
+    case 3: case 5: return MTLSamplerAddressModeClampToEdge;
+    case 4:  return MTLSamplerAddressModeClampToZero;
+    case 6: case 7: case 8: return MTLSamplerAddressModeMirrorClampToEdge;
+    default: return MTLSamplerAddressModeRepeat;
+    }
+}
+static id<MTLSamplerState> s_sampler;
+static id<MTLSamplerState> sampler_for(u16 key)
+{
+    static int s_on = -1; if (s_on < 0) { const char* e = getenv("RSX_SAMPLERS"); s_on = (e && *e == '0') ? 0 : 1; }
+    if (!s_on) return s_sampler;
+    static u16 keys[64]; static id<MTLSamplerState> vals[64]; static u32 n;
+    for (u32 i = 0; i < n; i++) if (keys[i] == key) return vals[i];
+    if (n >= 64) return s_sampler;
+    MTLSamplerDescriptor* sd = [MTLSamplerDescriptor new];
+    sd.minFilter = (key & 0x100) ? MTLSamplerMinMagFilterNearest : MTLSamplerMinMagFilterLinear;
+    sd.magFilter = (key & 0x200) ? MTLSamplerMinMagFilterNearest : MTLSamplerMinMagFilterLinear;
+    sd.sAddressMode = wrap_to_metal(key & 0xFu);
+    sd.tAddressMode = wrap_to_metal((key >> 4) & 0xFu);
+    sd.rAddressMode = sd.tAddressMode;
+    id<MTLSamplerState> ss = [s_dev newSamplerStateWithDescriptor:sd];
+    if (!ss) return s_sampler;
+    keys[n] = key; vals[n] = ss; n++;
+    return ss;
 }
 
 static void record_draw(const rsx_state* st, u32 prim, u32 base, u32 count,
@@ -810,7 +855,8 @@ static void record_draw(const rsx_state* st, u32 prim, u32 base, u32 count,
     draw_shadow_setup(d, st);
     for (u32 t = 0; t < RSX_MAX_TEXTURES; t++) {
         d->tex[t] = (st->textures[t].control0 & 0x80000000u) ? tex_with_remap(s_tex[t].tex, st->textures[t].control1) : nil;
-        d->tex_off[t] = st->textures[t].offset; d->tex_fmt[t] = st->textures[t].format; }
+        d->tex_off[t] = st->textures[t].offset; d->tex_fmt[t] = st->textures[t].format;
+        d->tex_samp[t] = sampler_key(&st->textures[t]); }
     d->zeta_off       = st->surface_zeta_offset;
     d->depth_test = st->depth_test_enable; d->depth_func = st->depth_func; d->depth_mask = st->depth_mask;
     d->shader_ctrl = st->shader_control;
@@ -1490,7 +1536,6 @@ static void texcache_sweep(void)
               for (u32 j = 0; j < s_texcache_n; j++) if (s_texcache[j].offset == s_texcache[i].offset) v++;
               if (v > 4) { shown++; fprintf(stderr, "[texcache]   offset 0x%08X: %d varianti, es. fmt=0x%X rect=0x%08X\n", s_texcache[i].offset, v, s_texcache[i].format, s_texcache[i].image_rect); } } } }
 }
-static id<MTLSamplerState> s_sampler;
 /* Il fragment program tradotto del guest dichiara le texture come ARRAY
  * (`array<texture2d<float>, 16> rsx_tex [[texture(0)]]`), e Metal vuole TUTTI
  * gli elementi dell'array legati: legando solo le unita' residenti, ogni
@@ -2560,7 +2605,7 @@ void rsx_metal_backend_present(void)
                         /* OGNI slot, non solo quelli residenti: vedi s_dummy_tex. */
                         [enc setFragmentTexture:(d->tex[t] ? d->tex[t] : s_dummy_tex)
                                         atIndex:t];
-                        [enc setFragmentSamplerState:s_sampler atIndex:t];
+                        [enc setFragmentSamplerState:sampler_for(d->tex_samp[t]) atIndex:t];
                     }
                 }
                 if (d->fp_addr) {

@@ -522,13 +522,53 @@ ricompila anche il VP; da separare, ma non e' il collo di bottiglia).
 `RSX_DUMP_COUNT>1` resta rotto. Gemini a quota esaurita (limite 20 richieste
 al giorno): l'audit degli helper SPU (`tasks/TASK.md`) non e' partito.
 
+**I vertici spazzatura: il job lappava il walker (RISOLTO con la guardia
+dell'anello).** Con `GCM_RING_TRACE=1` (nuovo: ogni controllo del label da
+parte del job con il blocco (r12, r5] e ogni RELEASE del walker) si vede il
+protocollo: ogni lane alloca blocchi contigui (vertici 8-16 KB + pacchetto
+0x100-0x300) da un anello di 0x199980 byte (lane 0 = 0x20800000, poi
++0x199980 ciascuna, r26 = fine), e prima di scrivere controlla il label:
+aspetta SOLO se r12 < label <= r5 (nel wrap, r5 > r26: se label <= r23). La
+RELEASE del walker vale la fine del blocco = r12 del successivo, quindi cade
+quasi sempre sul confine escluso. Sul ferro la RSX e' piu' veloce degli SPU
+e il label sta a ridosso del produttore: basta. Da noi il job fa un giro
+INTERO dell'anello in ~700 righe di log mentre il label si sposta di pochi
+blocchi: passa il walker e riscrive tutti i blocchi non ancora consumati
+(spazzatura 187-435 draw su 3000, solo nel prepass che e' il primo
+consumatore). Le RELEASE sono in ordine (11909 crescenti, 85 decrescenti = 65
+wrap + 20 reset all'inizio dell'anello). Non era lo sblocco dei label (tutti
+"altro" = no-op; A/B ripetuto: on 187/337/331/287/435, off 0/0/0, con lo
+sblocco spento 1 corsa su 6 non arriva al livello).
+
+Fatto: `rsx_ring_guard_*` in `rsx_commands.c`: posizione virtuale (giri x
+anello + offset) del produttore (dai controlli del job, `spu_dma.h`) e del
+consumatore (dalle RELEASE, giro = quello del blocco prodotto con quella fine;
+nel wrap la fine e' r23 nel giro dopo); se il blocco nuovo supererebbe il
+consumatore di un giro meno `GCM_RING_GUARD_MARGIN` (0x40000), prima della GET
+si scrive nel label un valore dentro l'intervallo (r5, o r23 nel wrap) e il job
+aspetta da solo; altrimenti il label vero. Valvola `GCM_RING_GUARD_MAX_MS`
+(2000) contro i blocchi circolari (mai scattata). `GCM_RING_GUARD=0` spegne.
+Misura: 0 draw spazzatura su 3000 in 3 corse su 3, livello raggiunto, stesso
+numero di fotogrammi in 95 s (f#2452-2453 contro f#2178-2450).
+
+**Ma braccia e gambe mancano anche con i dati puliti: le mesh delle gambe
+sono SCHIACCIATE.** `RSX_VP_DBG_VERTS=2000` (nuovo) stampa tutti i vertici:
+il draw della coscia (prepass 5A5B70A5, 465 vertici, 123 posizioni distinte,
+123/155 triangoli consecutivi condividono un lato: e' una lista di triangoli
+sana) ha il bbox giusto (24 x 77 x 26 cm) ma area totale 0.045 m² (una coscia
+ne fa ~0.2) e 977 px² su schermo per una striscia 41 x 200: i vertici stanno
+su una superficie sottile — lo skinning multi-osso (cosce, stinchi, braccia)
+esce collassato verso l'osso; testa, torso, mani (1 osso) no. I contatori di
+visibilita' confermano: 2.042-3.569 frammenti per draw invece di ~20.000. E'
+un errore di calcolo SPU nel job di skinning (o nelle matrici dei joint): il
+precedente e' `fi`. Serve l'audit degli helper (`tasks/TASK.md`).
+
 ### Fronte aperto (dopo la sessione 32)
 
-1. Braccia e gambe della muta: capire perche' il prepass (5A5B70A5, LEQUAL +
-   write, cm=0) non scrive lo z delle gambe; misurare i frammenti del prepass
-   (`RSX_FP_TRACE=34F0B9F8`) in un fotogramma SENZA spazzatura.
-2. Vertici spazzatura: chi riscrive i blocchi dopo la copia (A/B ripetuto
-   sblocco on/off; `SPU_DMA_EAWIN` sul va di un draw spazzatura).
+1. Braccia e gambe della muta schiacciate (skinning multi-osso): audit degli
+   helper SPU contro RPCS3 (Gemini a quota esaurita: farlo a mano o con il
+   worker locale), partendo da shufb/rotq*/selb/cwd e dalle conversioni.
+2. (risolto: guardia dell'anello) — tenere d'occhio `[ring-guard] valvola`.
 3. Ombre: con la WPOS giusta il termine d'ombra e' quasi tutto in ombra
    (scena scura, `RSX_SHADOW_FORCE=1` la illumina): coordinate della shadow
    map/atlante e la LUT 4x1 letta con il sampler LINEAR+REPEAT unico (serve un

@@ -527,8 +527,20 @@ void cellGcmSetWaitFlip(void)
 #ifdef _WIN32
     __declspec(dllimport) void __stdcall Sleep(unsigned long);
 #endif  /* elsewhere: runtime/platform/win32_compat.h */
-    for (int i = 0; i < 64 && s_flip_status == CELL_GCM_FLIP_STATUS_WAITING; i++)
-        Sleep(1);
+    /* GCM_WAITFLIP_MS (s.32): il tetto di 64 ms era pensato per titoli a 60
+     * Hz; Uncharted nel livello va a ~8 fps (125 ms per fotogramma) e il PPU
+     * usciva dall'attesa PRIMA che il walker avesse consumato il fotogramma:
+     * i job SPU riscrivevano l'anello dei vertici (0x20800000+) che il walker
+     * stava ancora leggendo (prepass con posizioni spazzatura: gambe e
+     * braccia del personaggio mancanti). Misurato (s.32): Uncharted la chiama UNA
+     * volta sola (al boot, e scade): il ritmo lo tiene altrove. Default 64 ms; 0 = infinito. */
+    static long s_wf = -1; if (s_wf < 0) { const char* e = getenv("GCM_WAITFLIP_MS"); s_wf = e ? atol(e) : 64; }
+    { static unsigned long s_n = 0, s_to = 0; s_n++;
+      long i = 0;
+      for (; (s_wf <= 0 || i < s_wf) && s_flip_status == CELL_GCM_FLIP_STATUS_WAITING; i++)
+          Sleep(1);
+      if (s_flip_status == CELL_GCM_FLIP_STATUS_WAITING) { s_to++;
+          static int _n = 0; if (_n++ < 8) fprintf(stderr, "[cellGcmSetWaitFlip] timeout dopo %ld ms (%lu su %lu attese)\n", i, s_to, s_n); } }
     s_flip_status = CELL_GCM_FLIP_STATUS_DONE;
 }
 

@@ -408,6 +408,87 @@ static void draw_clause_append(rsx_state* state, int kind, u32 first, u32 count)
 }
 extern u32 cellGcmResolveLocated(int local, u32 offset);
 extern unsigned long long ps3_ms_now(void);
+/* ---------------------------------------------------------------------------
+ * Guardia dell'anello dei job SPU (s.32). Il job di geometria di Uncharted
+ * (ovl 215) alloca i blocchi (vertici + pacchetto) da un anello per lane
+ * (0x199980 byte) e prima di scrivere un blocco (r12, r5] legge il label
+ * 0x480+16*lane (posizione consumata dalla RSX, = fine dell'ultimo blocco) e
+ * aspetta SOLO se r12 < label <= r5. Con la RSX vera, piu' veloce degli SPU,
+ * il label sta sempre a ridosso del produttore e quel controllo basta. Il
+ * nostro walker e' piu' lento delle lane: il job fa un giro intero
+ * dell'anello in ~700 righe di log mentre il label si muove di poche
+ * posizioni, il label cade quasi sempre su un confine di blocco (escluso
+ * dall'intervallo) e il job riscrive TUTTI i blocchi non ancora consumati
+ * (prepass con vertici spazzatura, 187-435 draw su 3000). Qui si tiene la
+ * posizione virtuale (giri x anello + offset) di produttore e consumatore:
+ * se il blocco nuovo supererebbe il consumatore di un giro meno un margine,
+ * al job si fa leggere un valore DENTRO il suo intervallo (r5, o r23 nel
+ * wrap) e lui aspetta da solo; appena il walker rilascia abbastanza, torna
+ * a leggere il label vero. GCM_RING_GUARD=0 spegne, _MARGIN i byte. */
+#define RING_GUARD_LANES 5
+#define RING_GUARD_SIZE  0x199980u
+#define RING_GUARD_HIST  1024
+static struct {
+    u32 last_r12, last_rel, real_label; int have_p, have_c;
+    u64 lap_p, lap_c, prod_v, cons_v;
+    struct { u32 end; u64 lap; } hist[RING_GUARD_HIST]; u32 hist_n;
+    unsigned long waits; unsigned long long wait_t0;
+} s_rg[RING_GUARD_LANES];
+static int ring_guard_on(void) { static int on = -1; if (on < 0) { const char* e = getenv("GCM_RING_GUARD"); on = (e && *e == '0') ? 0 : 1; } return on; }
+/* il walker ha rilasciato `val` per la lane (fine di un blocco consumato) */
+void rsx_ring_guard_release(unsigned lane, u32 val)
+{
+    if (lane >= RING_GUARD_LANES) return;
+    if (!ring_guard_on()) return;
+    /* il giro del consumatore = quello in cui il produttore ha allocato il
+     * blocco che finisce qui (l'ultimo, se piu' d'uno) */
+    u64 lap = s_rg[lane].lap_c; int found = 0;
+    for (u32 k = 0; k < s_rg[lane].hist_n && k < RING_GUARD_HIST; k++) {
+        u32 i = (s_rg[lane].hist_n - 1 - k) % RING_GUARD_HIST;
+        if (s_rg[lane].hist[i].end == val) { lap = s_rg[lane].hist[i].lap; found = 1; break; } }
+    if (!found && s_rg[lane].have_c && val + RING_GUARD_SIZE / 2 < s_rg[lane].last_rel) lap = s_rg[lane].lap_c + 1;
+    s_rg[lane].lap_c = lap; s_rg[lane].cons_v = lap * RING_GUARD_SIZE + val;
+    s_rg[lane].last_rel = val; s_rg[lane].real_label = val; s_rg[lane].have_c = 1;
+}
+/* il job sta per controllare il label per il blocco (r12, r5]: 1 = deve
+ * aspettare (scrivi `*fake` nel label), 0 = scrivi il label vero */
+int rsx_ring_guard_check(unsigned lane, u32 r12, u32 r5, u32 r23, u32 r26, u32* fake, u32* real)
+{
+    if (lane >= RING_GUARD_LANES || !ring_guard_on()) return -1;
+    static long s_margin = -1; if (s_margin < 0) { const char* e = getenv("GCM_RING_GUARD_MARGIN"); s_margin = e ? strtol(e, 0, 0) : 0x40000; }
+    /* un blocco che supera la fine dell'anello (r5 > r26) riparte dall'inizio e
+     * finisce a r23: la RELEASE del suo pacchetto vale r23, nel giro dopo */
+    const int wrap = (r5 > r26);
+    const u32 end = wrap ? r23 : r5; const u64 lap_end = s_rg[lane].lap_p + (wrap ? 1u : 0u);
+    if (!s_rg[lane].have_p || r12 != s_rg[lane].last_r12) {   /* blocco nuovo */
+        if (s_rg[lane].have_p && r12 + RING_GUARD_SIZE / 2 < s_rg[lane].last_r12) s_rg[lane].lap_p++;   /* wrap */
+        s_rg[lane].last_r12 = r12; s_rg[lane].have_p = 1;
+        u32 i = s_rg[lane].hist_n % RING_GUARD_HIST; s_rg[lane].hist[i].end = end; s_rg[lane].hist[i].lap = s_rg[lane].lap_p + (wrap ? 1u : 0u); s_rg[lane].hist_n++;
+        s_rg[lane].wait_t0 = 0;
+    }
+    s_rg[lane].prod_v = lap_end * RING_GUARD_SIZE + end;
+    *real = s_rg[lane].real_label;
+    if (!s_rg[lane].have_c) return 0;
+    if (s_rg[lane].prod_v > s_rg[lane].cons_v + RING_GUARD_SIZE - (u64)s_margin) {
+        /* valvola: un'attesa nostra che dura piu' di GCM_RING_GUARD_MAX_MS (default
+         * 2000) e' un blocco circolare (il walker aspetta il pacchetto di questa
+         * lane): si lascia passare e si risincronizza il consumatore */
+        extern unsigned long long ps3_ms_now(void); unsigned long long now = ps3_ms_now();
+        static long s_max = -1; if (s_max < 0) { const char* e = getenv("GCM_RING_GUARD_MAX_MS"); s_max = e ? atol(e) : 2000; }
+        if (!s_rg[lane].wait_t0) s_rg[lane].wait_t0 = now;
+        if (s_max > 0 && now - s_rg[lane].wait_t0 > (unsigned long long)s_max) {
+            static int _v = 0; if (_v++ < 16) fprintf(stderr, "[ring-guard] lane %u: valvola dopo %llu ms, blocco (%08X, %08X] prod_v=%llu cons_v=%llu label=%08X\n",
+                                                     lane, now - s_rg[lane].wait_t0, r12, r5, (unsigned long long)s_rg[lane].prod_v, (unsigned long long)s_rg[lane].cons_v, s_rg[lane].real_label);
+            s_rg[lane].cons_v = s_rg[lane].prod_v - RING_GUARD_SIZE + (u64)s_margin + 0x10000u; s_rg[lane].lap_c = s_rg[lane].cons_v / RING_GUARD_SIZE; s_rg[lane].wait_t0 = 0;
+            return 0; }
+        *fake = wrap ? r23 : r5; s_rg[lane].waits++;
+        { static int s_dbg = -1; if (s_dbg < 0) s_dbg = getenv("GCM_RING_GUARD_DBG") ? 1 : 0; static unsigned long _n = 0;
+          if (s_dbg && ((_n++ % 2000) == 0)) fprintf(stderr, "[ring-guard] lane %u aspetta: blocco (%08X, %08X] prod_v=%llu cons_v=%llu (label vero %08X) attese=%lu\n",
+                                                     lane, r12, r5, (unsigned long long)s_rg[lane].prod_v, (unsigned long long)s_rg[lane].cons_v, s_rg[lane].real_label, s_rg[lane].waits); }
+        return 1; }
+    return 0;
+}
+
 int rsx_process_method(rsx_state* state, u32 method, u32 data)
 {
     /* YDKJ_RSXTRACE=<N>: trace the first N methods (bare "1" keeps the old 250).
@@ -526,8 +607,16 @@ int rsx_process_method(rsx_state* state, u32 method, u32 data)
          * aspettava per sempre (livello fermo con GCM_PARK_POLL_US=200). */
         { static long s_ld = -1; if (s_ld < 0) { const char* e = getenv("GCM_LABEL_DELAY_US"); s_ld = e ? atol(e) : 0; }
           if (s_ld > 0 && method == 0x1D74) { rsx_label_delay_push(VM_HLE_INJECT_BASE + (s_sem_off & 0x00FFFFFFu), val, (unsigned)s_ld); }
-          else vm_write32(VM_HLE_INJECT_BASE + (s_sem_off & 0x00FFFFFFu), val); }
+          else vm_write32(VM_HLE_INJECT_BASE + (s_sem_off & 0x00FFFFFFu), val);
+          if (method == 0x1D74 && (s_sem_off & 0xFFFFFFu) >= 0x480u && (s_sem_off & 0xFFFFFFu) < 0x4D0u)
+              rsx_ring_guard_release((((s_sem_off & 0xFFFFFFu) - 0x480u) >> 4), val); }
         { static int _l=0; if(_l++<8) fprintf(stderr,"[RSX] label write @0x%08X = 0x%08X (sync fence, raw 0x%08X)\n", VM_HLE_INJECT_BASE+(s_sem_off&0xFFFFFF), val, data); }
+        { static int s_rt = -1; if (s_rt < 0) s_rt = getenv("GCM_RING_TRACE") ? 1 : 0;   /* v. spu_dma.h [ring] */
+          if (s_rt && method == 0x1D74 && (s_sem_off & 0xFFFFFFu) >= 0x480u && (s_sem_off & 0xFFFFFFu) < 0x500u) {
+              static long s_from = -2; if (s_from == -2) { const char* e = getenv("SPU_DMA_EAWIN_FROM"); s_from = e ? atol(e) : 0; }
+              extern unsigned rsx_backend_frame_no(void);
+              if ((long)rsx_backend_frame_no() >= s_from) { static int _n = 0; if (_n++ < 60000)
+                  fprintf(stderr, "[ring] lane %u RELEASE %08X\n", (((s_sem_off & 0xFFFFFFu) - 0x480u) >> 4) & 7, val); } } }
         /* RSX_LABEL_DBG=<hex offset>: tutte le scritture di quel label (il job
          * 215 aspetta il 0x480 = "fin dove la RSX ha consumato l'anello SPU") */
         { static long s_ld = -2; if (s_ld == -2) { const char* e = getenv("RSX_LABEL_DBG"); s_ld = e ? strtol(e, 0, 16) : -1; }
