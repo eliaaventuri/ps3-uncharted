@@ -457,6 +457,7 @@ static int rsx_fp_decompile_internal(
             if (s_force == 0 || s_force == 1) snprintf(cmp, sizeof cmp, "%s", s_force ? "true" : "false");
             else if (s_force == 3) snprintf(cmp, sizeof cmp, "z");        /* 3: il texel, 4: il riferimento (diagnostica) */
             else if (s_force == 4) snprintf(cmp, sizeof cmp, "c.z");
+            else if (s_force == 5 && zf != 0 && zf != 7) snprintf(cmp, sizeof cmp, "z %s c.z", fp_zfunc_op(zf));   /* 5: operandi scambiati (texel OP ref) */
             else if (zf == 0 || zf == 7) snprintf(cmp, sizeof cmp, "%s", fp_zfunc_op(zf));
             else snprintf(cmp, sizeof cmp, "c.z %s z", fp_zfunc_op(zf));
             snprintf(fn, sizeof fn,

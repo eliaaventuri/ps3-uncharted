@@ -565,6 +565,17 @@ Il personaggio (Drake) usciva nero e "a pezzi". Misure e fix, in ordine:
   grande = piu' vicino) e il nostro pass la scrive al contrario, o il
   confronto va fatto sul texel a 16 bit. Serve l'oracolo: RPCS3 con
   RenderDoc sullo stesso fotogramma (shadow map 03EE0000 e zfunc).
+- Correzione: 031E0000 (640x360 FP16) NON e' un buffer di luce a mezza
+  risoluzione: e' un atlante di piccoli render (una cassa, un pezzo di
+  cielo, un blocco verde: probe/riflessi). La giacca e' disegnata nel pass
+  finale 016D0000 dal FP F728899C (vp 99180BEE) -- una sonda su di esso
+  (`RSX_FP_PROBE=F728899C:float4(h[3].xyz*0.5+0.5,1)`) si vede sulla giacca.
+  Quel FP applica l'ombra SOLO se `cc0.z = saturate(dot(h3, -c12)) != 0`
+  (N.L verso la luce) e con `RSX_SHADOW_FORCE=3/4` la giacca resta scura:
+  la scurezza della giacca non dipende dal termine d'ombra ma da N.L o dal
+  resto dell'illuminazione (normale h3 = normal map tex1 .yw + tangenti da
+  tc). Prossimo: sonda `float4(saturate(dot(h[3].xyz,-fp_constants[12].xyz)).xxx,1)`
+  su F728899C, poi la normale e la luce (c12) contro RPCS3.
 - Misure fatte e scartate: `RSX_DEPTH_CLAMP` (nessun effetto), il
   ricontrollo dei buchi di zeri nelle CALL (`GCM_ZERO_TRACE=50`: 919 su 1,3
   milioni scritti dopo il passaggio del walker, tutti parole 00020000 /
