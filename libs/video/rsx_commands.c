@@ -377,6 +377,35 @@ int rsx_report_shadow_get(u32 ea, u32* val)
     return 0;
 }
 static u32 s_report_ctx = 0xFEED0001u;   /* NV4097_SET_CONTEXT_DMA_REPORT */
+/* Coalescenza dei DRAW_ARRAYS / DRAW_INDEX_ARRAY (sessione 30). Ogni parola
+ * porta al massimo 256 vertici ((count-1) in 8 bit) e un draw grande arriva
+ * come una sequenza di parole CONTIGUE dentro lo stesso BEGIN/END. Mandarle al
+ * backend una per una faceva ripartire l'assemblaggio delle primitive a ogni
+ * parola: 256 = 85*3+1, quindi dalla seconda parola in poi una lista di
+ * triangoli e' sfalsata di un vertice e i triangoli sono sbagliati (il cielo
+ * del livello a triangoli con i buchi: 23 parole da 256). Come RPCS3
+ * (draw_clause::append): le parole contigue diventano UN draw, emesso a END
+ * (o subito, fuori da BEGIN/END). RSX_DRAW_COALESCE=0 torna a una per una. */
+static struct { int kind; u32 first, count; } s_dc;   /* kind: 0 niente, 1 arrays, 2 indexed */
+static void draw_clause_flush(rsx_state* state)
+{
+    if (!s_dc.kind) return;
+    if (s_backend) {
+        if (s_dc.kind == 1 && s_backend->draw_arrays)
+            s_backend->draw_arrays(s_backend->userdata, state->primitive_type, s_dc.first, s_dc.count);
+        else if (s_dc.kind == 2 && s_backend->draw_indexed)
+            s_backend->draw_indexed(s_backend->userdata, state->primitive_type, s_dc.first, s_dc.count);
+    }
+    s_dc.kind = 0;
+}
+static void draw_clause_append(rsx_state* state, int kind, u32 first, u32 count)
+{
+    static int s_on = -1; if (s_on < 0) { const char* e = getenv("RSX_DRAW_COALESCE"); s_on = (e && *e == '0') ? 0 : 1; }
+    if (s_on && s_dc.kind == kind && s_dc.first + s_dc.count == first) { s_dc.count += count; return; }
+    draw_clause_flush(state);
+    s_dc.kind = kind; s_dc.first = first; s_dc.count = count;
+    if (!s_on || !state->in_begin_end) draw_clause_flush(state);
+}
 extern u32 cellGcmResolveLocated(int local, u32 offset);
 extern unsigned long long ps3_ms_now(void);
 int rsx_process_method(rsx_state* state, u32 method, u32 data)
@@ -823,6 +852,7 @@ int rsx_process_method(rsx_state* state, u32 method, u32 data)
 
     /* Draw */
     if (method == NV4097_SET_BEGIN_END) {
+        draw_clause_flush(state);   /* le parole accumulate nel BEGIN/END che si chiude */
         if (data != 0) {
             state->primitive_type = data;
             state->in_begin_end = 1;
@@ -916,8 +946,7 @@ int rsx_process_method(rsx_state* state, u32 method, u32 data)
                 }
             }
         }
-        if (s_backend && s_backend->draw_arrays)
-            s_backend->draw_arrays(s_backend->userdata, state->primitive_type, first, count);
+        draw_clause_append(state, 1, first, count);
         return 0;
     }
 
@@ -941,9 +970,7 @@ int rsx_process_method(rsx_state* state, u32 method, u32 data)
         u32 first = data & 0xFFFFFF;
         u32 count = ((data >> 24) & 0xFF) + 1;
         { static int _d=0; if (_d++ < 8) fprintf(stderr, "[RSX] DRAW_INDEX_ARRAY prim=%u first=%u count=%u idxoff=0x%X dma=0x%X\n", state->primitive_type, first, count, state->index_array_offset, state->index_array_dma); }
-        if (s_backend && s_backend->draw_indexed)
-            s_backend->draw_indexed(s_backend->userdata, state->primitive_type,
-                                    first, count);
+        draw_clause_append(state, 2, first, count);
         return 0;
     }
 
