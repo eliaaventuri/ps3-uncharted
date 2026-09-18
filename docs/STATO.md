@@ -531,10 +531,52 @@ misurare "meta' fotogrammi piatti" con uno screenshot della finestra.
 silenzio nel controllo degli header (`hdr_new`): corretto; `RT_BUILD=<dir>`
 sceglie la libreria runtime, `SPU_LDFLAGS` va al link.
 
+**Le pipeline Metal erano condivise fra programmi diversi** (`pso_key`,
+sera): la chiave era una parola a 32 bit con i campi impacchettati e nel
+ramo con blend il fragment program contribuiva con UN bit: ogni draw con
+blend e lo stesso stato di blend (stesso VP) prendeva la pipeline del primo
+programma capitato, e le varianti del FP (ombre, cubemap) condividevano la
+pipeline della prima variante. Trovato cosi': la sonda `RSX_FP_PROBE=
+43C6091F:float4(1,0,1,1)` dipingeva le gambe di magenta nel passaggio EQUAL
+(034B0000) mentre col programma vero le gambe NON venivano scritte (la sonda
+cambia la pipeline). Ora la chiave e' un hash a 64 bit di tutto (programma,
+variante `shadow_key`+`cube_mask`, blend, formato, MRT, maschera, export
+z), e la coppia incorporata (FP non ancora compilato) sta in una voce sua
+(vp = -2) invece di rubare quella dei draw con VP non compilabile. Effetto:
+il buffer delle normali ha Drake INTERO (gambe e braccia), il ponte e' del
+colore caldo di RPCS3 (era verdastro), le casse giuste. Resta (in
+016D0000, prima del composito): una copia scura semitrasparente di Drake
+spostata a sinistra di ~40 px e il corpo semitrasparente. Non e' nessuno dei
+draw con blend del pass finale (sondati 09E6635A = sprite, 6852BBAF = mare,
+67C98421, 6EBA84BF, C9A90509, 7D51FF19, 3CA5C8B6: nessuno la disegna) e non
+e' il composito (`RSX_FP_PROBE=A310E8C2:float4(rsx_tex[0].sample(...` mostra
+016D0000 tal quale): resta il pass di luce direzionale con ombra
+(#1961: FP A3954DDC, MRT x3, legge 2D50000 depth, 3EE0000 shadow, 034B0000
+normali). Ipotesi: e' l'OMBRA di Drake proiettata nel posto sbagliato (in
+RPCS3 sta ai suoi piedi a sinistra). `RSX_SHADOW_FORCE=1` non ancora
+misurato (due corse senza fotogramma sopra soglia).
+
+**Dati dei vertici letti a meta' scrittura** (`RSX_VP_DBG_STAT=2` +
+`RSX_VA_RECHECK=1`): in ~1 corsa su 2 i blocchi di posizione del prepass
+(job 215, PUT da 16 KB a 0x20800000+ da LS 0x2F000, lane diverse da quella
+che patcha il pacchetto) sono meta' spazzatura al momento della copia e
+completi al present. Con `GCM_LABEL_UNSTICK_MS=0` spazzatura 0/940 (c40) —
+lo sblocco dei label a 20 ms fa riscrivere al job un blocco che il walker
+non ha ancora copiato — ma con lo sblocco spento 2 corse su 4 (c52, c54)
+sono rimaste indietro (meno eventi, nessun fotogramma sopra soglia in
+125 s): e' il motivo per cui esiste. Da fare: capire l'attesa del job
+(label 0x480+16*lane) invece di forzarla. Aggiunto anche il conteggio delle
+"generazioni di park" dei pacchetti CALLati (`cellGcm_note_park_put`,
+`[stale-call]`, `GCM_STALE_WAIT=0`): il walker NON consuma mai pacchetti
+vecchi (0 casi), quindi il PPU/job 217 riparcheggia sempre in tempo.
+
 ### Fronte aperto (dopo la sessione 31)
 
-1. Semi-trasparenza del personaggio (gambe/pistola visibili attraverso il
-   corpo, `img_s31_drake_fi.jpg`); confronto: `img_s31_rpcs3_dive_boat.jpg`.
+1. Copia-ombra di Drake spostata a sinistra e corpo semitrasparente in
+   016D0000 (v. sopra): misurare `RSX_SHADOW_FORCE=1`, poi le coordinate
+   della shadow map (atlante 2432x1216, due cascate) nel FP A3954DDC.
+1b. Lo sblocco dei label (20 ms) corrompe i vertici del prepass; a 0 il
+   gioco a volte si ferma.
 2. Il dump multi-fotogramma (`RSX_DUMP_COUNT>1`) corrompe i fotogrammi
    successivi; verificare se anche a schermo alterna fotogrammi piatti.
 3. RPCS3 dice anche: `TEX3D` in 62 punti (volumi, unit 1/2) e `TEX1D(15)` —

@@ -275,7 +275,14 @@ static inline int mfc_do_transfer(spu_context* spu, uint32_t lsa, uint64_t ea,
                       (uint32_t)spu->pc & SPU_LS_MASK, cmd, lsa, (uint32_t)ea, size,
                       (uint32_t)s_w); } }
     if (mfc_is_put(cmd)) { char kb[12]; snprintf(kb, sizeof kb, "P%02X@%X", cmd & 0xFF, lsa >> 4);
-        spu_wring_note(spu, kb, (uint32_t)ea, size, &spu->ls[lsa]); }
+        spu_wring_note(spu, kb, (uint32_t)ea, size, &spu->ls[lsa]);
+        /* Park dei pacchetti RSX (s.31): un PUT la cui prima parola e' un JUMP
+         * (tipo 1) puo' essere il "JUMP-a-se-stesso" con cui il job 217
+         * parcheggia un pacchetto CALLato; cellGcmSys decide (mappa IO->EA) e
+         * conta le generazioni, cosi' il walker non consuma un pacchetto
+         * vecchio prima che sia stato riparcheggiato e ripatchato. */
+        if (size >= 4) { const uint8_t* q = &spu->ls[lsa]; uint32_t w0 = ((uint32_t)q[0] << 24) | ((uint32_t)q[1] << 16) | ((uint32_t)q[2] << 8) | q[3];
+            if ((w0 >> 29) == 1u) { extern void cellGcm_note_park_put(uint32_t ea, uint32_t word); cellGcm_note_park_put((uint32_t)ea, w0); } } }
     else if (mfc_is_get(cmd) && spu_wring_on()) { extern uint8_t* vm_base; char kb[12]; snprintf(kb, sizeof kb, "G%02X@%X", cmd & 0xFF, lsa >> 4);
         spu_wring_note(spu, kb, (uint32_t)ea, size, vm_base + (uint32_t)ea); }   /* le letture: dicono la base che il codice SPU usa */
     /* SPU_DMA_LSWATCH=<hex>: ogni GET (verso la local store) la cui finestra

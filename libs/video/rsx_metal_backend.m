@@ -238,7 +238,7 @@ static dispatch_semaphore_t s_inflight;
 
 /* PSO cache. Keyed on the blend state, which is all the built-in shader path
  * varies; a guest-shader key (vp/fp ucode hash) joins it when that lands. */
-typedef struct { u32 key; int vp; id<MTLRenderPipelineState> pso; } MtlPsoEntry;
+typedef struct { u64 key; int vp; id<MTLRenderPipelineState> pso; } MtlPsoEntry;
 /* 512 voci erano poche per il livello (sessione 28): con la cache dei
  * programmi piena ogni draw cadeva sulla coppia incorporata e la scena era
  * un colore piatto. 8192 voci e un indice hash (sonda lineare). */
@@ -247,8 +247,8 @@ typedef struct { u32 key; int vp; id<MTLRenderPipelineState> pso; } MtlPsoEntry;
 static MtlPsoEntry s_pso_cache[MTL_PSO_CACHE];
 static u32         s_pso_hash[MTL_PSO_HASH];   /* indice+1, 0 = vuoto */
 static u32         s_pso_count;
-static u32 pso_slot(u32 key, int vp) { u32 h = key * 2654435761u ^ ((u32)vp * 40503u); h ^= h >> 15; return h & (MTL_PSO_HASH - 1); }
-static id<MTLRenderPipelineState> pso_find(u32 key, int vp)
+static u32 pso_slot(u64 key, int vp) { u32 h = (u32)(key ^ (key >> 32)) * 2654435761u ^ ((u32)vp * 40503u); h ^= h >> 15; return h & (MTL_PSO_HASH - 1); }
+static id<MTLRenderPipelineState> pso_find(u64 key, int vp)
 {
     for (u32 hs = pso_slot(key, vp), n = 0; n < MTL_PSO_HASH; n++, hs = (hs + 1) & (MTL_PSO_HASH - 1)) {
         u32 ix = s_pso_hash[hs]; if (!ix) return nil;
@@ -694,6 +694,7 @@ static void vp_end_draw(MtlDraw* d)
  * RSX_VP_DBG_FP=<hex> filtra per fragment program; con PS3_TTY_BT parte
  * dall'hit. Ritorna 1 se il draw va stampato (record_draw aggiunge indici e
  * byte grezzi). */
+static struct { u32 draw, ea, va, fmt; float x, y, z; } s_recheck[64]; static u32 s_recheck_n;
 static int vpdbg_common(const MtlDraw* d, const rsx_state* st, u32 prim, u32 wrote, const char* via)
 {
     static int s_vd = -2; static int s_vn = 0; static int s_gate = -1;
@@ -712,7 +713,22 @@ static int vpdbg_common(const MtlDraw* d, const rsx_state* st, u32 prim, u32 wro
     const float* base_f = s_vpd + d->vbase / 4; u32 na = d->vstride / 16;
     /* RSX_VP_DBG_STAT=1: una riga con min/max di ogni attributo su TUTTI i
      * vertici del draw (per vedere i dati stantii/sovrascritti, s.29) */
-    { static int s_st = -1; if (s_st < 0) s_st = getenv("RSX_VP_DBG_STAT") ? 1 : 0;
+    { static int s_st = -1; if (s_st < 0) { const char* e = getenv("RSX_VP_DBG_STAT"); s_st = e ? atoi(e) : 0; }
+      if (s_st == 2) {   /* s.31: quanti vertici del draw hanno una posizione spazzatura, e il bbox dei sani */
+          u32 nb = 0; float mn[3] = {1e30f,1e30f,1e30f}, mx[3] = {-1e30f,-1e30f,-1e30f};
+          for (u32 v = 0; v < wrote; v++) { const float* f = base_f + (size_t)v * na * 4; int ok = 1;
+              for (int k = 0; k < 3; k++) if (!(f[k] == f[k]) || fabsf(f[k]) > 1e6f) ok = 0;
+              if (!ok) { nb++; continue; }
+              for (int k = 0; k < 3; k++) { if (f[k] < mn[k]) mn[k] = f[k]; if (f[k] > mx[k]) mx[k] = f[k]; } }
+          fprintf(stderr, "[vpbbox] draw#%u surf=%08X vp=%08X fp=%08X n=%u spazzatura=%u bbox=[%.2f..%.2f %.2f..%.2f %.2f..%.2f] va=%08X\n", s_draw_count - 1, d->surf, s_vps[d->vp].hash, d->fp_hash, wrote, nb, mn[0], mx[0], mn[1], mx[1], mn[2], mx[2], d->attr0_off);
+          /* RSX_VA_RECHECK: il blocco intero (float3 BE, passo dal formato) riletto al present */
+          { static int s_rc = -1; if (s_rc < 0) s_rc = getenv("RSX_VA_RECHECK") ? 1 : 0;
+            const rsx_vertex_attrib* va0 = &st->vertex_attribs[0];
+            if (s_rc && nb && va0->type == 2 && va0->size == 3 && s_recheck_n < 64) {
+                s_recheck[s_recheck_n].draw = s_draw_count - 1; s_recheck[s_recheck_n].va = va0->offset; s_recheck[s_recheck_n].fmt = va0->format;
+                s_recheck[s_recheck_n].ea = (va0->offset & 0x80000000u) ? cellGcmResolveLocated(0, va0->offset & 0x7FFFFFFFu) : cellGcmResolveLocated(1, va0->offset);
+                s_recheck[s_recheck_n].x = (float)wrote; s_recheck[s_recheck_n].y = (float)nb; s_recheck[s_recheck_n].z = (float)va0->stride; s_recheck_n++; } }
+          return 0; }
       if (s_st) { fprintf(stderr, "[vpstat] draw#%u vp=%08X fp=%08X n=%u", s_draw_count - 1, s_vps[d->vp].hash, d->fp_addr, wrote);
           /* o0 = c[0..3] x v0 del primo vertice, e la z finale con la viewport (s.30: shadow map a z=0) */
           if (st && wrote) { const float* v0 = base_f; float o[4];
@@ -780,6 +796,15 @@ static void record_draw(const rsx_state* st, u32 prim, u32 base, u32 count,
     for (int a = 0; a < 16; a++) { const rsx_vertex_attrib* va = &st->vertex_attribs[a];
         d->attr_ts[a] = (va->enabled && va->stride) ? (u8)(((va->type & 0xF) << 4) | (va->size & 0xF)) : 0; }
     d->attr0_off = st->vertex_attribs[0].offset; d->first = base;
+    /* RSX_VA_WATCH=<hex>: ogni draw il cui attributo 0 sta a quell'offset:
+     * quanti vertici (float3) sono spazzatura al momento della copia (s.31,
+     * da incrociare con SPU_DMA_EAWIN sullo stesso blocco). */
+    { static long s_vw = -2; if (s_vw == -2) { const char* e = getenv("RSX_VA_WATCH"); s_vw = e ? (long)strtoul(e, 0, 16) : -1; }
+      if (s_vw >= 0 && (long)(st->vertex_attribs[0].offset & 0x7FFFFFFFu) == s_vw && d->vp >= 0 && wrote) {
+          const float* bf = s_vpd + tmp.vbase / 4; u32 na = tmp.vstride / 16, nb = 0;
+          for (u32 v = 0; v < wrote; v++) { const float* f = bf + (size_t)v * na * 4; for (int k = 0; k < 3; k++) if (!(f[k] == f[k]) || fabsf(f[k]) > 1e6f) { nb++; break; } }
+          fprintf(stderr, "[va-watch] f#%lu draw#%u va=%08X ea=%08X n=%u spazzatura=%u fp=%08X surf=%08X\n", s_frame_no, s_draw_count - 1, st->vertex_attribs[0].offset,
+                  (st->vertex_attribs[0].offset & 0x80000000u) ? cellGcmResolveLocated(0, st->vertex_attribs[0].offset & 0x7FFFFFFFu) : cellGcmResolveLocated(1, st->vertex_attribs[0].offset), wrote, nb, d->fp_hash, st->surface_color_offset[0]); } }
     draw_shadow_setup(d, st);
     for (u32 t = 0; t < RSX_MAX_TEXTURES; t++) {
         d->tex[t] = (st->textures[t].control0 & 0x80000000u) ? tex_with_remap(s_tex[t].tex, st->textures[t].control1) : nil;
@@ -1882,29 +1907,37 @@ static id<MTLLibrary> guest_fp_library(u32 fp_addr, int vp, u32 ctrl, u32 mrt, u
     return lib;
 }
 
-static u32 pso_key(const MtlDraw* d)
+static u64 pso_key(const MtlDraw* d)
 {
-    /* The guest program is part of the key: two draws with identical blend
-     * state but different fragment programs are different pipelines. */
-    /* l'export della profondita' (SHADER_CONTROL & 0xE) cambia il programma */
-    const u32 fp = d->fp_addr ? (1u | (((d->fp_hash ? d->fp_hash : d->fp_addr) ^ ((d->shader_ctrl & 0xEu) << 28) ^ (d->pass_pf * 0x9E3779B1u) ^ (d->n_mrt * 0x85EBCA77u)) * 2654435761u)) : 0u;
-    const u32 tx = d->tex0 ? 0x40000000u : 0u;
-    /* la maschera di scrittura fa parte della pipeline; con la maschera piena
-     * (il caso comune) la chiave resta quella di prima */
-    const u32 cm = (d->color_mask == 0xF) ? 0u : ((u32)(d->color_mask ^ 0xF) * 0x9E3779B1u);
-    if (!d->blend_enable) return ((fp << 1) | tx) ^ cm;
-    return (1u | ((d->blend_sfactor & 0xFFFu) << 1)
-              | ((d->blend_dfactor & 0xFFFu) << 13)
-              | ((d->blend_equation & 0x7u) << 25)
-              | ((d->pass_pf == MTLPixelFormatRGBA16Float) ? 0x10000000u : (d->pass_pf == MTLPixelFormatRGBA32Float) ? 0x20000000u : 0u)
-              | (fp & 0x80000000u) | tx) ^ cm;
+    /* Tutto cio' che cambia la pipeline entra nella chiave (s.31): prima era
+     * una parola a 32 bit con i campi impacchettati, e nel ramo con blend il
+     * fragment program contribuiva con UN bit: ogni draw con blend e lo
+     * stesso stato di blend prendeva la pipeline del primo programma
+     * capitato (con lo stesso VP), e le varianti del FP (ombre, cubemap)
+     * condividevano la pipeline della prima variante. La chiave e' un hash a
+     * 64 bit di: programma (hash strutturale + variante), stato di blend,
+     * formato del bersaglio, MRT, maschera di colore, export della
+     * profondita', tex0 incorporato. */
+    u64 h = 0x9E3779B97F4A7C15ull;
+#define PSO_MIX(v) do { h ^= (u64)(v) + 0x9E3779B97F4A7C15ull + (h << 6) + (h >> 2); } while (0)
+    PSO_MIX(d->fp_addr ? (d->fp_hash ? d->fp_hash : d->fp_addr) : 0u);
+    PSO_MIX(d->fp_addr ? 1u : 0u);
+    PSO_MIX(d->shadow_key);            /* variante del FP: ombre + cube_mask */
+    PSO_MIX(d->shader_ctrl & 0xEu);
+    PSO_MIX(d->pass_pf);
+    PSO_MIX(d->n_mrt);
+    PSO_MIX(d->color_mask);
+    PSO_MIX(d->tex0 ? 1u : 0u);
+    if (d->blend_enable) { PSO_MIX(1u); PSO_MIX(d->blend_sfactor); PSO_MIX(d->blend_dfactor); PSO_MIX(d->blend_equation); }
+#undef PSO_MIX
+    return h;
 }
 
 static id<MTLRenderPipelineState> pso_for(MtlDraw* d)
 {
     /* Un VP che non compila (ok=0) manda il draw sul percorso incorporato. */
     int vp = (d->vp >= 0 && s_vps[d->vp].ok) ? d->vp : -1;
-    u32 key = pso_key(d);
+    u64 key = pso_key(d);
     { id<MTLRenderPipelineState> hit = pso_find(key, vp); if (hit) return hit; }
     if (s_pso_count >= (u32)(sizeof(s_pso_cache) / sizeof(s_pso_cache[0]))) {
         static int _n = 0; if (_n++ < 4) fprintf(stderr, "[RSX metal] cache delle pipeline PIENA (%u): draw con la coppia incorporata\n", s_pso_count);
@@ -1944,7 +1977,7 @@ static id<MTLRenderPipelineState> pso_for(MtlDraw* d)
     if (!glib && vp >= 0) {
         /* il VP non compila: si riprova la coppia con il VS incorporato */
         vp = -1; d->vp = -1;
-        { id<MTLRenderPipelineState> hit = pso_find(key, vp); if (hit) return hit; }
+        { id<MTLRenderPipelineState> hit = pso_find(key, -2); if (hit) return hit; }
         vd = [MTLVertexDescriptor vertexDescriptor];
         for (int i = 0; i < 3; i++) {
             vd.attributes[i].format      = MTLVertexFormatFloat4;
@@ -1954,6 +1987,7 @@ static id<MTLRenderPipelineState> pso_for(MtlDraw* d)
         vd.layouts[MTL_VB_INDEX].stride = sizeof(MtlVertex);
         glib = (d->fp_addr && !s_fb) ? guest_fp_library(d->fp_addr, -1, d->shader_ctrl, (d->n_mrt ? d->n_mrt : 1) | (d->shadow_key << 8), d->fp_hash) : nil;
     }
+    if (!glib) { id<MTLRenderPipelineState> hit = pso_find(key, -2); if (hit) return hit; }   /* coppia incorporata gia' creata */
     if (glib) {
         static int s_dtg = -1;
         if (s_dtg < 0) { const char* e = getenv("RSX_DEBUG_TINT");
@@ -2002,7 +2036,10 @@ static id<MTLRenderPipelineState> pso_for(MtlDraw* d)
         return nil;
     }
     s_pso_cache[s_pso_count].key = key;
-    s_pso_cache[s_pso_count].vp  = vp;
+    /* La coppia incorporata (programma del guest non ancora compilato, o
+     * senza programma) NON deve occupare la voce (chiave, -1) che spetta ai
+     * draw con il VP non compilabile ma il FP vero: vp = -2 (s.31). */
+    s_pso_cache[s_pso_count].vp  = glib ? vp : -2;
     s_pso_cache[s_pso_count].pso = pso;
     pso_index_add(s_pso_count);
     s_pso_count++;
@@ -2198,6 +2235,14 @@ void rsx_metal_backend_present(void)
         }
 
         s_frame_no++;
+        if (s_recheck_n) {   /* RSX_VA_RECHECK: v. vpdbg_common (RSX_VP_DBG_STAT=2) */
+            for (u32 i = 0; i < s_recheck_n; i++) {
+                const u32 n = (u32)s_recheck[i].x, stride = (u32)s_recheck[i].z; u32 nb = 0;
+                for (u32 v = 0; v < n; v++) { const u8* p = vm_base + s_recheck[i].ea + v * stride; int ok = 1;
+                    for (int k = 0; k < 3; k++) { u32 w = ((u32)p[k*4] << 24) | ((u32)p[k*4+1] << 16) | ((u32)p[k*4+2] << 8) | p[k*4+3]; float f; memcpy(&f, &w, 4); if (!(f == f) || fabsf(f) > 1e6f) ok = 0; }
+                    if (!ok) nb++; }
+                fprintf(stderr, "[va-recheck] f#%lu draw#%u va=%08X n=%u spazzatura al record=%u al present=%u\n", s_frame_no - 1, s_recheck[i].draw, s_recheck[i].va, n, (u32)s_recheck[i].y, nb); }
+            s_recheck_n = 0; }
         /* RSX_FRAMESTAT=<n>: una riga ogni n fotogrammi presentati, con il
          * numero di draw: la misura piu' economica di "il gioco va avanti". */
         { static int s_fs = -2; static unsigned long s_acc = 0, s_nz = 0;

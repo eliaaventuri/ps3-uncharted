@@ -704,6 +704,56 @@ static u32 gcm_io2ea(u32 io)
     return ((u32)ea_page << 20) | (io & 0xFFFFFu);
 }
 
+/* Generazioni di park dei pacchetti CALLati (s.31). I pacchetti della scena
+ * di Uncharted vivono in due regioni (IO 0x0A400000 / 0x0A500000) usate a
+ * fotogrammi alterni: job 206 li azzera, job 217 ci scrive il JUMP-a-se'
+ * (park), job 215 li patcha con i comandi veri. Il PPU accoda i CALL nella
+ * FIFO PRIMA che i job abbiano riparcheggiato la regione: la RSX vera ci
+ * arriva millisecondi dopo, il nostro walker (drain su put) subito, e
+ * consumava il pacchetto del fotogramma prima -- con i vertici dell'anello
+ * che i job stavano riscrivendo (meta' spazzatura: gambe e braccia del
+ * personaggio mancanti nel passaggio EQUAL). Qui: per ogni pacchetto, quante
+ * volte e' stato parcheggiato e quante consumato; un CALL a un pacchetto
+ * gia' parcheggiato in passato e non riparcheggiato dopo l'ultimo consumo
+ * aspetta (come un park) finche' il job 217 non lo riparcheggia. */
+#define GCM_PARKGEN_N 65536u
+static struct { u32 ea; u16 parked, consumed; } s_parkgen[GCM_PARKGEN_N];
+static unsigned long s_parkgen_stale, s_parkgen_waits;
+static int parkgen_slot(u32 ea, int create)
+{
+    u32 h = (ea * 2654435761u) >> 16;
+    for (u32 n = 0; n < GCM_PARKGEN_N; n++, h = (h + 1) & (GCM_PARKGEN_N - 1)) {
+        if (s_parkgen[h].ea == ea) return (int)h;
+        if (s_parkgen[h].ea == 0) { if (!create) return -1; s_parkgen[h].ea = ea; return (int)h; }
+    }
+    return -1;
+}
+void cellGcm_note_park_put(u32 ea, u32 word)
+{
+    /* e' un park solo se il JUMP punta a se stesso (IO -> EA) */
+    static unsigned long s_notes, s_parks;
+    s_notes++;
+    if (gcm_io2ea(word & 0x1FFFFFFCu) != ea) { static int _n = 0; if (_n++ < 3) fprintf(stderr, "[parkgen] PUT a %08X con prima parola %08X (JUMP -> EA %08X): non e' un park\n", ea, word, gcm_io2ea(word & 0x1FFFFFFCu)); return; }
+    s_parks++;
+    { static int _n = 0; if (_n++ < 3 || (s_parks % 20000) == 0) fprintf(stderr, "[parkgen] park #%lu a %08X (note %lu)\n", s_parks, ea, s_notes); }
+    int h = parkgen_slot(ea, 1);
+    if (h >= 0) __atomic_fetch_add(&s_parkgen[h].parked, 1, __ATOMIC_RELEASE);
+}
+/* 1 = il pacchetto a `ea` e' stato parcheggiato almeno una volta ma NON dopo
+ * l'ultimo consumo: contenuto vecchio, il walker deve aspettare. */
+static int parkgen_stale(u32 ea)
+{
+    int h = parkgen_slot(ea, 0);
+    if (h < 0) return 0;
+    u16 pk = __atomic_load_n(&s_parkgen[h].parked, __ATOMIC_ACQUIRE);
+    return pk != 0 && pk == s_parkgen[h].consumed;
+}
+static void parkgen_consume(u32 ea)
+{
+    int h = parkgen_slot(ea, 0);
+    if (h >= 0) s_parkgen[h].consumed = __atomic_load_n(&s_parkgen[h].parked, __ATOMIC_ACQUIRE);
+}
+
 /* RSX get pointer (IO offset) + one-deep CALL return slot. The FIFO-wrap
  * recycle path teleports these when it resets a ring without a JUMP command. */
 unsigned long long ps3_ms_now(void)
@@ -2015,6 +2065,23 @@ static void gcm_rsx_process_fifo_unlocked(void)
                     continue; }
               { static int _rd = -1; if (_rd < 0) _rd = getenv("GCM_RECDBG") ? 1 : 0;
                 if (_rd) fprintf(stderr, "[CALL] %08X -> %08X (put=%08X)\n", s_fifo_getoff, tgt, put); }
+              /* GCM_STALE_WAIT=0 spegne l'attesa (resta il conteggio) */
+              { static int sw = -1; if (sw < 0) { const char* e = getenv("GCM_STALE_WAIT"); sw = (e && *e == '0') ? 0 : 1; }
+                u32 tea = gcm_io2ea(tgt);
+                static u32 s_stale_tgt; static unsigned long long s_stale_since;
+                static long s_stale_max = -1; if (s_stale_max < 0) { const char* e = getenv("GCM_STALE_MAX_MS"); s_stale_max = e ? atol(e) : 500; }   /* via di fuga: dopo N ms si va comunque */
+                int stale = parkgen_stale(tea);
+                if (stale && sw) {
+                    unsigned long long now = ps3_ms_now();
+                    if (tgt != s_stale_tgt) { s_stale_tgt = tgt; s_stale_since = now; }
+                    if ((long)(now - s_stale_since) > s_stale_max) { stale = 0;
+                        { static int _n = 0; if (_n++ < 8) fprintf(stderr, "[stale-call] %08X -> %08X: non riparcheggiato dopo %ld ms, proseguo\n", s_fifo_getoff, tgt, s_stale_max); } } }
+                if (stale) {
+                    s_parkgen_stale++;
+                    if (sw) { s_parkgen_waits++; s_parked = 1;
+                        { static int _n = 0; if (_n++ < 4 || (s_parkgen_waits % 5000) == 0) fprintf(stderr, "[stale-call] %08X -> %08X non ancora riparcheggiato: aspetto (#%lu)\n", s_fifo_getoff, tgt, s_parkgen_waits); }
+                        break; } }
+                else parkgen_consume(tea); }
               s_fifo_calloff = s_fifo_getoff + 4;
               s_fifo_getoff  = tgt; s_call_start = tgt; }
             continue;
