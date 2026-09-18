@@ -105,6 +105,7 @@ typedef struct {
      * Puntatori non ritenuti: la cache (s_texcache) le tiene vive fino a fine
      * fotogramma. */
     __unsafe_unretained id<MTLTexture> tex[RSX_MAX_TEXTURES];
+    u32 shader_window;             /* SET_SHADER_WINDOW al momento del draw (WPOS, s.32) */
 } MtlDraw;
 static u32 fp_ucode_hash(u32 fp_addr);
 static u32 fpc_block(u32 fp_addr, u32* out_n);
@@ -715,12 +716,12 @@ static int vpdbg_common(const MtlDraw* d, const rsx_state* st, u32 prim, u32 wro
      * vertici del draw (per vedere i dati stantii/sovrascritti, s.29) */
     { static int s_st = -1; if (s_st < 0) { const char* e = getenv("RSX_VP_DBG_STAT"); s_st = e ? atoi(e) : 0; }
       if (s_st == 2) {   /* s.31: quanti vertici del draw hanno una posizione spazzatura, e il bbox dei sani */
-          u32 nb = 0; float mn[3] = {1e30f,1e30f,1e30f}, mx[3] = {-1e30f,-1e30f,-1e30f};
+          u32 nb = 0, nb_first = 0xFFFFFFFFu, nb_last = 0; float mn[3] = {1e30f,1e30f,1e30f}, mx[3] = {-1e30f,-1e30f,-1e30f};
           for (u32 v = 0; v < wrote; v++) { const float* f = base_f + (size_t)v * na * 4; int ok = 1;
               for (int k = 0; k < 3; k++) if (!(f[k] == f[k]) || fabsf(f[k]) > 1e6f) ok = 0;
-              if (!ok) { nb++; continue; }
+              if (!ok) { nb++; if (v < nb_first) nb_first = v; nb_last = v; continue; }
               for (int k = 0; k < 3; k++) { if (f[k] < mn[k]) mn[k] = f[k]; if (f[k] > mx[k]) mx[k] = f[k]; } }
-          fprintf(stderr, "[vpbbox] draw#%u surf=%08X vp=%08X fp=%08X n=%u spazzatura=%u bbox=[%.2f..%.2f %.2f..%.2f %.2f..%.2f] va=%08X\n", s_draw_count - 1, d->surf, s_vps[d->vp].hash, d->fp_hash, wrote, nb, mn[0], mx[0], mn[1], mx[1], mn[2], mx[2], d->attr0_off);
+          fprintf(stderr, "[vpbbox] draw#%u surf=%08X vp=%08X fp=%08X n=%u spazzatura=%u (vertici %u..%u) bbox=[%.2f..%.2f %.2f..%.2f %.2f..%.2f] va=%08X\n", s_draw_count - 1, d->surf, s_vps[d->vp].hash, d->fp_hash, wrote, nb, nb ? nb_first : 0, nb ? nb_last : 0, mn[0], mx[0], mn[1], mx[1], mn[2], mx[2], d->attr0_off);
           /* RSX_VA_RECHECK: il blocco intero (float3 BE, passo dal formato) riletto al present */
           { static int s_rc = -1; if (s_rc < 0) s_rc = getenv("RSX_VA_RECHECK") ? 1 : 0;
             const rsx_vertex_attrib* va0 = &st->vertex_attribs[0];
@@ -796,6 +797,7 @@ static void record_draw(const rsx_state* st, u32 prim, u32 base, u32 count,
     for (int a = 0; a < 16; a++) { const rsx_vertex_attrib* va = &st->vertex_attribs[a];
         d->attr_ts[a] = (va->enabled && va->stride) ? (u8)(((va->type & 0xF) << 4) | (va->size & 0xF)) : 0; }
     d->attr0_off = st->vertex_attribs[0].offset; d->first = base;
+    d->shader_window  = st->shader_window;
     /* RSX_VA_WATCH=<hex>: ogni draw il cui attributo 0 sta a quell'offset:
      * quanti vertici (float3) sono spazzatura al momento della copia (s.31,
      * da incrociare con SPU_DMA_EAWIN sullo stesso blocco). */
@@ -1768,15 +1770,34 @@ static u32          s_fp_hash[MTL_FP_HASH];   /* indice+1, 0 = vuoto */
 static u32          s_fp_count;
 static u32 fp_slot(u32 hash, int vp, u32 ctrl, u32 mrt) { u32 h = hash * 2654435761u ^ ((u32)vp * 40503u) ^ (ctrl * 2246822519u) ^ (mrt * 3266489917u); h ^= h >> 15; return h & (MTL_FP_HASH - 1); }
 
+/* L'ultimo "float4 _o = " dell'MSL: e' l'epilogo vero del programma (con un
+ * RET lo stesso testo compare anche nel ritorno anticipato, s.32). */
+static char* fp_last_epilogue(char* msl)
+{
+    char* last = NULL;
+    for (char* m = strstr(msl, "    float4 _o = "); m; m = strstr(m + 1, "    float4 _o = ")) last = m;
+    return last;
+}
 static id<MTLLibrary> guest_fp_library(u32 fp_addr, int vp, u32 ctrl, u32 mrt, u32 hash)
 {
     extern void rsx_fp_set_mrt_count(int n);
     if (!hash) hash = fp_ucode_hash(fp_addr);
+    /* RSX_FP_ALIAS=<A>:<B> (s.32, diagnostica): i draw con il programma A usano
+     * la libreria gia' compilata di B (stessi vp/ctrl/variante), se esiste */
+    { static long s_a = -2, s_b = -1; if (s_a == -2) { const char* e = getenv("RSX_FP_ALIAS"); s_a = -1; if (e) { char* c = 0; s_a = (long)strtoul(e, &c, 16); if (c && *c == ':') s_b = (long)strtoul(c + 1, 0, 16); } }
+      if ((long)hash == s_a && s_b > 0) {
+          for (u32 hs = fp_slot((u32)s_b, vp, ctrl, mrt), n = 0; n < MTL_FP_HASH; n++, hs = (hs + 1) & (MTL_FP_HASH - 1)) {
+              u32 ix = s_fp_hash[hs]; if (!ix) break;
+              GuestFpEntry* e = &s_fp_cache[ix - 1];
+              if (e->hash == (u32)s_b && e->vp == vp && e->ctrl == ctrl && e->mrt == mrt && __atomic_load_n(&e->done, __ATOMIC_ACQUIRE) && e->lib) return e->lib; } } }
     for (u32 hs = fp_slot(hash, vp, ctrl, mrt), n = 0; n < MTL_FP_HASH; n++, hs = (hs + 1) & (MTL_FP_HASH - 1)) {
         u32 ix = s_fp_hash[hs]; if (!ix) break;
         GuestFpEntry* e = &s_fp_cache[ix - 1];
-        if (e->hash == hash && e->vp == vp && e->ctrl == ctrl && e->mrt == mrt)
-            return __atomic_load_n(&e->done, __ATOMIC_ACQUIRE) ? e->lib : nil; }   /* nil = in compilazione o fallito */
+        if (e->hash == hash && e->vp == vp && e->ctrl == ctrl && e->mrt == mrt) {
+            /* RSX_FP_TRACE=<hash>: ogni ricerca di quel programma (s.32) */
+            { static long s_tr = -2; if (s_tr == -2) { const char* t = getenv("RSX_FP_TRACE"); s_tr = t ? (long)strtoul(t, 0, 16) : -1; }
+              if ((long)hash == s_tr) { static int _n = 0; if (_n++ < 40) fprintf(stderr, "[fptrace] %08X vp=%d ctrl=%X mrt=%X: voce %u done=%d lib=%d f#%lu\n", hash, vp, ctrl, mrt, ix - 1, __atomic_load_n(&e->done, __ATOMIC_ACQUIRE), e->lib ? 1 : 0, s_frame_no); } }
+            return __atomic_load_n(&e->done, __ATOMIC_ACQUIRE) ? e->lib : nil; } }   /* nil = in compilazione o fallito */
     /* RSX_FP_CACHE_MAX=<n>: tetto artificiale (A/B: con 512 il livello non
      * si fermava ma la scena era piatta, sessione 28) */
     static long s_fpmax = -1; if (s_fpmax < 0) { const char* e = getenv("RSX_FP_CACHE_MAX"); s_fpmax = e ? atol(e) : (long)(sizeof(s_fp_cache) / sizeof(s_fp_cache[0])); }
@@ -1824,11 +1845,12 @@ static id<MTLLibrary> guest_fp_library(u32 fp_addr, int vp, u32 ctrl, u32 mrt, u
                * bassi del proprio hash (r=bit 0-7, g=8-15, b=16-23), da leggere
                * nel dump della superficie per risalire al programma. */
               static int s_pall = -1; if (s_pall < 0) { const char* e = getenv("RSX_FP_PROBE"); s_pall = (e && !strncmp(e, "all", 3)) ? 1 : 0; }
-              if (s_pall) { char* m = strstr(msl, "    float4 _o = ");
+              /* l'ULTIMA occorrenza: con un RET (s.32) l'epilogo compare anche prima */
+              if (s_pall) { char* m = fp_last_epilogue(msl);
                   if (m) { char tail[256]; snprintf(tail, sizeof tail, "    return float4(%u.0/255.0, %u.0/255.0, %u.0/255.0, 1.0);\n}\n", hash & 0xFF, (hash >> 8) & 0xFF, (hash >> 16) & 0xFF);
                            if (strlen(tail) + 1 < sizeof(msl) - (size_t)(m - msl)) strcpy(m, tail); } }
               for (int k = 0; k < s_pn; k++) if (s_ph[k] == hash) {
-                  char* m = strstr(msl, "    float4 _o = ");
+                  char* m = fp_last_epilogue(msl);
                   if (m) { char tail[4096]; snprintf(tail, sizeof tail, "    { float4 _p = float4(%s); return select(float4(0), _p, _p == _p); }\n}\n", s_pe[k]);
                            size_t room = sizeof(msl) - (size_t)(m - msl); if (strlen(tail) + 1 < room) { strcpy(m, tail); fprintf(stderr, "[RSX metal] fp %08X: sonda '%s'\n", hash, s_pe[k]); } } } }
             NSString* src = (vp >= 0)
@@ -1877,7 +1899,10 @@ static id<MTLLibrary> guest_fp_library(u32 fp_addr, int vp, u32 ctrl, u32 mrt, u
                 const int nins = n; const u32 fpa = fp_addr, fph = hash; const int vpi = vp;
                 dispatch_async(s_cq, ^{
                     NSError* e2 = nil;
+                    unsigned long long t0 = (unsigned long long)([NSDate timeIntervalSinceReferenceDate] * 1000.0);
                     id<MTLLibrary> l2 = [s_dev newLibraryWithSource:src options:co error:&e2];
+                    { static _Atomic unsigned long long s_tot = 0, s_n = 0; unsigned long long dt = (unsigned long long)([NSDate timeIntervalSinceReferenceDate] * 1000.0) - t0; unsigned long long tot = atomic_fetch_add(&s_tot, dt) + dt; unsigned long long nn = atomic_fetch_add(&s_n, 1) + 1;
+                      if ((nn % 64) == 0) fprintf(stderr, "[RSX metal] compilazioni: %llu, media %llu ms, ultima %llu ms (%lu byte)\n", nn, tot / nn, dt, (unsigned long)[src length]); }
                     if (!l2) {
                         fprintf(stderr, "[RSX metal] guest %sfp 0x%08X compile failed: %s\n", vpi >= 0 ? "vp + " : "", fpa, [[e2 localizedDescription] UTF8String]);
                         if (vpi >= 0) s_vps[vpi].ok = 0;
@@ -1988,6 +2013,8 @@ static id<MTLRenderPipelineState> pso_for(MtlDraw* d)
         glib = (d->fp_addr && !s_fb) ? guest_fp_library(d->fp_addr, -1, d->shader_ctrl, (d->n_mrt ? d->n_mrt : 1) | (d->shadow_key << 8), d->fp_hash) : nil;
     }
     if (!glib) { id<MTLRenderPipelineState> hit = pso_find(key, -2); if (hit) return hit; }   /* coppia incorporata gia' creata */
+    { static long s_tr = -2; if (s_tr == -2) { const char* t = getenv("RSX_FP_TRACE"); s_tr = t ? (long)strtoul(t, 0, 16) : -1; }
+      if ((long)d->fp_hash == s_tr) { static int _n = 0; if (_n++ < 20) fprintf(stderr, "[fptrace] pso %08X: nuova pipeline vp=%d (d->vp=%d) glib=%d key=%016llX n=%u base=%u vbase=%u vstride=%u mask=%04X f#%lu\n", d->fp_hash, vp, d->vp, glib ? 1 : 0, (unsigned long long)key, d->count, d->base, d->vbase, d->vstride, vp >= 0 ? s_vps[vp].mask : 0, s_frame_no); } }
     if (glib) {
         static int s_dtg = -1;
         if (s_dtg < 0) { const char* e = getenv("RSX_DEBUG_TINT");
@@ -2269,10 +2296,10 @@ void rsx_metal_backend_present(void)
                       s_frame_no, s_draw_count, s_vert_count, s_cb_count);
               for (u32 i = 0; i < s_draw_count; i++) {
                   const MtlDraw* d = &s_draws[i];
-                  fprintf(stderr, "[drawlist] #%-3u surf=%08X%s[fmt=%X ct=%X pitch=%u B=%X Z=%X dt=%d/%X/%d sc=%X] vp=%s%08X fp=%08X/%08X n=%-5u topo=%d blend=%d(%03X,%03X) cm=%X cull=%X va=%08X+%u sh=%X sc=%u,%u %ux%u tex:",
+                  fprintf(stderr, "[drawlist] #%-3u surf=%08X%s[fmt=%X ct=%X pitch=%u B=%X Z=%X dt=%d/%X/%d sc=%X] vp=%s%08X fp=%08X/%08X n=%-5u topo=%d blend=%d(%03X,%03X) cm=%X cull=%X va=%08X+%u sh=%X sc=%u,%u %ux%u vp=%g,%g %gx%g tex:",
                           i, d->surf, cellGcmOffsetIsDisplay(d->surf) ? "*" : " ", d->surf_fmt, d->color_target, d->surf_pitch0, d->surf1, d->zeta_off, d->depth_test, d->depth_func, d->depth_mask, d->shader_ctrl,
                           d->vp >= 0 ? "" : "-", d->vp >= 0 ? s_vps[d->vp].hash : 0u, d->fp_addr, d->fp_hash, d->count, (int)d->topology,
-                          d->blend_enable, d->blend_sfactor, d->blend_dfactor, d->color_mask, d->cull, d->attr0_off, d->first, d->shadow_key, d->sx, d->sy, d->sw, d->sh);
+                          d->blend_enable, d->blend_sfactor, d->blend_dfactor, d->color_mask, d->cull, d->attr0_off, d->first, d->shadow_key, d->sx, d->sy, d->sw, d->sh, (double)d->vx, (double)d->vy, (double)d->vw, (double)d->vh);
                   /* RSX_DRAWLIST_FPC=<hash>: le costanti inline (fp_constants[]) del primo draw con quel FP (s.30) */
                   { static long s_fpch = -2; static int s_done2 = 0; if (s_fpch == -2) { const char* e = getenv("RSX_DRAWLIST_FPC"); s_fpch = e ? (long)strtoul(e, 0, 16) : -1; }
                     if (!s_done2 && s_fpch >= 0 && (long)d->fp_hash == s_fpch && d->fpc_n && s_fpc) { s_done2 = 1;
@@ -2322,6 +2349,17 @@ void rsx_metal_backend_present(void)
             fpcb = [s_dev newBufferWithBytes:s_fpc length:(NSUInteger)s_fpc_used options:MTLResourceStorageModeShared];
         static id<MTLBuffer> s_alpha_buf;   /* fp_alpha [[buffer(2)]]: il test alpha non e' applicato nel FP */
         if (!s_alpha_buf) { float z[4] = {0, 0, 0, 0}; s_alpha_buf = [s_dev newBufferWithBytes:z length:16 options:MTLResourceStorageModeShared]; }
+        /* fp_wpos [[buffer(2)]] (s.32): la WPOS del fragment program e' quella
+         * del ferro, non quella di Metal: x/2 nei pass 2xAA (il titolo disegna
+         * il pass principale in una superficie larga 2560 e i materiali
+         * leggono i buffer di luce in spazio schermo con wpos*(1/1280)), y
+         * ribaltata se SET_SHADER_WINDOW ha l'origine in basso, -0.5 con il
+         * centro del pixel intero (RPCS3 RSXDrawCommands: wpos_scale/bias).
+         * Un float4 per draw: (sx, sy, bx, by); anello di 3 come s_vis_buf. */
+        static id<MTLBuffer> s_wpos_buf[MTL_VIS_RING]; static u32 s_wpos_idx;
+        if (!s_wpos_buf[s_wpos_idx]) s_wpos_buf[s_wpos_idx] = [s_dev newBufferWithLength:(NSUInteger)MTL_MAX_DRAWS * 16 options:MTLResourceStorageModeShared];
+        id<MTLBuffer> wposb = s_wpos_buf[s_wpos_idx]; s_wpos_idx = (s_wpos_idx + 1) % MTL_VIS_RING;
+        float* wposp = wposb ? (float*)[wposb contents] : NULL;
 
         int drawable_cleared = 0;
         u32 i = 0;
@@ -2440,6 +2478,15 @@ void rsx_metal_backend_present(void)
                  * fotografare le superfici a meta' fotogramma con RSX_DUMP_FRAME) */
                 { static long s_lim = -2; if (s_lim == -2) { const char* e = getenv("RSX_DRAW_LIMIT"); s_lim = e ? atol(e) : -1; }
                   if (s_lim >= 0 && (long)i >= s_lim) continue; }
+                /* RSX_DRAW_LIMIT_FP=<hash>: SOLO nel fotogramma del drawlist, dal
+                 * primo draw con quel fragment program in poi non codifica piu'
+                 * (s.32): la fotografia delle superfici a meta' fotogramma senza
+                 * toccare i fotogrammi prima (gli indici cambiano da corsa a corsa). */
+                { static long s_lfp = -2; static int s_lhit = 0;
+                  if (s_lfp == -2) { const char* e = getenv("RSX_DRAW_LIMIT_FP"); s_lfp = e ? (long)strtoul(e, 0, 16) : -1; }
+                  if (s_lfp >= 0 && s_dump_with_drawlist == 1) {
+                      if ((long)d->fp_hash == s_lfp) s_lhit = 1;
+                      if (s_lhit) continue; } }
                 /* RSX_ONLY_SMALL=1: salta i quad che coprono tutto lo schermo.
                  * Il titolo ne disegna uno nero per fotogramma (di fatto un
                  * clear) e sopra ci mette l'HUD: saltandolo si vede se l'HUD
@@ -2518,7 +2565,14 @@ void rsx_metal_backend_present(void)
                 }
                 if (d->fp_addr) {
                     [enc setFragmentBuffer:(d->fpc_n && fpcb) ? fpcb : s_alpha_buf offset:(d->fpc_n && fpcb) ? d->fpc_off : 0 atIndex:1];
-                    [enc setFragmentBuffer:s_alpha_buf offset:0 atIndex:2];
+                    if (wposp) {
+                        const u32 sw = d->shader_window; const int bottom = ((sw >> 12) & 0xF) == 1, icenter = ((sw >> 16) & 0xF) == 1;
+                        float* wp = wposp + (size_t)i * 4;
+                        wp[0] = 1.0f / (float)sc_ax; wp[1] = (bottom ? -1.0f : 1.0f) / (float)sc_ay;
+                        wp[2] = icenter ? -0.5f : 0.0f; wp[3] = (bottom ? (float)(sw & 0xFFF) : 0.0f) + (icenter ? -0.5f : 0.0f);
+                        [enc setFragmentBuffer:wposb offset:(NSUInteger)i * 16 atIndex:2];
+                    } else
+                        [enc setFragmentBuffer:s_alpha_buf offset:0 atIndex:2];
                 }
                 if (vis) [enc setVisibilityResultMode:MTLVisibilityResultModeCounting offset:(NSUInteger)i * 8];
                 [enc drawPrimitives:d->topology vertexStart:(d->vp >= 0 && vpb && cbb) ? 0 : d->base
@@ -2761,7 +2815,8 @@ void rsx_metal_backend_present(void)
                       char zp2[128]; snprintf(zp2, sizeof zp2, "/tmp/rsx_zeta_%08X.ppm", s_zeta[k].offset);
                       FILE* zf = fopen(zp2, "wb");
                       if (zf) { fprintf(zf, "P6\n%lu %lu\n255\n", (unsigned long)ZW, (unsigned long)ZH);
-                          for (NSUInteger q = 0; q < ZW*ZH; q++) { u8 hi = zp[q*4+3], mid = zp[q*4+2]; u8 g = (u8)((hi * 3 + mid) / 4 * 4 > 255 ? 255 : hi); u8 rgb[3] = { g, g, g }; (void)mid; fwrite(rgb, 1, 3, zf); }
+                          /* i 24 bit dello z in R,G,B (alto, medio, basso): si decodifica con (R*65536+G*256+B)/16777215 (s.32; prima solo il byte alto) */
+                          for (NSUInteger q = 0; q < ZW*ZH; q++) { u8 rgb[3] = { zp[q*4+3], zp[q*4+2], zp[q*4+1] }; fwrite(rgb, 1, 3, zf); }
                           fclose(zf); fprintf(stderr, "[RSX metal] depth 0x%X salvato in %s\n", s_zeta[k].offset, zp2); }
                       free(zp);
                   }
@@ -2770,6 +2825,11 @@ void rsx_metal_backend_present(void)
               if (drawable) [drawable present];
               if (!s_headless) dispatch_semaphore_signal(s_inflight);
               /* i report del fotogramma: la GPU ha gia' finito (waitUntilCompleted) */
+              /* RSX_FP_TRACE=<hash> (s.32): frammenti passati per ogni draw di quel programma (contatori di visibilita') */
+              { static long s_tr = -2; if (s_tr == -2) { const char* t = getenv("RSX_FP_TRACE"); s_tr = t ? (long)strtoul(t, 0, 16) : -1; }
+                if (s_tr >= 0 && vis) { const uint64_t* cnt = (const uint64_t*)[vis contents];
+                    for (u32 q = 0; q < s_draw_count; q++) if ((long)s_draws[q].fp_hash == s_tr)
+                        fprintf(stderr, "[fptrace] draw#%u %08X n=%u vp=%d: %llu frammenti passati\n", q, s_draws[q].fp_hash, s_draws[q].count, s_draws[q].vp, (unsigned long long)cnt[q]); } }
               if (vis && s_report_count) {
                   MtlReport* reps = (MtlReport*)malloc(sizeof(MtlReport) * s_report_count);
                   memcpy(reps, s_reports, sizeof(MtlReport) * s_report_count);

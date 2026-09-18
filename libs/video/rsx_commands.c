@@ -953,6 +953,12 @@ int rsx_process_method(rsx_state* state, u32 method, u32 data)
     if (method == NV4097_SET_SHADER_CONTROL) {
         { static int _sc=0; if (_sc++ < 12 && getenv("RTT_DUMP"))
             fprintf(stderr, "[RSXSC] shader_control=0x%X\n", data); }
+        /* RSX_SC_TRACE=1 (s.32): le prime 64 coppie distinte (programma, controllo) */
+        { static int s_t = -1; if (s_t < 0) s_t = getenv("RSX_SC_TRACE") ? 1 : 0;
+          if (s_t) { static u32 seen_p[64], seen_c[64]; static int n = 0; int k;
+              for (k = 0; k < n; k++) if (seen_p[k] == state->shader_program && seen_c[k] == data) break;
+              if (k == n && n < 64) { seen_p[n] = state->shader_program; seen_c[n] = data; n++;
+                  fprintf(stderr, "[RSXSC] fp=%08X shader_control=%08X (prima %08X)\n", state->shader_program, data, state->shader_control); } } }
         state->shader_control = data;
         state->shader_dirty = 1;
         return 0;
@@ -983,6 +989,10 @@ int rsx_process_method(rsx_state* state, u32 method, u32 data)
     if (method == NV4097_SET_SCISSOR_VERTICAL) {
         state->scissor_y = data & 0xFFFF;
         state->scissor_h = (data >> 16) & 0xFFFF;
+        return 0;
+    }
+    if (method == NV4097_SET_SHADER_WINDOW) {
+        state->shader_window = data;
         return 0;
     }
 

@@ -1052,7 +1052,14 @@ static inline int mfc_submit(mfc_engine* mfc, spu_context* spu, uint32_t cmd)
           uint32_t r12 = spu->gpr[12]._u32[0], r5 = spu->gpr[5]._u32[0];
           if (us[li].ea == (uint32_t)ea && us[li].v == v) {
               us[li].n++;
-              if (now - us[li].t0 > (unsigned long long)s_unst) {
+              /* Solo un'attesa VERA (il ciclo di func_4B48 legge il label
+               * migliaia di volte al secondo): con 2-3 letture in 30-50 ms
+               * sono controlli di blocchi diversi con la RSX ferma, e lo
+               * sblocco faceva riscrivere al job blocchi non ancora copiati
+               * (s.32: 293 draw su 3000 con vertici spazzatura, 0 con lo
+               * sblocco spento). GCM_LABEL_UNSTICK_READS cambia la soglia. */
+              static long s_ureads = -1; if (s_ureads < 0) { const char* e = getenv("GCM_LABEL_UNSTICK_READS"); s_ureads = e ? atol(e) : 8; }
+              if (now - us[li].t0 > (unsigned long long)s_unst && (long)us[li].n >= s_ureads) {
                   extern void vm_write32(uint32_t a, uint32_t v);
                   uint32_t r23 = spu->gpr[23]._u32[0], r26 = spu->gpr[26]._u32[0], nv;
                   const char* why;

@@ -330,13 +330,14 @@ static void decode_src(u32 w, int abs_bit, Src* s)
  * The backend's passthrough VS forwards COL0/COL1/FOG/TEXCOORD0..7; WPOS maps
  * to SV_POSITION (screen-space — an approximation of the RSX window coord). */
 static int s_fp_msl_facing;   /* 1 mentre si traduce in MSL (input_facing esiste solo li') */
+static int s_fp_msl_wpos;     /* 1 se il prologo MSL ha definito `wpos` (buffer(2), s.32) */
 static const char* input_expr(u32 input_src)
 {
     static const char* tc[8] = {
         "input.tc0", "input.tc1", "input.tc2", "input.tc3",
         "input.tc4", "input.tc5", "input.tc6", "input.tc7" };
     switch (input_src) {
-    case 0x0: return "input.position"; /* WPOS */
+    case 0x0: return s_fp_msl_wpos ? "wpos" : "input.position"; /* WPOS: quella del ferro (v. fp_wpos) */
     case 0x1: return "input.col0";     /* COL0 */
     case 0x2: return "input.col1";     /* COL1 */
     case 0x3: return "input.fog";      /* FOGC */
@@ -406,6 +407,46 @@ void rsx_fp_set_shadow(const u8* zfunc16) { if (zfunc16) memcpy(s_fp_shadow, zfu
 static const char* fp_zfunc_op(u32 f) { static const char* o[8] = { "false", "<", "==", "<=", ">", "!=", ">=", "true" }; return o[f & 7]; }
 #define FP_CTRL_32BIT_EXPORTS 0x40u
 
+/* Fragment color output register selection. The NV40 hardware picks the
+ * output from the SHADER_CONTROL word's 32_BITS_EXPORTS bit, not from
+ * whichever temp happened to be written: fp32-export programs output r0,
+ * fp16-export programs (the default) output h0 (RPCS3
+ * FragmentProgramDecompiler::BuildCode). Many real material/lighting
+ * shaders accumulate into fp32 temps (r2/r3/r4) but write their FINAL
+ * color to h0 — the old "wrote_r0 => return r0" heuristic returned a stale
+ * intermediate, producing flat/constant surfaces.
+ * Emesso in coda al programma e a ogni RET (ritorno anticipato, s.32):
+ * senza la chiusura della funzione. */
+static void fp_emit_return(Out* o, int msl, u32 ctrl, int wrote_r0, int wrote_h0)
+{
+    /* NaN-scrub of the output. HLSL selects per component with `?:`; MSL
+     * has no vector-condition ternary, so it uses select() -- same
+     * component-wise semantics. */
+    const char* ret_r = msl
+        ? "    float4 _o = r[0];\n    return select(float4(0), _o, _o == _o);\n"
+        : "    float4 _o = r[0];\n    return (_o == _o) ? _o : (float4)0;\n";
+    const char* ret_h = msl
+        ? "    float4 _o = h[0];\n    return select(float4(0), _o, _o == _o);\n"
+        : "    float4 _o = h[0];\n    return (_o == _o) ? _o : (float4)0;\n";
+
+    if (ctrl == RSX_FP_CTRL_AUTO) {
+        /* No control word (standalone tests): legacy heuristic. */
+        out_puts(o, (wrote_r0 || !wrote_h0) ? ret_r : ret_h);
+    } else if (msl && ((ctrl & 0xEu) || s_fp_mrt > 1)) {
+        int r32 = (ctrl & FP_CTRL_32BIT_EXPORTS) ? 1 : 0;
+        char ep[640]; int n = snprintf(ep, sizeof ep, "    float4 _o = %s[0];\n    RsxFpOut _out; _out.color = select(float4(0), _o, _o == _o);\n", r32 ? "r" : "h");
+        /* color1..3 <- r2/r3/r4 (32 bit) oppure h2/h4/h6 (16 bit) */
+        for (int k = 1; k < s_fp_mrt; k++)
+            n += snprintf(ep + n, sizeof ep - n, "    { float4 _c = %s[%d]; _out.color%d = select(float4(0), _c, _c == _c); }\n",
+                          r32 ? "r" : "h", r32 ? (k + 1) : (2 * k), k);
+        if (ctrl & 0xEu) n += snprintf(ep + n, sizeof ep - n, "    _out.depth = clamp(r[1].z, 0.0f, 1.0f);\n");
+        snprintf(ep + n, sizeof ep - n, "    return _out;\n");
+        out_puts(o, ep);
+    } else {
+        out_puts(o, (ctrl & FP_CTRL_32BIT_EXPORTS) ? ret_r : ret_h);
+    }
+}
+
 int rsx_fp_decompile(const u8* ucode, u32 max_bytes, u32 ctrl, char* out, u32 out_size)
 {
     return rsx_fp_decompile_ex(ucode, max_bytes, ctrl, 0u, out, out_size);
@@ -419,7 +460,7 @@ static int rsx_fp_decompile_internal(
     /* The two dialects diverge in a handful of places only; `msl` selects the
      * Metal spelling at each of them. */
     const int msl = (lang == RSX_FP_LANG_MSL);
-    s_fp_msl_facing = msl;
+    s_fp_msl_facing = msl; s_fp_msl_wpos = 0;
     if (!ucode || !out || out_size == 0) return -1;
 
     u32 buffered_constant_count = 0;
@@ -515,7 +556,7 @@ static int rsx_fp_decompile_internal(
         if (buffered) {
             out_puts(&o,
                 ",\n    constant float4* fp_constants [[buffer(1)]]"
-                ",\n    constant float4& fp_alpha [[buffer(2)]]");
+                ",\n    constant float4& fp_wpos [[buffer(2)]]");
         }
         /* SSA (input 0xE, "facing"): +1 fronte / -1 retro. Il FP del personaggio
          * di Uncharted lo moltiplica in una condizione che abilita la lettura
@@ -527,6 +568,10 @@ static int rsx_fp_decompile_internal(
             "    for (int _i = 0; _i < 48; _i++) { r[_i] = float4(0); h[_i] = float4(0); }\n"
             "    float4 cc0 = float4(0); float4 cc1 = float4(0);\n"
             "    const float4 input_facing = float4(rsx_front ? 1.0f : -1.0f);\n");
+        /* WPOS del ferro: x/2 nei pass 2xAA, y ribaltata con l'origine in basso
+         * (SET_SHADER_WINDOW), v. fp_wpos nel backend (s.32) */
+        s_fp_msl_wpos = buffered ? 1 : 0;
+        if (buffered) out_puts(&o, "    const float4 wpos = float4(input.position.xy * fp_wpos.xy + fp_wpos.zw, input.position.zw);\n");
     } else if (tex_cube_mask == 0) {
         out_puts(&o, "Texture2D    rsx_tex[16] : register(t0);\n");
     } else {
@@ -646,7 +691,27 @@ static int rsx_fp_decompile_internal(
             constant_slot++;
 
         if (is_branch) {
-            out_puts(&o, "    /* TODO: branch/flow-control op skipped */\n");
+            /* SIP (flow control): l'opcode vale dst.opcode | 0x40 (RPCS3
+             * FragmentProgramDecompiler: BRK=0x40 CAL=41 IFE=42 LOOP=43
+             * REP=44 RET=45). Uncharted usa solo RET (RPCS3 GLSL del livello:
+             * 8 programmi con `if (any(...)) return;`): il passaggio di luce
+             * direzionale (A3954DDC) esce subito sui pixel del cielo, e senza
+             * il ritorno campionava la shadow map con coordinate a caso. Il
+             * ritorno e' l'epilogo del programma con i registri di quel
+             * momento, predicato come KIL (AddFlowOp). IFE/LOOP restano da fare. */
+            if (opcode == 0x05 && !is_never) {   /* RET */
+                if (is_uncond) fp_emit_return(&o, msl, ctrl, wrote_r0, wrote_h0);
+                else {
+                    char pre[96];
+                    snprintf(pre, sizeof pre, msl ? "    if (any(cc%u.%s %s 0.0f)) {\n" : "    if (any(cc%u.%s %s (float4)0)) {\n", cc_read, cswz, cmp_op);
+                    out_puts(&o, pre);
+                    fp_emit_return(&o, msl, ctrl, wrote_r0, wrote_h0);
+                    out_puts(&o, "    }\n");
+                }
+            } else if (opcode != 0x05) {
+                char t[80]; snprintf(t, sizeof t, "    /* TODO: branch/flow-control op 0x%02X skipped */\n", 0x40u | opcode);
+                out_puts(&o, t);
+            }
             if (w0 & FP_END) break;
             continue;
         }
@@ -872,42 +937,8 @@ static int rsx_fp_decompile_internal(
         if (w0 & FP_END) break;
     }
 
-    /* Fragment color output register selection. The NV40 hardware picks the
-     * output from the SHADER_CONTROL word's 32_BITS_EXPORTS bit, not from
-     * whichever temp happened to be written: fp32-export programs output r0,
-     * fp16-export programs (the default) output h0 (RPCS3
-     * FragmentProgramDecompiler::BuildCode). Many real material/lighting
-     * shaders accumulate into fp32 temps (r2/r3/r4) but write their FINAL
-     * color to h0 — the old "wrote_r0 => return r0" heuristic returned a stale
-     * intermediate, producing flat/constant surfaces. */
-    {
-        /* NaN-scrub of the output. HLSL selects per component with `?:`; MSL
-         * has no vector-condition ternary, so it uses select() -- same
-         * component-wise semantics. */
-        const char* ret_r = msl
-            ? "    float4 _o = r[0];\n    return select(float4(0), _o, _o == _o);\n}\n"
-            : "    float4 _o = r[0];\n    return (_o == _o) ? _o : (float4)0;\n}\n";
-        const char* ret_h = msl
-            ? "    float4 _o = h[0];\n    return select(float4(0), _o, _o == _o);\n}\n"
-            : "    float4 _o = h[0];\n    return (_o == _o) ? _o : (float4)0;\n}\n";
-
-        if (ctrl == RSX_FP_CTRL_AUTO) {
-            /* No control word (standalone tests): legacy heuristic. */
-            out_puts(&o, (wrote_r0 || !wrote_h0) ? ret_r : ret_h);
-        } else if (msl && ((ctrl & 0xEu) || s_fp_mrt > 1)) {
-            int r32 = (ctrl & FP_CTRL_32BIT_EXPORTS) ? 1 : 0;
-            char ep[640]; int n = snprintf(ep, sizeof ep, "    float4 _o = %s[0];\n    RsxFpOut _out; _out.color = select(float4(0), _o, _o == _o);\n", r32 ? "r" : "h");
-            /* color1..3 <- r2/r3/r4 (32 bit) oppure h2/h4/h6 (16 bit) */
-            for (int k = 1; k < s_fp_mrt; k++)
-                n += snprintf(ep + n, sizeof ep - n, "    { float4 _c = %s[%d]; _out.color%d = select(float4(0), _c, _c == _c); }\n",
-                              r32 ? "r" : "h", r32 ? (k + 1) : (2 * k), k);
-            if (ctrl & 0xEu) n += snprintf(ep + n, sizeof ep - n, "    _out.depth = clamp(r[1].z, 0.0f, 1.0f);\n");
-            snprintf(ep + n, sizeof ep - n, "    return _out;\n}\n");
-            out_puts(&o, ep);
-        } else {
-            out_puts(&o, (ctrl & FP_CTRL_32BIT_EXPORTS) ? ret_r : ret_h);
-        }
-    }
+    fp_emit_return(&o, msl, ctrl, wrote_r0, wrote_h0);
+    out_puts(&o, "}\n");
     (void)wrote_r0; (void)wrote_h0;
 
     if (!o.ok) return -1;

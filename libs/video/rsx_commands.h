@@ -74,6 +74,7 @@ extern "C" {
 /* Scissor */
 #define NV4097_SET_SCISSOR_HORIZONTAL          0x000008C0
 #define NV4097_SET_SCISSOR_VERTICAL            0x000008C4
+#define NV4097_SET_SHADER_WINDOW               0x00001D88   /* bit 0-11 altezza, 12-15 origine (1 = basso), 16-19 centro pixel (1 = intero) */
 
 /* Clear */
 #define NV4097_SET_COLOR_CLEAR_VALUE           0x00001D90
@@ -214,6 +215,7 @@ typedef struct rsx_state {
 
     /* Scissor */
     u32 scissor_x, scissor_y, scissor_w, scissor_h;
+    u32 shader_window;        /* SET_SHADER_WINDOW: origine e altezza della WPOS del fragment program (s.32) */
 
     /* Clear */
     u32 color_clear_value;

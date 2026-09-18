@@ -1,6 +1,6 @@
 # Stato del progetto
 
-Ultimo aggiornamento: **18 settembre 2026** — sessione 31.
+Ultimo aggiornamento: **19 settembre 2026** — sessione 32.
 
 ## Dove siamo
 
@@ -441,6 +441,101 @@ La lista dei comandi ora viene percorsa fino in fondo — sei coppie
 risultati in memoria principale.** Non era mai successo in nessuna sessione.
 Riproducibile: **tre corse su tre**, identiche -- 14 comandi, un overlay
 residente, zero microstep, cinque stall e due interrupt per corsa.
+
+## Sessione 32 — il fantasma di Drake era la WPOS: i materiali leggevano i buffer di luce con x raddoppiata
+
+**Il fantasma (copia semitrasparente di Drake ~40 px a sinistra, corpo
+semitrasparente, sagome fantasma sul ponte) non era un draw in piu' ne'
+l'ombra: era la WPOS del fragment program.** I materiali di Uncharted (ponte,
+casse, muta, tutti) leggono i buffer di luce in spazio schermo
+(tex13 = 016D0000, tex14 = 1E50000, scritti dal pass di luce #1961, e tex12 =
+034B0000 normali) con `r1.xy = wpos.xy * c0.xw + c2.xy`, c0 = (1/1280, ...,
+-1/720), cioe' aspettandosi una WPOS da 1280x720 con l'origine in BASSO. Il
+pass principale e' 2xAA (DIAGONAL_CENTERED_2: superficie fisica 2560x720, i
+draw stirati 2x): `input.position.x` di Metal andava da 0 a 2560 → u = x/1280
+in [0, 2): con il sampler REPEAT la meta' destra rileggeva la meta' sinistra e
+tutto il buffer di luce (con la silhouette di Drake) finiva spostato/ripetuto.
+Misurato con la catena di esclusioni: `RSX_SHADOW_FORCE=1` (c01) non toglieva il
+fantasma, `GCM_LABEL_UNSTICK_MS=0` (c03) nemmeno, le posizioni dei vertici e le
+costanti c0..c3 dei 3 pass del personaggio (034B/007D/016D) erano IDENTICHE
+(`RSX_VP_DBG_VP=7BC2B163`), il fantasma stava gia' in 007D0000 alla fine del
+pass di colore (`RSX_DRAW_LIMIT_FP=D5601146`, nuovo: dal primo draw con quel FP
+in poi non codifica, SOLO nel fotogramma del drawlist), e la sonda
+`RSX_FP_PROBE=C1D20673` dipingeva solo la testa (il corpo usa 806F9D7E,
+1002B8B8, 4BD7C24D, D7AE5FAD con vp 99180BEE).
+
+Fatto: `NV4097_SET_SHADER_WINDOW` (0x1D88: bit 0-11 altezza, 12-15 origine
+1 = basso, 16-19 centro pixel 1 = intero) decodificato in `rsx_state.shader_window`;
+nel backend un float4 per draw in `buffer(2)` (`fp_wpos`: sx, sy, bx, by, anello
+di 3 buffer) con sx = 1/sc_ax, sy = ±1/sc_ay, by = altezza se origine in basso,
+-0.5 con centro intero (RPCS3 `RSXDrawCommands.cpp`: wpos_scale/bias); il
+decompilatore FP (MSL, quando `buffered`) definisce `wpos = position.xy * fp_wpos.xy
++ fp_wpos.zw` e la usa per l'ingresso WPOS. Risultato
+(`docs/img_s32_wpos_shadowforce.jpg`, con `RSX_SHADOW_FORCE=1`): ponte, casse e
+ombre pulite, nessun fantasma, tavolozza di RPCS3.
+
+**RET nel fragment program.** Il decompilatore saltava OGNI op di flow control
+(`/* TODO: branch */`): il pass di luce direzionale A3954DDC (= RPCS3
+FragmentProgram40: `if (any(lessThanEqual(cc0.xxxx, 0))) return;`) esce subito sui
+pixel del cielo, e senza il ritorno campionava la shadow map con coordinate a
+caso. Ora RET (opcode SIP 0x45 = dst.opcode 5 con il bit branch) emette l'epilogo
+(`fp_emit_return`, fattorizzato) predicato come KIL. Nel livello RPCS3 usa solo
+RET e KIL (8 e 42 programmi su 169), niente IFE/LOOP: restano da fare. La sonda
+`RSX_FP_PROBE` ora sostituisce l'ULTIMO `float4 _o =` (prima il primo, che con
+un RET e' il ritorno anticipato).
+
+**Cosa resta sul personaggio.** Con la WPOS giusta mancano braccia e gambe
+della muta (torso, testa, mani, fondina, stivali ci sono). I draw ci sono
+(1002B8B8 = gambe/maniche), le posizioni e le costanti sono identiche fra
+prepass (5A5B70A5) e pass di colore (99180BEE), la libreria e' compilata
+(`RSX_FP_TRACE=<hash>`, nuovo: ricerche in cache, creazione della pipeline,
+e nel fotogramma del dump i FRAMMENTI PASSATI per draw dai contatori di
+visibilita'), la pipeline si crea una volta sola, `RSX_CULL=0`,
+`RSX_EQUAL_LEQUAL=256`, `RSX_DEPTH_FUNC=7` e `RSX_FP_ALIAS=1002B8B8:806F9D7E`
+(nuovo: usa la libreria di B per i draw con A) non cambiano nulla, ma i
+contatori dicono che i frammenti passano SOLO in parte (3.209 su ~20.000 per
+un draw da 492 vertici) e nel buffer LDR 007D0000 prima del resolve la sonda
+magenta dipinge solo chiazze (spalle, polsi, stinchi). Il depth del prepass
+(`/tmp/rsx_zeta_<off>.ppm` ora con i 24 bit in R,G,B) sotto le cosce ha lo z del
+ponte, non delle gambe: il prepass delle gambe non scrive dove dovrebbe.
+Sospetto principale: i vertici spazzatura.
+
+**I vertici spazzatura NON vengono (solo) dallo sblocco dei label.** Con
+`RSX_VP_DBG_STAT=2` (ora stampa anche l'intervallo di vertici spazzatura) su
+3000 draw dal fotogramma 2450: 266-361 draw con posizioni spazzatura con lo
+sblocco acceso, 0 con `GCM_LABEL_UNSTICK_MS=0` (c40) — ma in TUTTE le corse gli
+sblocchi sono del tipo "altro" (label == r12, cioe' il job NON sta aspettando:
+`func_4B48` aspetta solo se r12 < label <= r5, o nel wrap se label <= r23; il
+forzare a r12 e' un no-op). Quindi la correlazione con lo sblocco e' da
+rimisurare (una corsa per modo non basta), e al present la spazzatura AUMENTA
+(l'anello viene riscritto): il walker legge i blocchi mentre il job li sta
+ancora scrivendo o li ha gia' riscritti. Aggiunta la soglia
+`GCM_LABEL_UNSTICK_READS` (default 8 letture oltre ai 20 ms: 2-3 letture in
+30-50 ms sono controlli di blocchi diversi, non un'attesa). Con
+`GCM_LABEL_UNSTICK_MS=0` 2 corse su 3 non arrivano al livello in 95 s.
+
+**Altro, misurato.** `sh=` nel drawlist e' `shadow_key`, non SHADER_CONTROL
+(mezz'ora persa: i valori di 0x1D60 sono sani, `RSX_SC_TRACE=1` li stampa).
+Le compilazioni dei FP: solo ~190 coppie (FP, VP) in 90 s, e con la cache di
+sistema di Metal costano 0 ms (le chiavi includono il VP: ogni coppia
+ricompila anche il VP; da separare, ma non e' il collo di bottiglia).
+`RSX_DUMP_COUNT>1` resta rotto. Gemini a quota esaurita (limite 20 richieste
+al giorno): l'audit degli helper SPU (`tasks/TASK.md`) non e' partito.
+
+### Fronte aperto (dopo la sessione 32)
+
+1. Braccia e gambe della muta: capire perche' il prepass (5A5B70A5, LEQUAL +
+   write, cm=0) non scrive lo z delle gambe; misurare i frammenti del prepass
+   (`RSX_FP_TRACE=34F0B9F8`) in un fotogramma SENZA spazzatura.
+2. Vertici spazzatura: chi riscrive i blocchi dopo la copia (A/B ripetuto
+   sblocco on/off; `SPU_DMA_EAWIN` sul va di un draw spazzatura).
+3. Ombre: con la WPOS giusta il termine d'ombra e' quasi tutto in ombra
+   (scena scura, `RSX_SHADOW_FORCE=1` la illumina): coordinate della shadow
+   map/atlante e la LUT 4x1 letta con il sampler LINEAR+REPEAT unico (serve un
+   sampler per unita' da SET_TEXTURE_ADDRESS/FILTER: nearest per la LUT).
+4. Le scie delle barche sono blob bianchi (sprite 09E6635A con blend
+   ONE/INV_SRC_ALPHA).
+5. RSX_DUMP_COUNT>1, audit helper SPU (Gemini), separare VP/FP nelle librerie.
 
 ## Sessione 31 — l'oracolo RPCS3 gira sul Mac; cubemap e probe RGBA16F: il personaggio ha il suo materiale
 

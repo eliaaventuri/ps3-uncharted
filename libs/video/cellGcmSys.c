@@ -2176,7 +2176,12 @@ static void gcm_rsx_process_fifo_unlocked(void)
                         fprintf(stderr, "[SEMA] m=0x%02X v=0x%08X off=0x%X\n", m, v, s_sema_offset); }
                     if (m == 0x64u)      s_sema_offset = v;
                     else if (m == 0x6Cu) vm_write32(la, v);
-                    else if (m == 0x68u && vm_read32(la) != v) {
+                    /* GCM_SEMA_STAT=1 (s.32): quante ACQUIRE, e quante troverebbero il label
+                     * ancora diverso (cioe' bloccherebbero sul ferro) */
+                    else if (m == 0x68u) { static int s_st = -1; if (s_st < 0) s_st = getenv("GCM_SEMA_STAT") ? 1 : 0;
+                        if (s_st) { static unsigned long na = 0, nb = 0; na++; if (vm_read32(la) != v) nb++;
+                            if ((na % 500) == 1) fprintf(stderr, "[sema-stat] acquire %lu, non ancora soddisfatte %lu (off=0x%X v=%08X label=%08X)\n", na, nb, s_sema_offset, v, vm_read32(la)); } }
+                    if (m == 0x68u && vm_read32(la) != v) {
             /* GCM_SEMA_ACQUIRE=1 makes ACQUIRE actually block, which is what
              * the hardware does. Off by default: a title whose label nothing
              * ever writes would wedge the drain permanently, and RELEASE on
