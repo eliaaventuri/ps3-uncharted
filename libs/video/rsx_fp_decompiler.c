@@ -498,9 +498,15 @@ static int rsx_fp_decompile_internal(
             if (s_force == 0 || s_force == 1) snprintf(cmp, sizeof cmp, "%s", s_force ? "true" : "false");
             else if (s_force == 3) snprintf(cmp, sizeof cmp, "z");        /* 3: il texel, 4: il riferimento (diagnostica) */
             else if (s_force == 4) snprintf(cmp, sizeof cmp, "c.z");
-            else if (s_force == 5 && zf != 0 && zf != 7) snprintf(cmp, sizeof cmp, "z %s c.z", fp_zfunc_op(zf));   /* 5: operandi scambiati (texel OP ref) */
+            /* La RSX confronta TEXEL OP RIFERIMENTO (RPCS3 VKDraw.cpp:
+             * `get_compare_func(tex.zfunc(), true)`, cioe' con la direzione
+             * invertita rispetto a GL/Vulkan che fanno ref OP texel). Con
+             * l'ordine GL la scena era quasi tutta in ombra (s.32, il termine
+             * d'ombra del pass A3954DDC); con questo le ombre stanno dove le
+             * mette RPCS3. RSX_SHADOW_FORCE=5 = l'ordine GL (A/B). */
+            else if (s_force == 5 && zf != 0 && zf != 7) snprintf(cmp, sizeof cmp, "c.z %s z", fp_zfunc_op(zf));   /* 5: ref OP texel (ordine GL) */
             else if (zf == 0 || zf == 7) snprintf(cmp, sizeof cmp, "%s", fp_zfunc_op(zf));
-            else snprintf(cmp, sizeof cmp, "c.z %s z", fp_zfunc_op(zf));
+            else snprintf(cmp, sizeof cmp, "z %s c.z", fp_zfunc_op(zf));
             snprintf(fn, sizeof fn,
                 "static float rsx_shadow%u(texture2d<float> t, float3 c) {\n"
                 "    uint2 p = uint2(clamp(c.xy, 0.0f, 1.0f) * float2(t.get_width() - 1, t.get_height() - 1));\n"

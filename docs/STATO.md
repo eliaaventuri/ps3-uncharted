@@ -563,16 +563,26 @@ visibilita' confermano: 2.042-3.569 frammenti per draw invece di ~20.000. E'
 un errore di calcolo SPU nel job di skinning (o nelle matrici dei joint): il
 precedente e' `fi`. Serve l'audit degli helper (`tasks/TASK.md`).
 
+**Le ombre: la RSX confronta TEXEL OP RIFERIMENTO.** Con la WPOS giusta la
+scena era quasi tutta in ombra. Il decompilatore emetteva `c.z OP z` (ref OP
+texel, la convenzione GL/Vulkan); RPCS3 (`VKDraw.cpp`:
+`get_compare_func(tex.zfunc(), true)`) inverte la direzione per le texture
+con zfunc: GEQUAL diventa "texel >= ref", cioe' il test d'ombra classico.
+Ora il default e' `z OP c.z` (`RSX_SHADOW_FORCE=5` = l'ordine GL per l'A/B).
+Risultato (`docs/img_s32_shadows.jpg`): ponte, casse e ombre come in RPCS3
+(ombra delle casse a destra, di Drake ai piedi a sinistra), senza forzature.
+
+`SPU_PROBE_PC`/`SPU_PROBE_REGS`/`SPU_HOPHIST` (nuovi, `spu_pcwatch`): i kernel
+caldi del job 215 nel livello sono a 0x11260-0x13510 (0x12A98/0x12D68...),
+NON 0xD5AC/0xD070; solo i blocchi raggiunti dal trampolino si vedono.
+
 ### Fronte aperto (dopo la sessione 32)
 
 1. Braccia e gambe della muta schiacciate (skinning multi-osso): audit degli
    helper SPU contro RPCS3 (Gemini a quota esaurita: farlo a mano o con il
    worker locale), partendo da shufb/rotq*/selb/cwd e dalle conversioni.
 2. (risolto: guardia dell'anello) — tenere d'occhio `[ring-guard] valvola`.
-3. Ombre: con la WPOS giusta il termine d'ombra e' quasi tutto in ombra
-   (scena scura, `RSX_SHADOW_FORCE=1` la illumina): coordinate della shadow
-   map/atlante e la LUT 4x1 letta con il sampler LINEAR+REPEAT unico (serve un
-   sampler per unita' da SET_TEXTURE_ADDRESS/FILTER: nearest per la LUT).
+3. (risolto: ordine del confronto d'ombra; sampler per unita' fatti)
 4. Le scie delle barche sono blob bianchi (sprite 09E6635A con blend
    ONE/INV_SRC_ALPHA).
 5. RSX_DUMP_COUNT>1, audit helper SPU (Gemini), separare VP/FP nelle librerie.

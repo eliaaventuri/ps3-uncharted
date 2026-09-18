@@ -804,6 +804,34 @@ void (*spu_take_interrupt(spu_context* ctx,
  * passaggi contati sono zero. Per quei blocchi serve un altro aggancio. */
 static inline void spu_pcwatch(spu_context* ctx)
 {
+    /* SPU_PROBE_PC=<hex LS>[,<img>] + SPU_PROBE_REGS=<r,r,...> (s.32): ai primi
+     * SPU_PROBE_N (20) salti del trampolino a quel pc stampa i registri
+     * elencati (4 parole, hex e float): gli ingressi di un kernel liftato
+     * (es. lo skinning di Uncharted, func_D5AC del job 215) senza toccare il
+     * codice generato. Stesso limite di SPU_PCWATCH: solo i blocchi raggiunti
+     * dal trampolino. */
+    { static long s_ppc = -2, s_pimg = -1; static int s_pregs[16], s_npr = 0, s_pn = 20;
+      if (s_ppc == -2) { const char* e = getenv("SPU_PROBE_PC"); s_ppc = -1;
+          if (e) { char* c = 0; s_ppc = strtol(e, &c, 16); if (c && *c == ',') s_pimg = strtol(c + 1, 0, 0);
+              const char* r = getenv("SPU_PROBE_REGS"); while (r && *r && s_npr < 16) { s_pregs[s_npr++] = (int)strtol(r, (char**)&r, 10); if (*r == ',') r++; else break; }
+              const char* n = getenv("SPU_PROBE_N"); if (n) s_pn = atoi(n); } }
+      if (s_ppc >= 0 && ((uint32_t)ctx->pc & SPU_LS_MASK) == (uint32_t)s_ppc && (s_pimg < 0 || ctx->image_id == s_pimg)) {
+          static int _n = 0; if (_n++ < s_pn) {
+              fprintf(stderr, "[probe] pc=%05X img=%d ovl=%d hit %d\n", (uint32_t)ctx->pc & SPU_LS_MASK, ctx->image_id, ctx->resident_ovl, _n);
+              for (int k = 0; k < s_npr; k++) { const u128* g = &ctx->gpr[s_pregs[k]];
+                  fprintf(stderr, "[probe]   r%-3d %08X %08X %08X %08X  = %g %g %g %g\n", s_pregs[k], g->_u32[0], g->_u32[1], g->_u32[2], g->_u32[3], g->_f32[0], g->_f32[1], g->_f32[2], g->_f32[3]); } } } }
+    /* SPU_HOPHIST=<ovl>: istogramma dei salti del trampolino per pc nel modulo
+     * di job residente <ovl>, stampato ogni 4M salti (i 40 pc piu' frequenti) */
+    { static long s_hh = -2; if (s_hh == -2) { const char* e = getenv("SPU_HOPHIST"); s_hh = e ? atol(e) : -1; }
+      if (s_hh >= 0 && ctx->resident_ovl == (int)s_hh) {
+          static uint32_t* cnt = 0; static unsigned long long tot = 0;
+          if (!cnt) cnt = (uint32_t*)calloc(65536, sizeof(uint32_t));
+          cnt[((uint32_t)ctx->pc & SPU_LS_MASK) >> 2]++;
+          if ((++tot % 4000000ull) == 0) {
+              fprintf(stderr, "[hophist] ovl %ld, %llu salti:", s_hh, tot);
+              for (int k = 0; k < 40; k++) { uint32_t best = 0, bi = 0; for (uint32_t i = 0; i < 65536; i++) if (cnt[i] > best) { best = cnt[i]; bi = i; }
+                  if (!best) break; fprintf(stderr, " %05X:%u", bi << 2, best); cnt[bi] = 0; }
+              fputc('\n', stderr); } } }
     static long w = -1;
     if (w < 0) { const char* e = getenv("SPU_PCWATCH"); w = e ? (long)strtoul(e, 0, 16) : 0; }
     if (!w) return;
