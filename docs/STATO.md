@@ -1,7 +1,6 @@
 # Stato del progetto
 
-Ultimo aggiornamento: **18 settembre 2026** — sessione 29 (lavoro del 14 settembre,
-documentato il 18).
+Ultimo aggiornamento: **18 settembre 2026** — sessione 30.
 
 ## Dove siamo
 
@@ -125,6 +124,16 @@ un puntatore nullo letto dai propri dati, e la scena 3D non si vede ancora
 (nero: i buchi dei draw nei buffer SPU restano NOP). Tastiera = pad 0 nella
 finestra (frecce, Spazio/X = CROSS, C = CERCHIO, Invio = START); `PAD_SCRIPT`
 per le corse senza nessuno. Dettagli in "Sessione 27".
+
+**Dalla sessione 30 il livello si vede come nel gioco** (`docs/img_s30_dive_boat_colormask.png`):
+cielo intero, gru, sartie, mare, casse, HUD; i "triangoli neri" erano le
+parole `DRAW_ARRAYS` da 256 vertici mandate al backend una per una (una
+lista di triangoli ripartiva sfalsata di un vertice), la sfera e la cupola
+nere erano i volumi delle luci differite disegnati senza maschera di
+colore. Risolti anche il crash del present (viste con remap senza
+proprietario a tabella piena), i draw scartati dal tetto dei vertici e due
+fragment program oltre i 4 KB. Fronte: il personaggio (Drake) esce a pezzi
+staccati e scuro -- lo skinning. Dettagli in "Sessione 30".
 
 **Dalla sessione 29 il livello si vede a schermo, con l'HUD.**
 `docs/img_s29_dive_boat_display.png`: il ponte della dive-boat con casse e
@@ -432,6 +441,105 @@ La lista dei comandi ora viene percorsa fino in fondo — sei coppie
 risultati in memoria principale.** Non era mai successo in nessuna sessione.
 Riproducibile: **tre corse su tre**, identiche -- 14 comandi, un overlay
 residente, zero microstep, cinque stall e due interrupt per corsa.
+
+## Sessione 30 — il livello come nel gioco: draw coalescenti, maschera di colore, crash del present
+
+Prima cosa, fuori dal codice: dopo l'aggiornamento a Xcode 27 la licenza
+non era accettata (`clang` e `git` rifiutavano di partire: `sudo xcodebuild
+-license accept`) e il mount della ISO in `/tmp/uc_iso` era sparito col
+riavvio (0 draw dal fotogramma ~200, `Error loading script file
+'startup.bin'`, `ASSERTION: val` in `LookupSymbolValuePointer`): `hdiutil
+attach -readonly -nobrowse -noverify -mountpoint /tmp/uc_iso "<iso>"`.
+Poi la sessione 29 (14/09) e' stata documentata e committata (il worker
+Gemini ha estratto i numeri delle 25 corse ed e' caduto per quota).
+
+**1. `MTL_MAX_VERTS` 1M -> 4M** (`MTL_VP_FLOATS` 48M -> 128M float, memoria
+virtuale toccata solo se usata): `dropped` da 200-1.500 draw per fotogramma
+a **0** in tutte le corse (c2..c10).
+
+**2. Due fragment program del livello (0x0013C002, 0x00146002) uscivano
+`decompile failed`**: il tetto di lettura del microcodice era 4096 byte
+(`MTL_FP_UCODE_MAX`, ora 16 KB; MSL da 32 a 128 KB). I loro draw finivano
+nella coppia incorporata con le posizioni grezze. 0 fallimenti dopo.
+
+**3. SIGSEGV nel present (`objc_retain` dentro `setFragmentTexture`), c3 e
+2 corse su 25 della s.29.** Il crash report (`~/Library/Logs/
+DiagnosticReports/uncharted-*.ips`) dava la catena: un draw registrava una
+`id<MTLTexture>` senza ritenerla (`d->tex` e' `__unsafe_unretained`) e la
+codifica la trovava gia' liberata. Due strade: (a) la tabella delle viste
+con remap (`s_remaps`, 256 voci, ricerca lineare): a tabella piena la vista
+nuova non era tenuta da nessuno -- nel livello le coppie (texture, remap)
+superano 256; (b) `texcache_sweep`/`texcache_add` toglievano dalla cache
+texture ancora dentro una unita' (il percorso "already resident" non
+aggiorna `last_use`), e al rebind successivo l'unita' le liberava con i
+draw del fotogramma che le puntavano. Ora: viste in tabella hash da 4096
+(`remap_slot`, `remap_rebuild`), a tabella piena tutte nel cimitero e si
+ricomincia; le texture escono dalla cache solo se non sono in una unita'
+(`tex_held_by_unit`) e passano dal cimitero (`graveyard_add`), vive fino a
+fine present; `remap_drop_base` toglie le viste di una base che esce.
+Misura: 0 crash in 8 corse (c4..c10, 150-240 s).
+
+**4. `RSX_DUMP_FRAME` fermava il livello** (nota della s.28): il percorso
+del dump usciva dal present PRIMA di pubblicare i report delle occlusion
+query, e il job 215 aspettava per sempre. Ora `reports_publish()` e'
+condivisa fra il completed handler e il dump (la GPU ha gia' finito:
+`waitUntilCompleted`). c4: due dump a 240 s senza fermate.
+
+**5. I "triangoli neri" nel cielo: le parole DRAW_ARRAYS spezzavano le
+primitive.** `RSX_FP_PROBE=all` sul dump di 007D0000: la zona dei
+triangoli era il colore di clear (nessun draw) e il resto del cielo un
+solo programma (fp 0019A002/9B3CBE55, 23 draw da **256** vertici, liste di
+triangoli). Ogni parola `DRAW_ARRAYS`/`DRAW_INDEX_ARRAY` porta al massimo
+256 vertici ((count-1) in 8 bit) e un draw grande arriva come parole
+contigue nello stesso BEGIN/END; il dispatcher le mandava al backend una
+per una e l'assemblaggio ripartiva a ogni parola: 256 = 85*3+1, dalla
+seconda parola i triangoli erano sfalsati di un vertice (sul cielo, una
+griglia regolare, diventavano triangoli "plausibili" con i buchi; sulla
+gru e le sartie, spuntoni). Ora `draw_clause_append/flush` in
+`rsx_commands.c` (come RPCS3 `draw_clause::append`): le parole contigue
+diventano un draw, emesso a END. `RSX_DRAW_COALESCE=0` torna a prima.
+Risultato: cielo intero, gru e sartie giuste, mare; draw per fotogramma da
+~6.000 a ~2.900 (`docs/img_s30_dive_boat_coalesce.png`), fps invariati
+(7,5-8).
+
+**6. La sfera e la cupola nere davanti al personaggio: la maschera di
+colore.** Nel drawlist erano 2 draw da 540 vertici nel buffer illuminato
+016D0000 con un FP banale (34F0B9F8, lo stesso delle shadow map), senza
+blend: i volumi delle luci dell'illuminazione differita, che il titolo
+disegna con `SET_COLOR_MASK` = 0 (solo stencil/depth). Il backend Metal
+non applicava la maschera: ora `d->color_mask` -> `writeMask` della
+pipeline (parte della chiave PSO; `cm=` nel drawlist). Nel fotogramma del
+livello **1563 draw su 2920 hanno maschera 0** e 1094 maschera RGB senza
+alpha. `docs/img_s30_dive_boat_colormask.png`: la scena e' quella del
+gioco.
+
+**Stallo intermittente visto una volta (c2)**: `[spu-dma] ovl=215
+pc=0x086F4: 200000 identical GET ... ea=0x210157F0 (valore 0)` poi
+`Rendering is stuck on reference value 2144`: il job di geometria
+aspettava un report (slot 383) mai scritto dal walker (parola 0 = 0,
+nessun timestamp). 1 corsa su 9. Da capire; un rimedio nello stile di
+`GCM_LABEL_UNSTICK` (pubblicare l'ombra del report dopo N ms) e' l'idea.
+
+### Fronte aperto (dopo la sessione 30)
+
+1. **Il personaggio esce a pezzi staccati e scuro** (mano che fluttua,
+   busto, gambe separate: `img_s30_dive_boat_colormask.png`): lo skinning.
+   Nel drawlist i draw del personaggio nel buffer illuminato usano
+   vp A488B4A5 / fp 0F97C001 (memoria locale); da vedere se le matrici
+   delle ossa arrivano dalle costanti del VP o da un job SPU, e con
+   `RSX_VP_DBG_STAT` dove finiscono le posizioni.
+2. Lo stallo del report (sopra), 1 corsa su 9.
+3. Velocita': 7,5-8 fps nel livello con ~2.900 draw (nessun thread saturo).
+
+### Strumenti nuovi (sessione 30)
+
+- `RSX_DRAW_COALESCE=0` (parole DRAW una per una, come prima).
+- `cm=<maschera>` nel `RSX_DRAWLIST`; il messaggio `decompile failed` dice
+  quanti byte fino al bit END e il tetto.
+- `RSX_DUMP_FRAME` ora non ferma il livello: con `RSX_DRAWLIST_MIN=1500
+  RSX_DRAWLIST_AFTER=2450 RSX_DUMP_FRAME=100000` si ha drawlist + dump di
+  tutte le superfici del fotogramma 2450 (~65 s, livello pieno); i dump in
+  `/tmp/rsx_frame.ppm`, `/tmp/rsx_surf_<offset>.ppm`.
 
 ## Sessione 29 — il livello a schermo: costanti FP, NV0039, texture in streaming, normali CMP
 
