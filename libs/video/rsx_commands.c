@@ -20,6 +20,7 @@
 #include <string.h>
 
 #include "../../runtime/memory/vm.h"    /* VM_HLE_INJECT_BASE */
+u32 g_rsx_cur_dea;   /* EA della parola dati del metodo in corso (walker FIFO), per i trace */
 
 /* ---------------------------------------------------------------------------
  * Global backend
@@ -204,6 +205,12 @@ static int process_texture_method(rsx_state* state, u32 method, u32 data)
     switch (reg) {
     case 0x00: /* TEXTURE_OFFSET */
         tex->offset = data;
+        /* RSX_TEXOFF_TRACE=<lo>:<hi> (esadecimali): ogni SET_TEXTURE_OFFSET con
+         * valore nell'intervallo, con l'indirizzo FIFO della parola (per
+         * risalire con SPU_WRING a chi l'ha scritta, sessione 29). */
+        { static int t = -1; static u32 lo = 0, hi = 0;
+          if (t < 0) { t = 0; const char* e = getenv("RSX_TEXOFF_TRACE"); if (e && sscanf(e, "%x:%x", &lo, &hi) == 2) t = 1; }
+          if (t && data >= lo && data < hi) fprintf(stderr, "[texoff] unit %u off=%08X @fifo %08X\n", unit, data, g_rsx_cur_dea); }
         break;
     case 0x04: /* TEXTURE_FORMAT */
         tex->format = data;

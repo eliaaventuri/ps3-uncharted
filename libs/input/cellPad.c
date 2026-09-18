@@ -507,9 +507,15 @@ skip_inject: ;
     /* LBP_AUTOPRESS: headless bring-up input -- pulse CROSS then START every few
      * seconds of polling so boot screens that wait for input advance without a
      * human at the pad. Env-gated test scaffolding, off by default. */
-    { static int s_ap = -1; static unsigned s_apn = 0;
-      if (s_ap < 0) s_ap = getenv("LBP_AUTOPRESS") ? 1 : 0;
+    { static int s_ap = -1; static unsigned s_apn = 0; static double s_ap_until = 0; static unsigned long long s_ap_t0 = 0;
+      if (s_ap < 0) { const char* e = getenv("LBP_AUTOPRESS"); s_ap = (e && *e && *e != '0') ? 1 : 0;   /* "0" = spento (s.29: prima contava come acceso) */
+                      /* LBP_AUTOPRESS_UNTIL=<s>: dopo s secondi dal primo poll basta impulsi
+                       * (nel livello START mette in pausa e CROSS fa saltare/sparare, s.29) */
+                      const char* u = getenv("LBP_AUTOPRESS_UNTIL"); s_ap_until = u ? atof(u) : 0; }
       if (s_ap && port_no == 0) {
+          extern unsigned long long ps3_ms_now(void);
+          unsigned long long now = ps3_ms_now(); if (!s_ap_t0) s_ap_t0 = now;
+          if (s_ap_until > 0 && (double)(now - s_ap_t0) / 1000.0 > s_ap_until) s_ap = 0;
           unsigned ph = s_apn++ % 240;
           if (ph < 12)
               data->button[CELL_PAD_BTN_OFFSET_DIGITAL2] |= 0x40;   /* CROSS */

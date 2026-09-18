@@ -740,6 +740,7 @@ static u32 s_call_start = 0;   /* inizio del buffer CALLato corrente (per GCM_CA
  * its texture-size constants -> UVs scaled by 0 -> uniform output).
  * -----------------------------------------------------------------------*/
 extern u32 cellGcmResolveLocated(int local, u32 offset);
+extern u32 g_rsx_cur_dea;   /* rsx_commands.c */
 
 static struct {
     u32 dst_dma;      /* NV3062 0x0188 SET_CONTEXT_DMA_IMAGE_DESTIN */
@@ -892,6 +893,58 @@ static void nv3089_blit(void)
                out_w, out_h, f, src, in_pitch, dst, dst_pitch, out_x, out_y); } }
 }
 
+/* NV0039 (memory-to-memory, cellGcmSetTransferData): copia lineare o per
+ * righe fra due indirizzi della memoria guest, eseguita dalla RSX nell'ordine
+ * della FIFO. Uncharted ci fa la COMPATTAZIONE del suo heap texture
+ * (func_004D19B8: un blocco per fotogramma spostato in basso della misura del
+ * buco, con il descrittore aggiornato subito): senza la copia i descrittori
+ * puntavano a dati non spostati e le texture grandi (cielo, pavimento, sfondo
+ * di pausa) uscivano a rumore con le prime righe di spazzatura (sessione
+ * 29). Sovrapposizione ammessa (memmove). GCM_NV0039=0 la spegne. */
+extern u8* vm_base; extern u32 ppu_vm_size;   /* 0 = sconosciuta */
+static struct { u32 dma_in, dma_out, off_in, off_out, pitch_in, pitch_out, len, lines, fmt; } s_nv0039 = { 0xFEED0000u, 0xFEED0000u, 0,0,0,0,0,0,0x101 };
+static unsigned long s_nv0039_n, s_nv0039_bytes;
+static void nv0039_copy(void)
+{
+    const u32 lines = s_nv0039.lines, len = s_nv0039.len;
+    if (!lines || !len || !vm_base) return;
+    /* contesto DMA: 0xFEED0000 = locale (VRAM), 0xFEED0001 = principale (IO) */
+    const u32 sea = cellGcmResolveLocated(s_nv0039.dma_in  == 0xFEED0000u, s_nv0039.off_in);
+    const u32 dea = cellGcmResolveLocated(s_nv0039.dma_out == 0xFEED0000u, s_nv0039.off_out);
+    const u64 sspan = (u64)(lines - 1) * s_nv0039.pitch_in  + len;
+    const u64 dspan = (u64)(lines - 1) * s_nv0039.pitch_out + len;
+    if (!sea || !dea || (ppu_vm_size && ((u64)sea + sspan > ppu_vm_size || (u64)dea + dspan > ppu_vm_size))) {
+        static int _w = 0; if (_w++ < 8) fprintf(stderr, "[NV0039] copia fuori memoria: in=%08X/%08X out=%08X/%08X %ux%u -- saltata\n",
+                                                  s_nv0039.off_in, sea, s_nv0039.off_out, dea, len, lines);
+        return; }
+    if ((s_nv0039.fmt & 0xFF) != 1 || ((s_nv0039.fmt >> 8) & 0xFF) != 1) {
+        static int _w = 0; if (_w++ < 4) fprintf(stderr, "[NV0039] formato %08X non gestito (solo byte)\n", s_nv0039.fmt); }
+    u8* d = vm_base + dea; const u8* sp = vm_base + sea;
+    if (s_nv0039.pitch_in == len && s_nv0039.pitch_out == len) memmove(d, sp, (size_t)len * lines);
+    else for (u32 y = 0; y < lines; y++) memmove(d + (size_t)y * s_nv0039.pitch_out, sp + (size_t)y * s_nv0039.pitch_in, len);
+    s_nv0039_n++; s_nv0039_bytes += (unsigned long)len * lines;
+    { static int tr = -1; if (tr < 0) tr = getenv("GCM_NV0039_TRACE") ? 1 : 0;
+      if (tr || s_nv0039_n <= 4) fprintf(stderr, "[NV0039] #%lu copia %u x %u byte %08X -> %08X (ea %08X -> %08X)\n",
+                                        s_nv0039_n, len, lines, s_nv0039.off_in, s_nv0039.off_out, sea, dea); }
+}
+static int nv0039_method(u32 method, u32 data)
+{
+    switch (method) {
+    case 0x0184: s_nv0039.dma_in    = data; return 1;
+    case 0x0188: s_nv0039.dma_out   = data; return 1;
+    case 0x030C: s_nv0039.off_in    = data; return 1;
+    case 0x0310: s_nv0039.off_out   = data; return 1;
+    case 0x0314: s_nv0039.pitch_in  = data; return 1;
+    case 0x0318: s_nv0039.pitch_out = data; return 1;
+    case 0x031C: s_nv0039.len       = data; return 1;
+    case 0x0320: s_nv0039.lines     = data; return 1;
+    case 0x0324: s_nv0039.fmt       = data; return 1;
+    case 0x0328: nv0039_copy();              return 1;   /* BUFFER_NOTIFY */
+    }
+    return 0;
+}
+static int nv0039_is_method(u32 m) { return m == 0x0184u || m == 0x0188u || (m >= 0x030Cu && m <= 0x0328u); }
+
 static void gcm_2d_method(u32 subch, u32 method, u32 data)
 {
     /* GCM2D_TRACE=1: histogram of (subchannel, method) actually seen. The
@@ -997,7 +1050,8 @@ static void gcm_2d_method(u32 subch, u32 method, u32 data)
         }
         return;
     }
-    /* NV0039 / NV309E: not implemented yet -- log first sightings. */
+    if ((subch == 1 || subch == 6) && nv0039_method(method, data)) return;
+    /* NV309E: not implemented yet -- log first sightings. */
     /* GCM2D_DBG=<N> raises the cap and adds the data word: the fixed 8 showed
      * only that SOMETHING was unhandled, not enough to implement it. */
     static int warned = 0, wcap = -1;
@@ -2140,7 +2194,9 @@ static void gcm_rsx_process_fifo_unlocked(void)
                                  n_be, n_va, n_ia), fflush(stdout);
                   } }
 
-                if (subch == 0 || (subch == 1 && !s1_2d)) {
+                static int s_nv39 = -1; if (s_nv39 < 0) { const char* e = getenv("GCM_NV0039"); s_nv39 = (e && *e == '0') ? 0 : 1; }
+                if (subch == 0 || (subch == 1 && !s1_2d && !(s_nv39 && nv0039_is_method(m)))) {
+                    g_rsx_cur_dea = dea;
                     rsx_process_method(&s_state, m, vm_read32(dea));
                     /* NV406E_SET_REFERENCE: queue the fence value for PACED
                      * publication (gcm_ref_publish below) instead of letting a

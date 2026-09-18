@@ -97,6 +97,16 @@ void rsx_fetch_attrib(const rsx_state* st, int idx, u32 vi, float out[4])
     case 7: /* UB256: u8 unnormalized */
         for (u32 k = 0; k < n; k++) out[k] = (float)p[k];
         break;
+    case 6: { /* CMP: una parola BE, x/y/z a 11/11/10 bit con segno,
+               * normalizzati (RPCS3 RSXVertexFetch.glsl: _get_bits 0/11,
+               * 11/11, 22/10, poi sext). Uncharted ci mette le normali
+               * (attr 2, size 1): non gestito, ogni superficie illuminata
+               * usciva a rumore (sessione 29). */
+        const u32 v = ((u32)p[0] << 24) | ((u32)p[1] << 16) | ((u32)p[2] << 8) | p[3];
+        out[0] = (float)((s32)(v << 21) >> 21) / 1023.0f;
+        out[1] = (float)((s32)(v << 10) >> 21) / 1023.0f;
+        out[2] = (float)((s32)v >> 22) / 511.0f;
+        break; }
     default:
         { static int t = -1; if (t < 0) t = getenv("VTX_TYPEDBG") ? 1 : 0;
           if (t) { static u32 seen = 0;
