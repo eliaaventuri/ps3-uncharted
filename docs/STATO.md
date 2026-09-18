@@ -1,6 +1,6 @@
 # Stato del progetto
 
-Ultimo aggiornamento: **18 settembre 2026** — sessione 30.
+Ultimo aggiornamento: **18 settembre 2026** — sessione 31.
 
 ## Dove siamo
 
@@ -441,6 +441,79 @@ La lista dei comandi ora viene percorsa fino in fondo — sei coppie
 risultati in memoria principale.** Non era mai successo in nessuna sessione.
 Riproducibile: **tre corse su tre**, identiche -- 14 comandi, un overlay
 residente, zero microstep, cinque stall e due interrupt per corsa.
+
+## Sessione 31 — l'oracolo RPCS3 gira sul Mac; cubemap e probe RGBA16F: il personaggio ha il suo materiale
+
+**RPCS3 esegue Uncharted su questa macchina** (`uncharted-data/tools/RPCS3.app`,
+build arm64 0.0.42, Vulkan/MoltenVK): titolo, menu, livello dive-boat a
+~17 fps (`docs/img_s31_rpcs3_dive_boat.jpg` = il riferimento del fotogramma
+che stiamo inseguendo). Ricetta, perche' ognuno di questi passi e' costato:
+
+- Firmware: quello del disco (`/tmp/uc_iso/PS3_UPDATE/PS3UPDAT.PUP`, v1.9x)
+  installato con `rpcs3 --installfw <pup>`. E' VECCHIO: manca
+  `libmpeg2dec.sprx`, e RPCS3 moderno decodifica i filmati chiamando i moduli
+  del firmware -> `cellVdecQueryAttr` FATAL, il titolo resta per sempre in
+  "waiting for pic" sul filmato dei loghi. Rimedio senza scaricare un PUP nuovo:
+  `uncharted-data/rpcs3_bdvd/` e' un'ombra del disco fatta di symlink SENZA
+  `sce-ndi-logos.m2v` e `00a-01a-sequence.m2v` (il titolo salta i filmati
+  mancanti senza lamentarsi). Si avvia con
+  `rpcs3 --no-gui ~/Documents/Coding/uncharted-data/rpcs3_bdvd/PS3_GAME/USRDIR/EBOOT.BIN`.
+- Gli overlay di RPCS3 vogliono un font: senza `~/Library/Fonts/Arial.ttf`
+  (symlink a `/System/Library/Fonts/Supplemental/Arial.ttf`) il Pad Thread
+  muore con "Failed to initialize font" e il gioco non parte.
+- Tastiera: `~/Library/Application Support/rpcs3/input_configs/global/Default.yml`
+  con **Cross = Backspace**, Start = Return, Circle = Del, Triangle = Esc. Il
+  motivo: i tasti si mandano dal computer-use MCP in background (`app_key`)
+  che conosce solo return/escape/backspace/delete; `app_type "x"` arriva come
+  testo, non come tasto, e RPCS3 non lo vede. Una pressione singola spesso
+  cade fra due poll del titolo: 8 backspace di fila in un `app_batch`.
+  Sequenza: autosave -> Cross; "Press START" -> Return; New Game -> Cross;
+  difficolta' -> Cross; "save this data?" -> Cross; ~60 s dopo il livello.
+- `Log shader programs: true` in `config.yml`: RPCS3 scrive il GLSL di ogni
+  programma in `~/Library/Caches/rpcs3/shaderlog/` (188 file per il livello,
+  `FragmentProgramN.spirv` e' testo GLSL). NON c'e' il microcodice ne' un hash:
+  si appaiano con i nostri per struttura (unita' texture, TEX2D_SHADOW,
+  numero di istruzioni). TTY del titolo in `~/Library/Caches/rpcs3/TTY.log`.
+- Non lanciare il port mentre RPCS3 gira (stessa GPU).
+
+**Cosa ha detto l'oracolo sul personaggio** (FP F728899C = muta, 5F6F3ABD =
+testa, in RPCS3 `FragmentProgram129/130.spirv`): `tex2` e' un **samplerCube**
+campionato con la normale (ambiente/probe), `tex15` un `sampler1D` (LUT),
+`tex12` `sampler2DShadow`. Il backend Metal passava sempre `tex_cube_mask=0`
+al decompilatore e caricava ogni texture come 2D: il termine ambiente del
+personaggio leggeva un colore qualsiasi della prima faccia. E la probe e'
+una cubemap **16x16 W16_Z16_Y16_X16_FLOAT (0xBA)**, formato che
+`rsx_texture_layout` non conosceva (letta come B8: rumore).
+
+Fatto (`rsx_metal_backend.m`): (1) `cube_mask` per draw dal bit 2 di
+SET_TEXTURE_FORMAT, dentro la chiave della variante del FP (`shadow_key`) e
+passato al decompilatore (che aveva gia' il percorso `texturecube`);
+(2) upload a 6 facce in una `MTLTextureTypeCube` — ogni faccia e' la sua
+piramide di mip completa allineata a 128 byte (come nel backend D3D12), le
+viste con remap prendono 6 slice; (3) decodifica di 0x9A in una texture
+`RGBA16Float` (parole a 16 bit BE, ordine gia' RGBA dopo lo scambio, RPCS3
+`TextureUtils.cpp`). Risultato: la muta e' grigio-blu con il riflesso del
+cielo e il disegno circolare della bombola sulla schiena, il container verde
+acido e' diventato grigio-azzurro: la tavolozza e' quella di RPCS3.
+`RSX_CUBE=0` per l'A/B, `RSX_CUBE_DBG=1` stampa cubemap e varianti.
+
+**Il personaggio E' a pezzi** (correzione della nota di s.30): in RPCS3 sta in
+piedi con le braccia lungo i fianchi; da noi la mano fluttua sopra la testa,
+il busto e' deformato e delle gambe restano frammenti ai piedi. Skinning o
+matrici delle ossa: e' il fronte.
+
+**Meta' dei fotogrammi presentati e' PIATTA** (misurato con `RSX_DUMP_COUNT=10`:
+OK OK PIATTO PIATTO OK OK ..., colore uniforme 0x363A4E + HUD, ~2000 draw
+anche loro). Preesistente (`RSX_CUBE=0` uguale). Da capire: composizione che
+legge la superficie sbagliata a fotogrammi alterni, o artefatto del dump.
+
+### Fronte aperto (dopo la sessione 31)
+
+1. Skinning del personaggio (v. sopra). Confronto: `img_s31_rpcs3_dive_boat.jpg`.
+2. Fotogrammi piatti alternati.
+3. RPCS3 dice anche: `TEX3D` in 62 punti (volumi, unit 1/2) e `TEX1D(15)` —
+   da noi tutto 2D. Da verificare cosa si perde.
+4. Stallo del report (s.30), velocita' 8 fps.
 
 ## Sessione 30 — il livello come nel gioco: draw coalescenti, maschera di colore, crash del present
 

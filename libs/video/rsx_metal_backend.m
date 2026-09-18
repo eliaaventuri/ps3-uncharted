@@ -84,7 +84,8 @@ typedef struct {
     u8  color_mask;                /* MTLColorWriteMask (s.30): SET_COLOR_MASK del guest, 0 = solo depth/stencil */
     u32 attr0_off, first;          /* offset guest dell'attributo 0 e primo vertice (RSX_DRAWLIST `va=`, s.30: per appaiare prepass e colore) */
     u8  tex_zfunc[16];             /* unita' in modalita' shadow: zfunc (TEXTURE_ADDRESS bit 28-31) se la texture e' depth, 0 altrimenti (s.30) */
-    u32 shadow_key;                /* impronta di tex_zfunc, nei bit alti dell'argomento mrt di guest_fp_library (variante del FP) */
+    u32 shadow_key;                /* impronta di tex_zfunc E di cube_mask, nei bit alti dell'argomento mrt di guest_fp_library (variante del FP) */
+    u32 cube_mask;                 /* bit N: l'unita' N e' una cubemap (SET_TEXTURE_FORMAT bit 2): il FP la campiona con la direzione xyz (s.31) */
     u32 zeta_off;                  /* SURFACE_ZETA_OFFSET al momento del draw */
     int depth_test; u32 depth_func; int depth_mask; /* stato del test di profondita' */
     u32 shader_ctrl;               /* SET_SHADER_CONTROL (0x1D60): bit 0xE = export della profondita' */
@@ -138,15 +139,24 @@ static void draw_viewport_setup(MtlDraw* d, const rsx_state* st)
     d->vy = st->viewport_offset[1] - sy; d->vh = 2.0f * sy;
 }
 static const u8* s_fp_shadow_cur;   /* tabella del draw in corso di traduzione */
+static u32       s_fp_cube_cur;     /* cube_mask del draw in corso di traduzione (s.31) */
+/* RSX_CUBE=0: le cubemap tornano a essere campionate come 2D (A/B, s.31). */
+static int cube_enabled(void) { static int en = -1; if (en < 0) { const char* e = getenv("RSX_CUBE"); en = (e && *e == '0') ? 0 : 1; } return en; }
 static u32 draw_shadow_setup(MtlDraw* d, const rsx_state* st)
 {
-    u32 key = 0;
+    u32 key = 0, cube = 0;
     memset(d->tex_zfunc, 0, sizeof d->tex_zfunc);
     if (st) for (u32 u = 0; u < 16; u++) {
         const rsx_texture_state* t = &st->textures[u];
         if (!(t->control0 & 0x80000000u)) continue;
         u32 fmt = (t->format >> 8) & 0x9Fu, zf = (t->address >> 28) & 0xFu;
-        if (fmt >= 0x90u && fmt <= 0x93u && zf) { d->tex_zfunc[u] = (u8)zf;   /* DEPTH24_D8 0x90 .. DEPTH16_FLOAT 0x93, senza LN/UN */ key |= (zf & 7u) << (u * 2); key ^= 0x80000000u >> (u & 15); } }
+        if (fmt >= 0x90u && fmt <= 0x93u && zf) { d->tex_zfunc[u] = (u8)zf;   /* DEPTH24_D8 0x90 .. DEPTH16_FLOAT 0x93, senza LN/UN */ key |= (zf & 7u) << (u * 2); key ^= 0x80000000u >> (u & 15); }
+        /* SET_TEXTURE_FORMAT bit 2: cubemap. Il FP del personaggio di Uncharted
+         * campiona l'ambiente con la normale (unit 2/3): letta come 2D dava
+         * un colore qualsiasi della prima faccia (RPCS3: samplerCube, s.31). */
+        if ((t->format & 4u) && cube_enabled()) cube |= 1u << u; }
+    d->cube_mask = cube;
+    if (cube) key ^= cube * 0x9E3779B1u;
     d->shadow_key = key ? (key * 2654435761u >> 8) | 1u : 0;
     return d->shadow_key;
 }
@@ -784,7 +794,7 @@ static void record_draw(const rsx_state* st, u32 prim, u32 base, u32 count,
     /* Il programma va tradotto ORA, finche' il microcodice in memoria e' quello
      * del draw: il titolo riusa il ring dei FP e alla codifica (present) ci
      * sarebbe gia' il programma del fotogramma dopo. */
-    if (d->fp_addr) { s_fp_shadow_cur = d->tex_zfunc; (void)guest_fp_library(d->fp_addr, (d->vp >= 0 && s_vps[d->vp].ok) ? d->vp : -1, d->shader_ctrl, d->n_mrt | (d->shadow_key << 8), d->fp_hash); }
+    if (d->fp_addr) { s_fp_shadow_cur = d->tex_zfunc; s_fp_cube_cur = d->cube_mask; (void)guest_fp_library(d->fp_addr, (d->vp >= 0 && s_vps[d->vp].ok) ? d->vp : -1, d->shader_ctrl, d->n_mrt | (d->shadow_key << 8), d->fp_hash); }
     d->surf_w = st->surface_clip_w ? st->surface_clip_w : s_width; d->surf_h = st->surface_clip_h ? st->surface_clip_h : s_height;
     d->sx = st->scissor_x; d->sy = st->scissor_y;
     d->sw = st->scissor_w; d->sh = st->scissor_h;
@@ -922,7 +932,7 @@ done:
     d->surf_fmt = s_state ? s_state->surface_format : 0; d->color_target = s_state ? s_state->color_target : 0;
     d->surf2 = s_state ? s_state->surface_color_offset[2] : 0; d->surf3 = s_state ? s_state->surface_color_offset[3] : 0;
     d->n_mrt = (d->color_target == 0x13) ? 2 : (d->color_target == 0x17) ? 3 : (d->color_target == 0x1F) ? 4 : 1;
-    if (d->fp_addr) { s_fp_shadow_cur = d->tex_zfunc; (void)guest_fp_library(d->fp_addr, (d->vp >= 0 && s_vps[d->vp].ok) ? d->vp : -1, d->shader_ctrl, d->n_mrt | (d->shadow_key << 8), d->fp_hash); }
+    if (d->fp_addr) { s_fp_shadow_cur = d->tex_zfunc; s_fp_cube_cur = d->cube_mask; (void)guest_fp_library(d->fp_addr, (d->vp >= 0 && s_vps[d->vp].ok) ? d->vp : -1, d->shader_ctrl, d->n_mrt | (d->shadow_key << 8), d->fp_hash); }
     d->surf_pitch0 = s_state ? s_state->surface_color_pitch[0] : 0; d->surf1 = s_state ? s_state->surface_color_offset[1] : 0;
     d->surf_w = (s_state && s_state->surface_clip_w) ? s_state->surface_clip_w : s_width;
     d->surf_h = (s_state && s_state->surface_clip_h) ? s_state->surface_clip_h : s_height;
@@ -1413,7 +1423,7 @@ static id<MTLTexture> tex_with_remap(id<MTLTexture> t, u32 remap)
     MTLTextureSwizzleChannels ch = MTLTextureSwizzleChannelsMake(sw[0], sw[1], sw[2], sw[3]);
     id<MTLTexture> v = [t newTextureViewWithPixelFormat:t.pixelFormat textureType:t.textureType
                                                  levels:NSMakeRange(0, t.mipmapLevelCount)
-                                                 slices:NSMakeRange(0, t.arrayLength) swizzle:ch];
+                                                 slices:NSMakeRange(0, t.textureType == MTLTextureTypeCube ? 6 : t.arrayLength) swizzle:ch];
     if (!v) return t;
     if (s_remap_n >= MTL_REMAP_MAX) {   /* piena: tutte nel cimitero, si ricomincia (raro) */
         for (u32 i = 0; i < s_remap_n; i++) { graveyard_add(s_remaps[i].view); s_remaps[i].view = nil; }
@@ -1519,6 +1529,18 @@ static void mtl_bind_texture(void* ud, u32 unit, const rsx_texture_state* tex)
      * texture Metal non ha mip e lo stesso offset compariva con 5 varianti */
     rsx_tex_layout tl;
     rsx_texture_layout(fmt, width, height, &tl);
+    /* W16_Z16_Y16_X16_FLOAT (0x9A): RGBA a mezza precisione, 8 byte per texel,
+     * parole a 16 bit big-endian, e dopo lo scambio l'ordine e' gia' R,G,B,A
+     * (RPCS3: "WZYX maps directly as RGBA16: R=W"). rsx_texture_layout non lo
+     * conosce e lo leggeva come B8: le probe di luce di Uncharted (cubemap
+     * 16x16 per il personaggio, s.31) uscivano rumore. Texture Metal RGBA16F:
+     * i valori HDR restano tali. */
+    const int hdr16 = ((fmt & 0x9Fu) == 0x9Au);
+    if (hdr16) {
+        tl.compressed = 0; tl.block_bytes = 0; tl.bytes_per_texel = 8;
+        tl.row_bytes = width * 8u; tl.rows = height; tl.face_bytes = tl.row_bytes * height;
+        tl.swizzled = (!(fmt & 0x20u) && !(width & (width - 1)) && !(height & (height - 1))) ? 1 : 0;
+    }
 
     /* Bit 31 of the OFFSET selects the context DMA (1 = MAIN, 0 = LOCAL), the
      * same convention rsx_vertex_fetch follows; the FORMAT's low two bits say
@@ -1529,13 +1551,32 @@ static void mtl_bind_texture(void* ud, u32 unit, const rsx_texture_state* tex)
     const u32 raw  = tex->offset;
     const int main_mem = (raw & 0x80000000u) ? 1 : ((tex->format & 3u) != 1u);
     const u32 ea   = cellGcmResolveLocated(!main_mem, raw & 0x7FFFFFFFu);
+    /* Cubemap (SET_TEXTURE_FORMAT bit 2): 6 facce consecutive, e OGNI faccia e'
+     * la sua piramide di mip completa, allineata a 128 byte (come nel backend
+     * D3D12: con il passo di una sola immagine la faccia 1 cadeva dentro la
+     * catena di mip della faccia 0). Ordine +X -X +Y -Y +Z -Z = slice Metal 0..5. */
+    const int  cube   = ((tex->format & 4u) && cube_enabled()) ? 1 : 0;
+    const u32  nfaces = cube ? 6u : 1u;
+    u32 face_stride = tl.face_bytes;
+    if (cube) {
+        u32 mips = (tex->format >> 16) & 0xFu; if (!mips) mips = 1;
+        u32 total = 0;
+        for (u32 lw = width, lh = height, l = 0; l < mips; l++) {
+            total += tl.compressed ? (((lw + 3) / 4) * tl.block_bytes * ((lh + 3) / 4))
+                                   : (lw * lh * tl.bytes_per_texel);
+            if (lw > 1) lw >>= 1;
+            if (lh > 1) lh >>= 1;
+        }
+        face_stride = (total + 127u) & ~127u;
+    }
+    const u32 span = face_stride * (nfaces - 1u) + tl.face_bytes;
     if (ppu_vm_size && (ea == 0 || tl.face_bytes == 0 ||
-                        ea + tl.face_bytes > ppu_vm_size)) {
+                        ea + span > ppu_vm_size)) {
         static int warned = 0;
         if (warned++ < 8)
             fprintf(stderr, "[RSX metal] texture unit %u: offset 0x%08X resolves "
                             "to 0x%08X + %u bytes, outside guest memory -- skipped\n",
-                    unit, raw, ea, tl.face_bytes);
+                    unit, raw, ea, span);
         return;
     }
 
@@ -1548,29 +1589,46 @@ static void mtl_bind_texture(void* ud, u32 unit, const rsx_texture_state* tex)
       if (ce) { stale = ce; static unsigned long s_nst = 0; s_nst++;
                 if (s_nst <= 8 || (s_nst % 1000) == 0) fprintf(stderr, "[RSX metal] texture %ux%u fmt=0x%02X @%08X cambiata in memoria: ridecodifica (#%lu)\n", width, height, fmt, tex->offset, s_nst); } }
 
-    const u32 pitch = width * 4u;
-    u8* staging = (u8*)malloc((size_t)pitch * height);
+    const u32 pitch = width * (hdr16 ? 8u : 4u);
+    u8* staging = (u8*)malloc((size_t)pitch * height * nfaces);
     if (!staging) return;
     /* Un formato compresso va DECOMPRESSO: la texture Metal qui e' RGBA8, e
      * rsx_texture_decode() per i formati a blocchi copia i blocchi cosi' come
      * sono (che e' giusto per chi carica BC nativo, come D3D12). Copiandoli in
      * una RGBA8 si otteneva rumore rosso/verde/blu -- misurato: un riquadro di
      * 128x32 pixel di sale e pepe colorato al posto dell'HUD. */
-    s_tex_decodes++; s_tex_decode_px += (unsigned long)width * height;
-    if (tl.compressed)
-        rsx_texture_decode_bc(staging, pitch, vm_base + ea, width, height, &tl);
-    else
-        rsx_texture_decode(staging, pitch, vm_base + ea, width, height, &tl,
-                           rsx_texture_argb_is_rgba());
+    s_tex_decodes++; s_tex_decode_px += (unsigned long)width * height * nfaces;
+    for (u32 f = 0; f < nfaces; f++) {
+        u8* dst = staging + (size_t)f * pitch * height;
+        const u8* src = vm_base + ea + (size_t)f * face_stride;
+        if (hdr16) {
+            const u32 lw = rsx_log2_ceil(width), lh = rsx_log2_ceil(height);
+            for (u32 y = 0; y < height; y++) for (u32 x = 0; x < width; x++) {
+                const u8* q = src + (tl.swizzled ? rsx_swizzle_offset(x, y, lw, lh) * 8u : (y * width + x) * 8u);
+                u8* o = dst + y * pitch + x * 8u;
+                for (int c = 0; c < 4; c++) { o[c*2] = q[c*2+1]; o[c*2+1] = q[c*2]; }   /* u16 BE -> LE */
+            }
+        } else if (tl.compressed)
+            rsx_texture_decode_bc(dst, pitch, src, width, height, &tl);
+        else
+            rsx_texture_decode(dst, pitch, src, width, height, &tl,
+                               rsx_texture_argb_is_rgba());
+    }
+    const MTLPixelFormat hostpf = hdr16 ? MTLPixelFormatRGBA16Float : MTLPixelFormatRGBA8Unorm;
 
-    MTLTextureDescriptor* td = [MTLTextureDescriptor
-        texture2DDescriptorWithPixelFormat:MTLPixelFormatRGBA8Unorm
-                                     width:width height:height mipmapped:NO];
+    MTLTextureDescriptor* td = cube
+        ? [MTLTextureDescriptor textureCubeDescriptorWithPixelFormat:hostpf
+                                                                size:width mipmapped:NO]
+        : [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:hostpf
+                                                             width:width height:height mipmapped:NO];
     td.usage = MTLTextureUsageShaderRead;
-    id<MTLTexture> mt = [s_dev newTextureWithDescriptor:td];
+    id<MTLTexture> mt = (cube && width != height) ? nil : [s_dev newTextureWithDescriptor:td];
+    if (!mt && cube) { static int _n = 0; if (_n++ < 8) fprintf(stderr, "[RSX metal] cubemap %ux%u fmt=0x%02X: texture cube NON creata (facce non quadrate?)\n", width, height, fmt); }
     if (mt) {
-        [mt replaceRegion:MTLRegionMake2D(0, 0, width, height)
-              mipmapLevel:0 withBytes:staging bytesPerRow:pitch];
+        for (u32 f = 0; f < nfaces; f++)
+            [mt replaceRegion:MTLRegionMake2D(0, 0, width, height)
+                  mipmapLevel:0 slice:f withBytes:staging + (size_t)f * pitch * height
+                  bytesPerRow:pitch bytesPerImage:(NSUInteger)pitch * height];
         u->tex = mt;
         u->offset = tex->offset; u->format = tex->format;
         u->image_rect = tex->image_rect;
@@ -1578,9 +1636,13 @@ static void mtl_bind_texture(void* ud, u32 unit, const rsx_texture_state* tex)
             remap_drop_base(stale->tex); graveyard_add(stale->tex);
             stale->tex = mt; stale->fp = fpr; stale->last_use = s_frame_no; }
         else texcache_add(tex->offset, tex->format & ~0xF0000u, tex->image_rect, mt, fpr);
-        { static int _tn = 0; if (_tn++ < 64)
-          fprintf(stderr, "[RSX metal] texture unit %u: %ux%u fmt=0x%02X\n",
-                  unit, width, height, fmt); }
+        { static int _tn = 0; static int _cn = 0; if (_tn++ < 64 || (cube && _cn++ < 32))
+          fprintf(stderr, "[RSX metal] texture unit %u: %ux%u fmt=0x%02X%s%s\n",
+                  unit, width, height, fmt, cube ? " (cubemap, 6 facce)" : "", (tex->format & 4u) && !cube ? " (cubemap letta come 2D: RSX_CUBE=0)" : ""); }
+        /* RSX_CUBE_DBG=1: ogni cubemap con formato, mip, passo di faccia */
+        { static int cd = -1; if (cd < 0) cd = getenv("RSX_CUBE_DBG") ? 1 : 0;
+          if (cd && (tex->format & 4u)) fprintf(stderr, "[cube] f#%lu unit %u off=%08X fmt=%08X %ux%u mips=%u face_stride=%u compressed=%d bpt=%u\n",
+                  s_frame_no, unit, tex->offset, tex->format, width, height, (tex->format >> 16) & 0xFu, face_stride, tl.compressed, tl.bytes_per_texel); }
         /* RSX_TEX_DBG=1: quanti texel non neri sono davvero atterrati. Una
          * texture decodificata male e una texture vuota dal backend si vedono
          * uguali (nero), e da li' non si riparte. */
@@ -1596,7 +1658,7 @@ static void mtl_bind_texture(void* ud, u32 unit, const rsx_texture_state* tex)
                         /* RSX_TEX_SAVE_WH=<w>x<h>: solo le texture di quella misura (gli offset cambiano da corsa a corsa, s.29) */
                         const char* ew = getenv("RSX_TEX_SAVE_WH"); if (ew) sscanf(ew, "%ux%u/%x", &ts_w, &ts_h, &ts_f); }   /* "<w>x<h>[/<fmt hex>]" */
           static int tn = 0;
-          if (ts && tn < ts_max && (ts_off < 0 || (long)(tex->offset & 0x7FFFFFFFu) == ts_off) && (!ts_w || (width == ts_w && height == ts_h && (!ts_f || fmt == ts_f)))) {
+          if (ts && !hdr16 && tn < ts_max && (ts_off < 0 || (long)(tex->offset & 0x7FFFFFFFu) == ts_off) && (!ts_w || (width == ts_w && height == ts_h && (!ts_f || fmt == ts_f)))) {
               char tp[96]; snprintf(tp, sizeof tp, "/tmp/rsx_tex%d_%08X.ppm", tn++, tex->offset);
               fprintf(stderr, "[RSX metal] texture salvata: %s (fotogramma #%lu, impronta %08X%s)\n", tp, s_frame_no, fpr, stale ? ", ridecodifica" : "");
               FILE* tf = fopen(tp, "wb");
@@ -1611,7 +1673,7 @@ static void mtl_bind_texture(void* ud, u32 unit, const rsx_texture_state* tex)
               } } }
         { static int td2 = -1;
           if (td2 < 0) td2 = getenv("RSX_TEX_DBG") ? 1 : 0;
-          if (td2) {
+          if (td2 && !hdr16) {
               unsigned long nz = 0, na = 0;
               const size_t n = (size_t)width * height;
               for (size_t i = 0; i < n; i++) {
@@ -1710,9 +1772,12 @@ static id<MTLLibrary> guest_fp_library(u32 fp_addr, int vp, u32 ctrl, u32 mrt, u
          * appena qualcuno lo scriveva come temporaneo: il resolve del depth di
          * Uncharted (0x0F989E01) usa r0 per i calcoli e consegna il texel in
          * h0, e finiva a schermo il temporaneo (l'immagine "blu"). */
+        const u32 cube_mask = (mrt >> 8) ? s_fp_cube_cur : 0u;
         const int n = rsx_fp_decompile_lang(vm_base + off, MTL_FP_UCODE_MAX, ctrl ? ctrl : RSX_FP_CTRL_AUTO,
-                                            0u, 1 /* buffered: fp_constants[] */, RSX_FP_LANG_MSL,
+                                            cube_mask, 1 /* buffered: fp_constants[] */, RSX_FP_LANG_MSL,
                                             msl, sizeof(msl), NULL);
+        { static int cd = -1; if (cd < 0) cd = getenv("RSX_CUBE_DBG") ? 1 : 0;
+          if (cd && cube_mask) fprintf(stderr, "[cube] fp %08X: variante con cube_mask=%04X (%d istruzioni)\n", hash, cube_mask, n); }
         if (n > 0) {
             /* Con un VP del guest il vertex shader e' il suo (stessa
              * PSInput); altrimenti quello incorporato con la MVP. */
@@ -1874,7 +1939,7 @@ static id<MTLRenderPipelineState> pso_for(MtlDraw* d)
      * nero". */
     static int s_fb = -1;
     if (s_fb < 0) s_fb = getenv("RSX_FORCE_BUILTIN") ? 1 : 0;
-    s_fp_shadow_cur = d->tex_zfunc;
+    s_fp_shadow_cur = d->tex_zfunc; s_fp_cube_cur = d->cube_mask;
     id<MTLLibrary> glib = (d->fp_addr && !s_fb) ? guest_fp_library(d->fp_addr, vp, d->shader_ctrl, (d->n_mrt ? d->n_mrt : 1) | (d->shadow_key << 8), d->fp_hash) : nil;
     if (!glib && vp >= 0) {
         /* il VP non compila: si riprova la coppia con il VS incorporato */
