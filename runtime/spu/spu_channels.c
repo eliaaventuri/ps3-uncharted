@@ -222,6 +222,7 @@ int spu_run_with_halt(void (*entry)(spu_context*), spu_context* ctx)
      * executes at a time. No-op when unarmed. The thread-local halt env above
      * makes a token pause/resume mid-run safe. */
     yz_lockstep_register(ctx);
+    uint64_t fp_old = spu_host_fp_enter();   /* FZ + verso lo zero, come la SPU (s.36) */
     /* _setjmp: senza salvare la maschera dei segnali (sigprocmask era il
      * 5,6% del tempo delle lane: una syscall per ogni corsa del PM) */
 #ifdef _WIN32
@@ -247,6 +248,7 @@ int spu_run_with_halt(void (*entry)(spu_context*), spu_context* ctx)
               fflush(stderr); } }
         SPU_DRAIN(ctx);
     }
+    spu_host_fp_leave(fp_old);
     yz_lockstep_unregister(ctx);   /* leave the ring; hand the token onward */
     s_spu_halt_armed = 0;
     return halted;

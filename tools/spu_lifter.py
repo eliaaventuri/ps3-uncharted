@@ -140,6 +140,13 @@ static inline int spu_backedge_pending(const spu_context* ctx)
 #define SPU_BACKEDGE(ctx, tgt, fn, lbl) do { \
         if (__builtin_expect(spu_backedge_pending(ctx), 0)) { (ctx)->pc = (tgt); g_spu_trampoline_fn = fn; return; } \
         goto lbl; } while (0)
+/* --reg-cache (s.36): i registri della funzione sono variabili locali (r3,
+ * r4, ...) e vengono scritti in ctx->gpr (RC_FLUSH) prima di ogni uscita,
+ * chiamata o operazione di canale, e riletti (RC_LOAD) dopo. RC_FLUSH/RC_LOAD
+ * sono macro definite davanti a ciascuna funzione generata. */
+#define SPU_BACKEDGE_RC(ctx, tgt, fn, lbl) do { \
+        if (__builtin_expect(spu_backedge_pending(ctx), 0)) { RC_FLUSH(); (ctx)->pc = (tgt); g_spu_trampoline_fn = fn; return; } \
+        goto lbl; } while (0)
 
 /* Execution trace (only emitted when the lifter was invoked with --trace). */
 void spu_trace_init(const char* path);
@@ -225,6 +232,8 @@ class LiftedFunction:
     calls: list[int] = field(default_factory=list)
     cur_addr: int = 0     # istruzione in traduzione (--merge-blocks: archi all'indietro)
     labels: list = field(default_factory=list)   # --merge-blocks: ingressi interni registrati
+    rc_regs: list = field(default_factory=list)  # --reg-cache: registri in variabili locali
+    rc_written: list = field(default_factory=list)  # --reg-cache: quelli scritti (da flushare)
 
 
 # Mnemonics whose last operand is a branch target address (0x...).
@@ -478,6 +487,13 @@ def compute_link_returns(insns, bounds) -> set:
 
 
 class SPULifter:
+    # --reg-cache: prefissi/suffissi dei punti di sincronizzazione (vuoti se spento)
+    reg_cache = False
+    reg_cache_min = 24
+    _rcf = ""            # "RC_FLUSH(); " prima di chiamate/uscite
+    _rcl = ""            # " RC_LOAD();" dopo le chiamate
+    _rcbe = "SPU_BACKEDGE"
+
     def __init__(self, trace: bool = False, prefix: str = ""):
         self.functions: list[LiftedFunction] = []
         self.call_targets: set[int] = set()
@@ -579,7 +595,7 @@ class SPULifter:
                 # Tail call diretta (musttail: nessuna crescita dello stack);
                 # interrupt, lockstep e diagnostiche restano sui salti veri.
                 func.body_lines.append(
-                    f"    {{ ctx->pc = 0x{end:X}; "
+                    f"    {{ ctx->pc = 0x{end:X}; {self._rcf}"
                     f"SPU_TAILCALL({self.prefix}spu_func_{end:08X}(ctx)); }}")
             else:
                 func.body_lines.append(
@@ -604,8 +620,44 @@ class SPULifter:
                     "    spu_halt(ctx); return;",
                 ]
 
+        if self.reg_cache and len(body_insns) >= self.reg_cache_min:
+            self._apply_reg_cache(func)
         self.functions.append(func)
         return func
+
+    # --reg-cache (s.36). Il corpo liftato tiene ogni registro in
+    # ctx->gpr[n]: le scritture nella LS passano da puntatori a byte, quindi
+    # per il compilatore possono toccare qualunque cosa e ogni valore va
+    # riletto dalla memoria dopo ogni store (misurato sul job di geometria di
+    # Uncharted: 26% di load/store). Qui i registri usati dalla funzione
+    # diventano variabili locali (u128 rN), caricate all'ingresso e scritte in
+    # ctx->gpr (solo quelle assegnate) prima di ogni uscita, chiamata,
+    # operazione di canale o stop; dopo le chiamate e i canali si ricaricano
+    # tutte (il runtime legge e scrive i gpr: ring guard, intercetti, irq).
+    _RC_SYNC_CALLS = ("spu_stop(", "spu_stop_at(", "spu_halt(", "spu_unsupported(")
+
+    def _apply_reg_cache(self, func: LiftedFunction) -> None:
+        text = "\n".join(func.body_lines)
+        regs = sorted({int(m) for m in re.findall(r"ctx->gpr\[(\d+)\]", text)})
+        if not regs:
+            return
+        written = sorted({int(m) for m in
+                          re.findall(r"ctx->gpr\[(\d+)\]\s*=(?!=)", text)})
+        out = []
+        for ln in func.body_lines:
+            ln = re.sub(r"ctx->gpr\[(\d+)\]", r"r\1", ln)
+            if any(k in ln for k in self._RC_SYNC_CALLS):
+                # stop/halt fanno longjmp PRIMA del return: flush davanti a
+                # tutta l'istruzione (incondizionato: e' sempre corretto).
+                ln = "RC_FLUSH(); " + ln.lstrip() if not ln.endswith(":") else ln
+            if "return;" in ln and "RC_FLUSH(); return;" not in ln:
+                ln = ln.replace("return;", "{ RC_FLUSH(); return; }")
+            out.append(ln)
+        head = ["    u128 " + ", ".join(f"r{n}" for n in regs) + ";",
+                "    RC_LOAD();"]
+        func.body_lines = head + out
+        func.rc_regs = regs
+        func.rc_written = written
 
     @staticmethod
     def _branch_target(insn: SPUInstruction):
@@ -872,14 +924,20 @@ class SPULifter:
 
         # ---- channel ops ----
         if mn == "rdch":
+            if self.reg_cache:
+                return (f"{{ RC_FLUSH(); u128 _v = spu_rdch(ctx, {_chan(ops[1])}); "
+                        f"RC_LOAD(); {g(rt())} = _v; }}")
             return f"{g(rt())} = spu_rdch(ctx, {_chan(ops[1])});"
         if mn == "rchcnt":
             # CBEA: the count lands in the PREFERRED word, remaining slots ZERO
             # (splatting it is the spu_link bug class; RPCS3 = v128::from32r).
+            if self.reg_cache:
+                return (f"{{ RC_FLUSH(); uint32_t _v = spu_rchcnt(ctx, {_chan(ops[1])}); "
+                        f"RC_LOAD(); {g(rt())} = spu_pref_u32(_v); }}")
             return f"{g(rt())} = spu_pref_u32(spu_rchcnt(ctx, {_chan(ops[1])}));"
         if mn == "wrch":
             # operands: channel, $rt
-            return f"spu_wrch(ctx, {_chan(ops[0])}, {g(_reg(ops[1]))});"
+            return f"{self._rcf}spu_wrch(ctx, {_chan(ops[0])}, {g(_reg(ops[1]))});{self._rcl}"
 
         # ---- branches ----
         if mn in ("br", "bra"):
@@ -929,9 +987,9 @@ class SPULifter:
                 setpc = f"ctx->pc = 0x{tgt:X}u; " if self.merge_blocks else ""
                 return (f"{link} {{ int32_t _si = (int32_t)ctx->image_id; "
                         f"uint32_t _rl = ctx->ret_link; ctx->ret_link = 0x{addr + 4:X}u; "
-                        f"ctx->host_depth++; {setpc}{self.prefix}spu_func_{self._owner(tgt):08X}(ctx); "
+                        f"{self._rcf}ctx->host_depth++; {setpc}{self.prefix}spu_func_{self._owner(tgt):08X}(ctx); "
                         f"SPU_DRAIN(ctx); ctx->host_depth--; ctx->ret_link = _rl; "
-                        f"spu_img_restore(ctx, _si); }}")
+                        f"spu_img_restore(ctx, _si); {self._rcl}}}")
             return f"{link} /* TODO spu: brsl unresolved target */;"
         if mn in _COND_BR:
             tgt = self._branch_target(insn)
@@ -941,7 +999,7 @@ class SPULifter:
                         f'spu_unsupported(0x{insn.addr:X}, "{mn}");')
             if func.start_addr <= tgt < func.end_addr:
                 if self.merge_blocks and tgt <= insn.addr:
-                    return f"if ({cond}) SPU_BACKEDGE(ctx, 0x{tgt:X}u, {func.name}, loc_{tgt:08X});"
+                    return f"if ({cond}) {self._rcbe}(ctx, 0x{tgt:X}u, {func.name}, loc_{tgt:08X});"
                 return f"if ({cond}) goto loc_{tgt:08X};"
             self.branch_targets.add(tgt)
             # Cross-function conditional branch = conditional tail: hand the
@@ -970,7 +1028,7 @@ class SPULifter:
                 # (host_depth>0); at 0 the frame was destroyed -> dispatch to r0.
                 # SPU_RETR: il registro di collegamento e' quello del `bi`
                 # (r78 nei ritorni `brsl $r78` del policy module), non sempre r0.
-                return f"{_ied}SPU_RETR(ctx, {int(tgt_reg)});"
+                return f"{_ied}{self._rcf}SPU_RETR(ctx, {int(tgt_reg)});"
             # Computed indirect tail: set pc + trampoline to the dispatcher, unwind.
             return (f"{_ied}ctx->pc = {g(tgt_reg)}._u32[0]; "
                     f"g_spu_trampoline_fn = spu_indirect_branch; return;")
@@ -997,9 +1055,9 @@ class SPULifter:
                     f"{g(link_rt)} = spu_link(0x{addr + 4:X}); "
                     f"int32_t _si = (int32_t)ctx->image_id; "
                     f"uint32_t _rl = ctx->ret_link; ctx->ret_link = 0x{addr + 4:X}u; "
-                    f"{_ied}ctx->pc = _tg; ctx->host_depth++; "
+                    f"{_ied}ctx->pc = _tg; {self._rcf}ctx->host_depth++; "
                     f"spu_indirect_branch(ctx); SPU_DRAIN(ctx); "
-                    f"ctx->host_depth--; ctx->ret_link = _rl; spu_img_restore(ctx, _si); }}")
+                    f"ctx->host_depth--; ctx->ret_link = _rl; spu_img_restore(ctx, _si); {self._rcl}}}")
         # bisled: set link, branch to RA only if an external event is pending.
         if mn in ("bisled",):
             link_rt = insn.raw & 0x7F            # rt = link; ra (last) = target
@@ -1020,7 +1078,7 @@ class SPULifter:
             # land on an unregistered mid-function PC.
             if (tgt_reg == "0" and addr not in self.bi_r0_jump) \
                     or addr in self.link_return:
-                return f"if ({cond}) {{ {_ied}SPU_RETR(ctx, {int(tgt_reg)}); }}"
+                return f"if ({cond}) {{ {_ied}{self._rcf}SPU_RETR(ctx, {int(tgt_reg)}); }}"
             return (f"if ({cond}) {{ {_ied}ctx->pc = {g(tgt_reg)}._u32[0]; "
                     f"g_spu_trampoline_fn = spu_indirect_branch; return; }}")
 
@@ -1054,7 +1112,7 @@ class SPULifter:
             return "/* TODO spu: unresolved branch */;"
         if func.start_addr <= tgt < func.end_addr:
             if self.merge_blocks and tgt <= func.cur_addr:
-                return f"SPU_BACKEDGE(ctx, 0x{tgt:X}u, {func.name}, loc_{tgt:08X});"
+                return f"{self._rcbe}(ctx, 0x{tgt:X}u, {func.name}, loc_{tgt:08X});"
             return f"goto loc_{tgt:08X};"
         self.branch_targets.add(tgt)
         # Cross-function unconditional tail: hand the target to the trampoline
@@ -1082,11 +1140,31 @@ class SPULifter:
 
     def emit_source(self) -> str:
         lines = [SOURCE_PREAMBLE, ""]
+        if self.reg_cache:
+            # le funzioni sotto --reg-cache-min restano su ctx->gpr: per loro
+            # i punti di sincronizzazione sono vuoti
+            lines.append("#define RC_LOAD() ((void)0)")
+            lines.append("#define RC_FLUSH() ((void)0)")
+            lines.append("")
         for f in self.functions:
+            if f.rc_regs:
+                lines.append("#undef RC_LOAD")
+                lines.append("#undef RC_FLUSH")
+                lines.append("#define RC_LOAD() do { " +
+                             " ".join(f"r{n} = ctx->gpr[{n}];" for n in f.rc_regs) +
+                             " } while (0)")
+                lines.append("#define RC_FLUSH() do { " +
+                             " ".join(f"ctx->gpr[{n}] = r{n};" for n in f.rc_written) +
+                             " } while (0)")
             lines.append(f"void {f.name}(spu_context* ctx) {{")
             for b in f.body_lines:
                 lines.append(b if b.endswith(":") else f"    {b}")
             lines.append("}")
+            if f.rc_regs:
+                lines.append("#undef RC_LOAD")
+                lines.append("#undef RC_FLUSH")
+                lines.append("#define RC_LOAD() ((void)0)")
+                lines.append("#define RC_FLUSH() ((void)0)")
             lines.append("")
 
         # Stubs for cross-function branch/call targets the function-boundary
@@ -1163,6 +1241,13 @@ def main() -> None:
                    help="La caduta in avanti nella funzione liftata successiva "
                         "e' una tail call diretta (musttail) invece di un hop "
                         "del trampolino. Solo i salti veri passano dal trampolino.")
+    p.add_argument("--reg-cache", action="store_true",
+                   help="I registri di ogni funzione liftata sono variabili locali "
+                        "(u128 rN), scritte in ctx->gpr prima di uscite/chiamate/"
+                        "canali e rilette dopo (s.36). Incompatibile con --trace.")
+    p.add_argument("--reg-cache-min", type=int, default=24,
+                   help="--reg-cache solo per le funzioni con almeno N istruzioni "
+                        "(default 24: sotto, il carico/flush costa piu' del corpo).")
     p.add_argument("--trace", action="store_true",
                    help="Emit spu_trace_pc/spu_trace_rt around each instruction "
                         "for §3 diff-vs-RPCS3 validation. Output goes to stderr "
@@ -1299,6 +1384,12 @@ def main() -> None:
     lifter.func_starts = {s for s, e in bounds}  # for fall-through tail-call chaining
     lifter.fallthrough_tailcall = bool(args.fallthrough_tailcall)
     lifter.merge_blocks = bool(args.merge_blocks)
+    if args.reg_cache and not args.trace:
+        lifter.reg_cache = True
+        lifter.reg_cache_min = int(args.reg_cache_min)
+        lifter._rcf = "RC_FLUSH(); "
+        lifter._rcl = " RC_LOAD();"
+        lifter._rcbe = "SPU_BACKEDGE_RC"
     if args.merge_blocks:
         # Etichette: i semi non promossi a funzione, gli extra dentro una
         # funzione, e l'indirizzo di ritorno di ogni brsl/bisl (un `bi $r0` a

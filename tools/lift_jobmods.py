@@ -58,6 +58,10 @@ def main():
     ap.add_argument("--jobmods", default=JOBMODS, help="cartella con i moduli .bin")
     ap.add_argument("--merge-blocks", action="store_true",
                     help="passa --merge-blocks a spu_lifter.py (funzioni vere, etichette interne, s.34)")
+    ap.add_argument("--reg-cache", action="store_true",
+                    help="passa --reg-cache a spu_lifter.py (registri in variabili locali, s.36)")
+    ap.add_argument("--reg-cache-min", type=int, default=None,
+                    help="passa --reg-cache-min N a spu_lifter.py")
     ap.add_argument("--fallthrough-tailcall", action="store_true",
                     help="passa --fallthrough-tailcall a spu_lifter.py (caduta in avanti = tail call, s.34)")
     ap.add_argument("--lifted", default=OUTDIR, help="cartella di destinazione del C liftato")
@@ -120,6 +124,10 @@ def main():
             cmd += ["--fallthrough-tailcall"]
         if a.merge_blocks:
             cmd += ["--merge-blocks"]
+        if a.reg_cache:
+            cmd += ["--reg-cache"]
+            if a.reg_cache_min is not None:
+                cmd += ["--reg-cache-min", str(a.reg_cache_min)]
         r = subprocess.run(cmd, capture_output=True, text=True)
         if r.returncode != 0:
             print(f"  FAIL {name}\n{r.stderr}", file=sys.stderr)

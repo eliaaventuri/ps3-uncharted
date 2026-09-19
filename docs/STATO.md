@@ -125,6 +125,15 @@ un puntatore nullo letto dai propri dati, e la scena 3D non si vede ancora
 finestra (frecce, Spazio/X = CROSS, C = CERCHIO, Invio = START); `PAD_SCRIPT`
 per le corse senza nessuno. Dettagli in "Sessione 27".
 
+**Dalla sessione 36 il livello gira a 10,4 fps** (era 8,0-8,6): via il
+ramo delle sonde negli accessi alla LS (il compilatore scaricava tutti i
+registri a ogni accesso), FPCR delle lane come la SPU (denormali a zero,
+troncamento) con la via veloce dei float che guarda solo il risultato, e
+`cntb`/byte-shift/confronti/conversioni in NEON. Il lifter PPU emette le
+barriere di memoria (`sync/lwsync/eieio/isync` erano no-op) e
+`ShutdownWorkload`/`WaitForWorkloadShutdown` aspettano davvero il quanto
+del PM in volo. Dettagli in "Sessione 36".
+
 **Dalla sessione 35 Drake puo' morire e il gioco riparte dal checkpoint.**
 Lo stallo intermittente dopo la morte (e quando Drake parlava) era il
 workload SPURS wid 3 (animazione/ragdoll, dichiarato a UNA SPU) che il
@@ -492,6 +501,91 @@ azzera il flag. Misurato su 3 corse da 200 s (sd1-3): l'attesa scatta di
 rado (<1000 su ~2.200 Shutdown per corsa) e dura 0,08 ms in media, mai
 il tetto; fps 8,0/7,9/8,0 (f#2300-2500), 0 stalli, 1 morte (sd3) con
 ricaricamento del checkpoint.
+
+**Velocita': da 8,0-8,6 a 10,3-10,4 fps (f#2300-2500; 11-12 fps a
+f#3000-3400), stessa immagine (`docs/img_s36_dive_boat_neon_fz_rz.jpg`),
+3 corse da 200 s senza stallo ne' assert, 1 morte col checkpoint.** Tre
+cose, in ordine di resa:
+
+1. **`-DSPU_LS_NODIAG` (default in `build.sh`, +10%: 9,4 -> 10,3).** Gli
+   accessori della LS (`spu_ls_read128/write128`) testavano `g_spu_ls_diag`
+   a ogni accesso e sul ramo lento chiamavano una funzione fuori linea: per
+   il compilatore quella chiamata puo' toccare tutto, quindi OGNI registro
+   guest tenuto in un registro host andava scaricato in `ctx->gpr` prima e
+   riletto dopo -- il corpo liftato era una sequenza di load/store. Con la
+   macro il ramo sparisce. Le sonde `SPU_LS_*` (watch, LOWREAD, ...) non
+   funzionano piu' nella build di default: `SPU_DEFS=" " ./build.sh` le
+   riaccende (`obj/spu_defs.stamp` forza il rifacimento degli oggetti SPU
+   quando le define cambiano).
+2. **FPCR delle lane = FZ + arrotondamento verso lo zero** (`spu_host_fp_
+   enter/leave` in `spu_context.h`, chiamati da `spu_run_with_halt`,
+   `SPU_FP_HOST=1` per l'A/B). La SPU non ha denormali e tronca sempre: con
+   FZ e RZ le istruzioni NEON danno il risultato della SPU e la via veloce
+   di fa/fs/fm/fma/fms/fnms guarda SOLO il risultato (`|w| >= 0x7F7FFFFF`
+   -> via esatta in double): un ingresso esteso (per il ferro inf/NaN) non
+   da' mai un risultato finito, quindi si vede sempre nel risultato. Prima:
+   3 flush + 4 controlli per operazione (`spu__flush4`/`spu__noext4` erano
+   il 10% del tempo delle lane nel profilo a -fno-inline; `spu__f2d` un
+   altro 5%: la via lenta scatta spesso perche' la tavolozza di skinning e'
+   piena di sentinelle 0x7FFF0000, s.33). Verificato con un differenziale
+   da 200.000 prove contro la via esatta (ingressi estesi, denormali, zeri,
+   massimo normale): 0 discrepanze. `spu_fm/fa/fs_slow` ora fuori linea
+   (la via lenta era copiata in ogni sito: 139 istruzioni per un fm).
+3. **Helper in NEON** (`runtime/spu/spu_helpers_neon.h`, tabelle in
+   `spu_neon_tables.h` generate da `tools/gen_spu_neon_tables.py`; le
+   versioni scalari restano sotto `#ifndef SPU_NEON_*` per gli altri host):
+   `cntb` (era un ciclo bit a bit su 16 byte: `vcntq_u8`), `rotqby/shlqby/
+   rotqmby` e varianti `bi`/immediate (cicli di byte con SPU_W: ora un
+   `vqtbl1q_u8` con una riga di tabella per scorrimento, 0xFF = zero),
+   `cbd/chd/cwd/cdd_pos` (tabella di 16 controlli), `fcgt/fcmgt` (via double
+   per corsia: ora confronto intero segno-modulo, esatto anche per gli
+   estesi -- RPCS3 li "abbassa" al massimo normale e per ext vs 0x7F7FFFFF
+   risponde al contrario del ferro), `cflts/cfltu/csflt/cuflt`
+   (`vcvtq_s32_f32` tronca e satura come la SPU; estesi saturati per segno).
+   Differenziale NEON/scalare: 0 discrepanze su 200.000 prove.
+
+**Come si e' misurato:** i due moduli caldi (215 geometria, 218 tavolozza)
+compilati con `-fno-inline` e `sample` per 10 s nel livello (fps 5,5 cosi',
+ma le proporzioni si vedono): helper 3.683 campioni, corpi liftati 2.837,
+accessi LS 664; in testa `spu_shufb` 590, `spu__noext4` 414, `spu__f2d`
+373, `spu__flush4` 307, `spu_rotqby` 224, `spu_rotqbyi` 212, `spu_cntb`
+152, `spu_a` 141, `spu_selb` 135, `spu_shlhi` 103, `spu_fcgt` 82. Il
+`vm_read32` a 726 e' il PPU che aspetta la job list (`func_0074232C`), non
+lavoro. Costo statico per istruzione SPU sul ferro (istruzioni host,
+`clang -O2`): a 15, ai 11, selb 5, shufb 21, rotqby 102, rotqbyi 4,
+shlqbyi 25, fm 139 (con la via lenta in linea), fma 61, lqd 30, stqd 39.
+
+**Fallito: cache dei registri nel lifter SPU (`--reg-cache`, tenuto come
+opzione, spento).** I registri di ogni funzione liftata come variabili
+locali `u128 rN`, scritte in `ctx->gpr` (RC_FLUSH) prima di uscite,
+chiamate, canali e stop, rilette (RC_LOAD) dopo; solo per le funzioni con
+>= 24 istruzioni (`--reg-cache-min`). Corretto (stessa corsa, 0 assert) ma
+**6,9 fps contro 8,0**: la funzione 0x4090 del job 218 passa da 13,6k a
+23,4k istruzioni host, load 2.499 -> 8.654, store 1.069 -> 3.294. Cause:
+100+ variabili vive (spill), e a ogni punto di sincronizzazione (121 nella
+sola 0x4090) si scaricano/ricaricano TUTTI i registri usati. Per farla
+rendere servono le analisi di flusso (registri sporchi dal'ultimo sync in
+avanti, registri vivi dopo il sync all'indietro): non fatto. Build a
+-O2 con la cache: 19 minuti (13 clang paralleli) contro ~2. I sorgenti
+liftati senza l'opzione sono identici a prima (verificato con diff).
+Lift con la cache conservato in `uncharted-data/spu_jobs/lifted_rc_s36`.
+
+**Strumenti nuovi:** `tools/winid.swift` (`swiftc -O tools/winid.swift -o /tmp/winid`; `/tmp/winid
+uncharted` da' l'id della finestra per `screencapture -x -l <id>`; la
+finestra NON e' "on screen" per CGWindowList, serve `.optionAll`).
+
+### Fronte aperto (dopo la sessione 36)
+
+1. Velocita' (10,4 fps): `spu_shufb` e' l'helper piu' caldo (3 vrev32 +
+   tbl2 + 3 confronti = 21 istruzioni); la rappresentazione u128 "parole
+   in ordine SPU, byte in ordine host" costa un rev32 a ogni lqd/stqd e a
+   ogni op sui byte -- passare ai byte in ordine SPU (rev32 solo nei
+   canali/DMA e negli helper per parola) e' la mossa grossa. Poi i 41-46
+   ms di PPU da solo per fotogramma e la cache dei registri con le analisi
+   di flusso.
+2. Giocare oltre il checkpoint (Elia con la tastiera, o `PAD_SCRIPT`).
+3. `RING_GUARD_LANES` 5 (la sesta lane del wid 12 senza guardia), death4
+   (mai piu' visto in 9 corse dopo lo shutdown vero: da confermare).
 
 ## Sessione 35 — lo stallo alla morte di Drake era il wid 3 (lista a UNA SPU) girato su 6 lane
 

@@ -6,6 +6,7 @@
 #include <stdio.h>
 #include <string.h>
 #include <math.h>
+#include <atomic>
 
 /* Float->int conversion per Book I 4.6.7: SATURATE out-of-range (positive
  * overflow => max, negative => min, NaN => min) and honor the rounding mode

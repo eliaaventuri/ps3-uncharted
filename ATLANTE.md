@@ -30,6 +30,9 @@ runtime/spu/spurs_job.c      esecuzione di un job WwsJob liftato
 runtime/spu/spu_drain.c      dispatch dei salti indiretti, irq (snapshot registri nel contesto), ritorno
 runtime/spu/spu_interp.c     interprete SPU di riserva (blocchi non liftati)
 runtime/spu/spu_lockstep.c   esecuzione lockstep per i poll GETLLAR/PUTLLC
+runtime/spu/spu_helpers.h    helper delle istruzioni SPU (scalari; float CBEA con via veloce NEON)
+runtime/spu/spu_helpers_neon.h  versioni NEON di cntb, byte-shift, cbd/cwd, fcgt, cflts (s.36)
+runtime/spu/spu_neon_tables.h   tabelle di indici per vqtbl1q (GENERATO da tools/gen_spu_neon_tables.py)
 runtime/syscalls/            lv2: sys_event, sys_cond, sys_mutex, sys_ppu_thread, sys_fs, ...
 runtime/memory/vm.h          layout memoria guest
 runtime/platform/            win32_compat.h, darwin_compat.h: shim POSIX/Win32
@@ -56,6 +59,8 @@ tools/extract_spu_images.py  estrae le immagini SPU dall'ELF
 tools/gen_hle_nids.py        genera la tabella NID per il port (--all)
 tools/check_ppu_scaffold.py  ratchet del boot
 tools/spu_disasm.py, ppu_disasm.py  disassemblatori
+tools/gen_spu_neon_tables.py  genera runtime/spu/spu_neon_tables.h
+tools/winid.swift            id della finestra del port per screencapture -l (CGWindowList .optionAll)
 tools/lldb_guest_bp.py       breakpoint lldb sui func_XXXX del port vivo (r3-r5, f1, catena)
 tools/stallcatch.sh          corsa Uncharted che campiona il processo se il caricamento si ferma
 tests/                       torture e conformance del runtime

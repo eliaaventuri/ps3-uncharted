@@ -427,6 +427,47 @@ static inline void spu_ls_write32(spu_context* ctx, uint32_t lsa, uint32_t val)
  * does explicitly. Doing the swap here (rather than in every channel
  * extractor) keeps the per-word `_u32[i]` semantics that the lifter
  * helpers in `spu_helpers.h` were written against. */
+/* Modo in virgola mobile dell'host per il codice SPU liftato (sessione 36).
+ * La SPU non ha denormali (valgono zero) e arrotonda SOLO verso lo zero;
+ * l'host di default tiene i denormali e arrotonda al piu' vicino. Con FZ e
+ * RMode=RZ nell'FPCR (ARM64: FZ bit 24, RMode bit 23:22 = 11; x86: FTZ|DAZ e
+ * RC = 11 nell'MXCSR) le istruzioni del ferro danno il risultato della SPU
+ * senza controlli sugli ingressi (vedi SPU__FLOAT3_NEON in spu_helpers.h) e
+ * i risultati coincidono col troncamento del ferro vero. Si imposta
+ * all'ingresso di ogni corsa (spu_run_with_halt) e si ripristina all'uscita:
+ * i thread PPU non devono vederlo. SPU_FP_HOST=1 lascia il modo dell'host
+ * (A/B; con il modo dell'host i denormali in ingresso non vengono azzerati). */
+#if defined(__x86_64__) || defined(_M_X64) || defined(__i386__) || defined(_M_IX86)
+#include <xmmintrin.h>
+#endif
+static inline uint64_t spu_host_fp_enter(void)
+{
+    static int s_off = -1;
+    if (s_off < 0) s_off = getenv("SPU_FP_HOST") ? 1 : 0;
+    if (s_off) return ~0ull;
+#if defined(__aarch64__)
+    uint64_t old; __asm__ volatile("mrs %0, fpcr" : "=r"(old));
+    uint64_t nv = old | (1ull << 24) | (3ull << 22);
+    if (nv != old) __asm__ volatile("msr fpcr, %0" :: "r"(nv));
+    return old;
+#elif defined(__x86_64__) || defined(_M_X64) || defined(__i386__) || defined(_M_IX86)
+    unsigned old = _mm_getcsr();
+    _mm_setcsr(old | 0x8040u | 0x6000u);
+    return old;
+#else
+    return ~0ull;
+#endif
+}
+static inline void spu_host_fp_leave(uint64_t old)
+{
+    if (old == ~0ull) return;
+#if defined(__aarch64__)
+    __asm__ volatile("msr fpcr, %0" :: "r"(old));
+#elif defined(__x86_64__) || defined(_M_X64) || defined(__i386__) || defined(_M_IX86)
+    _mm_setcsr((unsigned)old);
+#endif
+}
+
 /* The 128-bit LS accessors are THE hot primitive of lifted SPU execution
  * (every load/store in a Bink movie frame's ~millions of lifted instructions
  * runs through here). On x86 the whole BE<->LE quadword swizzle is one
@@ -451,12 +492,20 @@ extern int g_spu_ls_diag;   /* spu_channels.c: -1 da decidere, 0 veloce, 1 con l
 int spu_ls_diag_init(void);  /* spu_channels.c: legge le variabili d'ambiente */
 static inline u128 spu_ls_read128_diag(const spu_context* ctx, uint32_t lsa);
 static inline void spu_ls_write128_diag(spu_context* ctx, uint32_t lsa, u128 val);
+/* SPU_LS_NODIAG (s.36): compila via il ramo delle sonde. Il solo controllo
+ * `g_spu_ls_diag` costa: la chiamata (non in linea) sul ramo lento fa
+ * scaricare al compilatore OGNI registro guest tenuto nei registri host
+ * prima di ogni accesso alla LS e rileggerlo dopo -- il codice liftato
+ * diventa una sequenza di load/store. Con la macro le variabili SPU_LS_*
+ * (watch, LOWREAD, ...) non funzionano: si ricompila senza. */
 static inline u128 spu_ls_read128(const spu_context* ctx, uint32_t lsa)
 {
+#ifndef SPU_LS_NODIAG
     if (__builtin_expect(g_spu_ls_diag != 0, 0)) {
         if (g_spu_ls_diag < 0) g_spu_ls_diag = spu_ls_diag_init();
         if (g_spu_ls_diag) return spu_ls_read128_diag(ctx, lsa);
     }
+#endif
     const uint8_t* p = &ctx->ls[lsa & (SPU_LS_MASK & ~0xFu)];
     u128 v;
 #if defined(__aarch64__) && defined(__ARM_NEON)
@@ -470,10 +519,12 @@ static inline u128 spu_ls_read128(const spu_context* ctx, uint32_t lsa)
 }
 static inline void spu_ls_write128(spu_context* ctx, uint32_t lsa, u128 val)
 {
+#ifndef SPU_LS_NODIAG
     if (__builtin_expect(g_spu_ls_diag != 0, 0)) {
         if (g_spu_ls_diag < 0) g_spu_ls_diag = spu_ls_diag_init();
         if (g_spu_ls_diag) { spu_ls_write128_diag(ctx, lsa, val); return; }
     }
+#endif
     uint8_t* p = &ctx->ls[lsa & (SPU_LS_MASK & ~0xFu)];
 #if defined(__aarch64__) && defined(__ARM_NEON)
     vst1q_u8(p, vrev32q_u8(vld1q_u8(val._u8)));
