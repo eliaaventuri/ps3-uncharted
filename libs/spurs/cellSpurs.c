@@ -411,6 +411,8 @@ static struct SpursInst* spurs_inst_find(u32 ea)
 
 struct SpursKernArg { struct SpursInst* si; u32 mask; };   /* istanza + workload serviti da questo thread */
 static DWORD WINAPI spurs_kernel_thread(LPVOID p);
+static DWORD WINAPI spurs_lane_sched_thread(LPVOID p);   /* lane indipendenti (s.38) */
+static int spurs_lane_sched_on(void);
 
 
 static s32 spurs_initialize_common(u32 spurs_ea, u32 nspus, const char* prefix)
@@ -450,6 +452,16 @@ static s32 spurs_initialize_common(u32 spurs_ea, u32 nspus, const char* prefix)
          * dispatch (wid 12: 4.400 corse al secondo da 100 us). */
         static struct SpursKernArg s_ka[MAX_SPURS_INST][6];
         int slot = (int)(si - s_inst); if (slot < 0 || slot >= MAX_SPURS_INST) slot = 0;
+        if (spurs_lane_sched_on()) {
+            /* lane indipendenti (s.38): un solo pool per tutte le istanze, le
+             * lane scorrono i workload di ognuna (s_workloads[].spurs_ea) */
+            static int s_started = 0;
+            if (!s_started) { s_started = 1;
+                long n = 6; { const char* e = getenv("SPURS_LANES"); if (e && atol(e) > 0) n = atol(e); }
+                if (n > 16) n = 16;
+                for (long k = 0; k < n; k++)
+                    CreateThread(NULL, 1u << 20, spurs_lane_sched_thread, (LPVOID)(uintptr_t)k, 0, NULL); }
+        } else {
         u32 all = 0, masks[5]; int nm = 0;
         { const char* e = getenv("SPURS_KERN2_WIDS");
           while (e && *e && nm < 5) { char* q = 0; u32 m = (u32)strtoul(e, &q, 16); if (q == e) break;
@@ -458,6 +470,7 @@ static s32 spurs_initialize_common(u32 spurs_ea, u32 nspus, const char* prefix)
         CreateThread(NULL, 1u << 20, spurs_kernel_thread, &s_ka[slot][0], 0, NULL);
         for (int k = 0; k < nm; k++) { s_ka[slot][1 + k].si = si; s_ka[slot][1 + k].mask = masks[k];
                                        CreateThread(NULL, 1u << 20, spurs_kernel_thread, &s_ka[slot][1 + k], 0, NULL); }
+        }
     }
 
     printf("[cellSpurs] Initialize \"%s\" ea=0x%08X nSpus=%u (real BE instance + kernel poll)\n",
@@ -1593,6 +1606,151 @@ static void spurs_lane_stat_flush(void)
     memset(s_ls, 0, sizeof s_ls); s_ls_t0 = now;
 }
 
+extern PPU_THREAD_LOCAL volatile unsigned g_spurs_pm_polls, g_spurs_pm_exited;   /* spurs_policy.c, per thread */
+
+/* Contention di un workload come la vede il dispatch: quella dichiarata dal
+ * titolo (1..6), alzata da SPURS_FORCE_SPUS solo per i multi-SPU (s.35). */
+static u8 spurs_wkl_maxcont(u32 ea, u32 wid)
+{
+    u8 maxcont = *(vm_base + ea + SPURS_WKL_MAXCONT + wid);
+    if (maxcont < 1) maxcont = 1;
+    if (maxcont > 6) maxcont = 6;
+    static int s_fs = -2, s_fs_all = -1;
+    if (s_fs == -2) { const char* e = getenv("SPURS_FORCE_SPUS"); s_fs = e ? atoi(e) : -1; }
+    if (s_fs_all < 0) { const char* e = getenv("SPURS_FORCE_SPUS_ALL"); s_fs_all = (e && *e && *e != '0') ? 1 : 0; }
+    if (s_fs > 0 && (maxcont > 1 || s_fs_all)) maxcont = (u8)(s_fs > 6 ? 6 : s_fs);
+    return maxcont;
+}
+
+/* Lane indipendenti (SPURS_LANE_SCHED=1, sessione 38). Sul ferro ogni SPU
+ * esegue il proprio ciclo del kernel: sceglie un workload pronto con
+ * contention libera, ne esegue un quanto del PM, sceglie di nuovo -- nessuna
+ * sincronizzazione fra le SPU. Il thread kernel qui sotto invece fa
+ * fork-join: per OGNI quanto sveglia le 5 lane del pool, aspetta la piu'
+ * lenta, e finche' un workload e' in corsa nessun altro gira. Misurato nel
+ * livello (SPURS_LANE_STAT, 2 s): 10.900 quanti del wid 12 con le lane
+ * occupate al 69% del quanto, e il thread kernel al 90% con il wid 12 al
+ * 47% -- l'altro 43% erano quanti di altri workload (spesso a UNA lane, con
+ * le altre 5 ferme). Qui SPURS_LANES thread (default 6) girano da soli:
+ * ognuno scorre i workload a rotazione dal successivo all'ultimo eseguito,
+ * prende il primo con lane libere (in corsa < maxContention), si assegna il
+ * primo spuNum libero con una maschera atomica ed esegue un quanto con quel
+ * numero. maxContention e' quella di prima: le liste a UNA SPU (wid 3 ecc.)
+ * restano su una lane sola. Un workload che all'ultimo quanto non ha trovato
+ * lavoro (polls==0) viene ritentato dopo 50 us << (streak-1), tetto 800 us;
+ * un kick (readyCount/signal) azzera l'attesa. Una lane che non trova nulla
+ * dorme SPURS_LANE_IDLE_US (default 100). */
+static struct { unsigned spumask, next_sn; unsigned idle; unsigned long long last_empty_ns; } s_lsch[CELL_SPURS_MAX_WORKLOAD];
+static int spurs_lane_sched_on(void)
+{
+    static int on = -1;
+    if (on < 0) { const char* e = getenv("SPURS_LANE_SCHED"); on = (e && *e && *e != '0') ? 1 : 0; }
+    return on;
+}
+static DWORD WINAPI spurs_lane_sched_thread(LPVOID p)
+{
+    { ULONG g = 256 * 1024; SetThreadStackGuarantee(&g); }
+    const unsigned lane = (unsigned)(uintptr_t)p;
+    static long s_idle_us = -1;
+    if (s_idle_us < 0) { const char* e = getenv("SPURS_LANE_IDLE_US"); s_idle_us = e ? atol(e) : 100; }
+    static int s_lstat = -1; if (s_lstat < 0) s_lstat = getenv("SPURS_LANE_STAT") ? 1 : 0;
+    static int s_pm_off = -1; if (s_pm_off < 0) s_pm_off = getenv("PS3_NO_SPURS_PM") ? 1 : 0;
+    static long s_skip = -1; if (s_skip < 0) { const char* e = getenv("SPURS_SKIP_WID"); s_skip = e ? strtol(e, 0, 16) : 0; }
+    static int s_dt = -1; static long s_dt_wid = -1;
+    if (s_dt < 0) { s_dt = getenv("SPURS_DISPATCH_TRACE") ? 1 : 0;
+                    const char* w = getenv("SPURS_DISPATCH_TRACE_WID"); s_dt_wid = w ? atol(w) : -1; }
+    fprintf(stderr, "[spurs-lane] lane %u viva\n", lane); fflush(stderr);
+    unsigned rr = lane;
+    for (;;) {
+        int ran = 0;
+        for (unsigned k = 0; k < CELL_SPURS_MAX_WORKLOAD && !ran; k++) {
+            u32 wid = (rr + k) % CELL_SPURS_MAX_WORKLOAD;
+            SpursWorkload* w = &s_workloads[wid];
+            if (s_pm_off || !w->in_use) continue;
+            u32 ea = w->spurs_ea;
+            if (!ea) continue;
+            if (!(vm_read32(ea + SPURS_WKL_ENABLED) & (0x80000000u >> wid))) continue;
+            if (*(vm_base + ea + SPURS_WKL_STATE1 + wid) != 2) continue;
+            if (__atomic_load_n(&w->shutdown, __ATOMIC_SEQ_CST)) continue;
+            if (s_skip & (1L << wid)) continue;
+            volatile u8* rdy = vm_base + ea + SPURS_WKL_READY1 + wid;
+            u32 sig = vm_read32(ea + SPURS_WKL_SIGNAL1) >> 16;    /* be u16 @0x70 */
+            int kicked = (*rdy != 0) || ((sig & (0x8000u >> wid)) != 0);
+            unsigned idle = __atomic_load_n(&s_lsch[wid].idle, __ATOMIC_RELAXED);
+            if (!kicked && idle) {
+                unsigned long long wait = 50000ull << (idle - 1);
+                if (spurs_ns_now() - __atomic_load_n(&s_lsch[wid].last_empty_ns, __ATOMIC_RELAXED) < wait) continue;
+            }
+            u8 maxcont = spurs_wkl_maxcont(ea, wid);
+            /* spuNum: il primo bit libero sotto maxcont A ROTAZIONE (dal
+             * successivo all'ultimo assegnato), preso con CAS. Prendere sempre
+             * il piu' basso lasciava i quanti brevi (5 us) tutti allo spuNum 0:
+             * il job manager tiene una riga di ticket per SPU e la lista non
+             * finisce finche' ogni SPU non l'ha percorsa -- il wid 6 kickato
+             * con readyCount=8 al caricamento non chiudeva mai (prima prova). */
+            unsigned m = __atomic_load_n(&s_lsch[wid].spumask, __ATOMIC_RELAXED), sn = maxcont;
+            unsigned start = __atomic_load_n(&s_lsch[wid].next_sn, __ATOMIC_RELAXED) % maxcont;
+            for (;;) {
+                unsigned i = 0;
+                for (; i < maxcont; i++) { sn = (start + i) % maxcont; if (!(m & (1u << sn))) break; }
+                if (i >= maxcont) { sn = maxcont; break; }
+                if (__atomic_compare_exchange_n(&s_lsch[wid].spumask, &m, m | (1u << sn), 0,
+                                                __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST)) break;
+            }
+            if (sn >= maxcont) continue;
+            __atomic_store_n(&s_lsch[wid].next_sn, sn + 1, __ATOMIC_RELAXED);
+            __atomic_fetch_add(&s_wkl_running[wid], 1, __ATOMIC_SEQ_CST);
+            WklPm* r = __atomic_load_n(&w->shutdown, __ATOMIC_SEQ_CST) ? NULL : spurs_resolve_pm(wid);
+            if (r) {
+                if (kicked) __atomic_store_n(&s_lsch[wid].idle, 0, __ATOMIC_RELAXED);
+                if (*rdy) (*rdy)--;
+                if (sig & (0x8000u >> wid))
+                    vm_write32(ea + SPURS_WKL_SIGNAL1,
+                               (vm_read32(ea + SPURS_WKL_SIGNAL1) & ~((0x8000u >> wid) << 16)));
+                { u8 c = 0; for (unsigned b = m | (1u << sn); b; b &= b - 1) c++;
+                  *(vm_base + ea + SPURS_WKL_CURCONT + wid) = c; }
+                u64 arg = vm_read64(ea + SPURS_WKL_INFO1 + wid * SPURS_WKL_INFO_SZ + 8);
+                const uint8_t* pm = (const uint8_t*)vm_base + (uint32_t)(uintptr_t)w->pm;
+                unsigned long long t0 = spurs_ns_now();
+                spu_run_policy_module(r->fn, r->image_id, pm, w->sizePm, arg, wid, ea, sn);
+                unsigned long long ns = spurs_ns_now() - t0;
+                if (g_spurs_pm_polls == 0) {
+                    __atomic_store_n(&s_lsch[wid].last_empty_ns, t0 + ns, __ATOMIC_RELAXED);
+                    if (idle < 5) __atomic_store_n(&s_lsch[wid].idle, idle + 1, __ATOMIC_RELAXED);
+                } else __atomic_store_n(&s_lsch[wid].idle, 0, __ATOMIC_RELAXED);
+                if (s_dt && (kicked || g_spurs_pm_polls) && (s_dt_wid < 0 || (long)wid == s_dt_wid))
+                    fprintf(stderr, "[spurs-disp] lane=%u spu=%u wid=%u kicked=%d arg=0x%016llX polls=%u exited=%u %.0f us\n",
+                            lane, sn, wid, kicked, (unsigned long long)arg, g_spurs_pm_polls, g_spurs_pm_exited, ns / 1e3);
+                if (s_lstat && wid < 16) {
+                    __atomic_fetch_add(&s_ls[wid].runs, 1, __ATOMIC_RELAXED);
+                    __atomic_fetch_add(&s_ls[wid].lanes, 1, __ATOMIC_RELAXED);
+                    __atomic_fetch_add(&s_ls[wid].wall_ns, ns, __ATOMIC_RELAXED);
+                    __atomic_fetch_add(&s_ls[wid].lane_ns, ns, __ATOMIC_RELAXED);
+                    if (ns > s_ls[wid].max_lane_ns) s_ls[wid].max_lane_ns = ns;
+                    if (lane == 0) spurs_lane_stat_flush();
+                }
+                ran = 1; rr = wid + 1;
+            }
+            __atomic_fetch_sub(&s_wkl_running[wid], 1, __ATOMIC_SEQ_CST);
+            /* contention = lane ancora in corsa su questo workload: il titolo la
+             * legge con cellSpursGetWorkloadInfo e aspetta che torni a 0 (il
+             * main thread al caricamento girava su GetWorkloadInfo(wid=6) per
+             * sempre quando restava a 1 -- seconda prova) */
+            { unsigned nm = __atomic_and_fetch(&s_lsch[wid].spumask, ~(1u << sn), __ATOMIC_SEQ_CST);
+              u8 c = 0; for (; nm; nm &= nm - 1) c++;
+              *(vm_base + ea + SPURS_WKL_CURCONT + wid) = c; }
+        }
+        if (!ran) {
+#ifdef _WIN32
+            Sleep(s_idle_us >= 1000 ? (DWORD)(s_idle_us / 1000) : 1);
+#else
+            struct timespec ts = { 0, s_idle_us * 1000L }; nanosleep(&ts, NULL);
+#endif
+        }
+    }
+    return 0;
+}
+
 static DWORD WINAPI spurs_kernel_thread(LPVOID p)
 {
     { ULONG g = 256 * 1024; SetThreadStackGuarantee(&g); }  /* let SO reach the reporter */
@@ -1780,7 +1938,6 @@ static DWORD WINAPI spurs_kernel_thread(LPVOID p)
                 if (s_imax < 0) { const char* e = getenv("SPURS_IDLE_MAX"); s_imax = e ? atoi(e) : 4; }
                 u32 cad = 1u << (s_idle[wid] > (u8)s_imax ? (u32)s_imax : s_idle[wid]);
                 if (!kicked && (s_pass_no & (cad - 1)) != 0) continue;
-                extern volatile unsigned g_spurs_pm_polls, g_spurs_pm_exited;
                 u32 polls_before = g_spurs_pm_polls;   /* heuristic only */
                 (void)polls_before;
 

@@ -125,6 +125,13 @@ un puntatore nullo letto dai propri dati, e la scena 3D non si vede ancora
 finestra (frecce, Spazio/X = CROSS, C = CERCHIO, Invio = START); `PAD_SCRIPT`
 per le corse senza nessuno. Dettagli in "Sessione 27".
 
+**Dalla sessione 38 il livello gira a 24-26,6 fps** (era 12,6 sulla stessa
+corsa di riferimento): il nostro kernel SPURS faceva fork-join per ogni
+quanto (sveglia 5 lane, aspetta la piu' lenta, un workload alla volta); ora
+ogni lane sceglie da sola il workload, come le SPU vere
+(`SPURS_LANE_SCHED=1` in `run.sh`). Il collo e' passato al walker RSX (copia
+dei vertici per draw e memmove del present). Dettagli in "Sessione 38".
+
 **Dalla sessione 37 il livello gira a 13-14,5 fps** (era 10,7-11,9 sulla
 stessa finestra di orologio): `cellGcmSetWaitFlip` bloccava il PPU fino al
 flip (64 ms di tetto), ma sul ferro e' un'attesa per la RSX dentro la FIFO e
@@ -479,6 +486,78 @@ La lista dei comandi ora viene percorsa fino in fondo — sei coppie
 risultati in memoria principale.** Non era mai successo in nessuna sessione.
 Riproducibile: **tre corse su tre**, identiche -- 14 comandi, un overlay
 residente, zero microstep, cinque stall e due interrupt per corsa.
+
+## Sessione 38 — lane SPU indipendenti: il kernel SPURS non fa piu' fork-join; 12,6 -> 24-26,6 fps
+
+**Il collo era il modo in cui il nostro kernel SPURS distribuiva i quanti.**
+Con `SPURS_LANE_STAT=1` nel livello (finestra da 2 s a 150 s, binario s.37,
+12,6 fps mediani): 10.927 quanti del wid 12 (geometria), ognuno = sveglia
+delle 5 lane del pool + join sulla piu' lenta, con le lane occupate al 69%
+del quanto; il thread kernel al 90% del tempo dentro quanti, di cui il wid
+12 solo il 47% -- l'altro 43% erano quanti degli altri workload, durante i
+quali il wid 12 NON girava (e i workload a UNA SPU, wid 2/4/9/10, tenevano
+ferme le altre 5 lane). Somma delle lane: 6,4 s ogni 2 s = 53% di 6 lane.
+Sul ferro non c'e' niente di tutto questo: ogni SPU esegue il proprio ciclo
+del kernel, sceglie un workload pronto con contention libera, ne esegue un
+quanto, sceglie di nuovo.
+
+**Fatto: `SPURS_LANE_SCHED=1` (`libs/spurs/cellSpurs.c`,
+`spurs_lane_sched_thread`; default in `run.sh`).** N thread lane
+(`SPURS_LANES`, default 6) girano da soli: ognuno scorre i workload a
+rotazione (dal successivo all'ultimo eseguito, cosi' l'audio wid 7 e le
+liste sincrone non aspettano la geometria), prende il primo abilitato con
+lane libere (in corsa < maxContention, la stessa di prima: FORCE_SPUS solo
+per i multi-SPU, le liste a una SPU restano su una lane), si assegna uno
+spuNum con una maschera atomica ed esegue un quanto del PM. Un workload che
+all'ultimo quanto non ha trovato lavoro (`polls==0`) viene ritentato dopo
+50 us << streak (tetto 800 us); un kick lo azzera; lane senza nulla da fare:
+`SPURS_LANE_IDLE_US` (100). `g_spurs_pm_polls/exited` ora per thread
+(`SPU_THREAD_LOCAL`): con piu' corse in volo erano un globale condiviso.
+`s_wkl_running[wid]` e' un contatore (shutdown wait invariato). Il vecchio
+thread kernel resta il default nel codice (Windows e altri titoli):
+`SPURS_LANE_SCHED=0` per l'A/B. `SPURS_KERN2_WIDS` non conta piu'.
+
+**Due prove fallite prima di quella buona, tutte e due al caricamento (il
+main thread girava per sempre e il livello non partiva):**
+1. spuNum = il bit libero piu' basso: con quanti da 5 us tutti finivano su
+   spuNum 0. Il job manager tiene una riga di ticket per SPU e la lista non
+   "finisce" finche' ogni SPU non l'ha percorsa: il wid 6 kickato con
+   readyCount=8 non chiudeva mai. Ora lo spuNum RUOTA (`next_sn`).
+2. Il byte di contention dell'istanza (`SPURS_WKL_CURCONT`) veniva scritto
+   all'inizio del quanto e mai azzerato: il titolo lo legge con
+   `cellSpursGetWorkloadInfo(wid=6)` e aspetta che torni a 0 (`sample`: main
+   thread in `func_001AD590` -> GetWorkloadInfo in ciclo). Ora vale il numero
+   di lane in corsa e torna a 0 all'uscita.
+
+**Misure (mediana 100-190 s, `fpsmed.sh`): 26,6 / 24,1 / 23,8 fps con 6
+lane (3 corse), 25,5 con `SPURS_LANES=8`, contro 12,6 del binario s.37 nella
+stessa corsa di riferimento.** 6.100 fotogrammi in 200 s contro 4.250. Il
+livello si carica in 6 s invece di 15. Nessuno stallo in 5 corse (200/200/
+150/135/113 s); un `[park-watchdog]` da 7,5 s durante il caricamento del
+livello (fotogrammi che continuano, io=0A400000, poi il livello parte), da
+capire se e' solo il caricamento. Immagine identica alla s.37
+(`docs/img_s38_dive_boat_lane_sched.jpg`). Lane-stat a 150 s: wid 12
+114.000 quanti in 2 s (un job per quanto, ~50 us), lane occupate all'82%.
+
+**Dove va il tempo ORA (`sample` a 100 s, `GCM_TIMELINE`):** put -> walk
+~40-54 ms, walk -> put 0,3 ms: il PPU aspetta il walker. Il ticker e' al
+70%: 56% dentro `gcm_rsx_process_fifo` (di cui `draw_clause_flush` 47% del
+thread: `record_draw` + `fetch_vp_vertex`/`rsx_fetch_attrib` = i vertici
+copiati sulla CPU a ogni draw), 15% in `rsx_metal_backend_present`
+(`newBufferWithBytes` = memmove), 29% a dormire (2,7 park per fotogramma,
+erano 12). Le 8 lane non aiutano (25,5 fps): il prossimo collo e' il walker
+stesso, cioe' il costo per draw del backend Metal, non piu' le SPU.
+
+### Fronte aperto (dopo la sessione 38)
+
+1. Il walker: `draw_clause_flush` -> `record_draw`/`fetch_vp_vertex` (~18 ms
+   per fotogramma a 2.000 draw = 9 us/draw) e il memmove del present (~6 ms).
+   Guardare cosa copia `newBufferWithBytes` a ogni fotogramma e se i vertici
+   in modalita' immediata/array possono andare in un buffer condiviso senza
+   la copia per draw.
+2. Il park-watchdog da 7,5 s al caricamento del livello con le lane nuove.
+3. Perche' chiudere il flip costa ~1 fps (s.37, punto 2); giocare oltre il
+   checkpoint; `RING_GUARD_LANES` 5.
 
 ## Sessione 37 — cellGcmSetWaitFlip non blocca piu' il PPU: 10,7-11,9 -> 13-14,5 fps; via in linea degli accessi PPU (neutra)
 

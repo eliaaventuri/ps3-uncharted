@@ -33,8 +33,10 @@ extern int spu_run_with_halt(void (*)(spu_context*), spu_context*);
 
 /* Counters the intercepts in spu_channels.c maintain for the CURRENT run
  * (single writer per run; reads are diagnostic). */
-volatile unsigned g_spurs_pm_polls = 0;   /* selectWorkload calls this run */
-volatile unsigned g_spurs_pm_exited = 0;  /* set when exitToKernel was taken */
+/* Per thread (sessione 38): con le lane indipendenti piu' corse del PM sono
+ * in volo insieme su thread diversi, e ognuna deve leggere i propri contatori. */
+SPU_THREAD_LOCAL volatile unsigned g_spurs_pm_polls = 0;   /* selectWorkload calls this run */
+SPU_THREAD_LOCAL volatile unsigned g_spurs_pm_exited = 0;  /* set when exitToKernel was taken */
 volatile unsigned g_wws_batch_gets = 0;   /* loadCommands (LS 0xC00) fetch count, spu_dma.h */
 
 /* Watchdog delle corse del PM (SPURS_PM_WATCHDOG=<s>), vedi il punto d'uso. */
