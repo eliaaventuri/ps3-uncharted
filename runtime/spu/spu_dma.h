@@ -1126,7 +1126,18 @@ static inline int mfc_submit(mfc_engine* mfc, spu_context* spu, uint32_t cmd)
        * per sempre (sessione 28: livello fermo dopo 2-3 halt). */
       if (!s_limit) { const char* e = getenv("SPU_DMA_REPEAT_LIMIT");
                       s_limit = e ? (uint32_t)strtoul(e, 0, 0) : 200000u; }
-      if ((uint32_t)ea == s_last_ea && lsa == s_last_lsa) {
+      /* Il poll del label RSX (0x480+16*lane) NON e' mai un job incastrato: e'
+       * il job che aspetta la RSX, e da noi la RSX (il walker) puo' stare
+       * ferma piu' di 200.000 letture (parcheggiata su un pacchetto, o
+       * trattenuta dalla guardia dell'anello con valvola a 2 s). Ucciderlo
+       * qui e' il ciclo della s.35: il suo pacchetto resta col JUMP-a-se-
+       * stessi, il walker ci resta parcheggiato per sempre, il label non
+       * avanza, le altre lane muoiono uguale, il PPU aspetta la job list
+       * (livello fermo all'ingresso, o alla morte di Drake). Lo sblocco dei
+       * label e la valvola della guardia sono i limiti di quell'attesa. */
+      int label_poll = (size == 4 && (uint32_t)ea >= 0x50000480u && (uint32_t)ea < 0x50000500u && mfc_is_get(cmd));
+      if (label_poll) { s_rep = 0; }
+      else if ((uint32_t)ea == s_last_ea && lsa == s_last_lsa) {
           if (++s_rep >= s_limit) {
               s_rep = 0;   /* re-arm: the chain may run this job again */
               extern void spu_halt(spu_context*);

@@ -517,9 +517,15 @@ skip_inject: ;
           unsigned long long now = ps3_ms_now(); if (!s_ap_t0) s_ap_t0 = now;
           if (s_ap_until > 0 && (double)(now - s_ap_t0) / 1000.0 > s_ap_until) s_ap = 0;
           unsigned ph = s_apn++ % 240;
+          /* LBP_AUTOPRESS_NOSTART=1: solo CROSS. Uncharted (s.35): se il menu
+           * principale diventa interattivo entro 2 s dall'avviso autosave,
+           * l'impulso START ci finisce sopra e "New Game" non parte piu'
+           * (2 corse su 3 con il boot piu' veloce). */
+          static int s_nostart = -1;
+          if (s_nostart < 0) { const char* e = getenv("LBP_AUTOPRESS_NOSTART"); s_nostart = (e && *e && *e != '0') ? 1 : 0; }
           if (ph < 12)
               data->button[CELL_PAD_BTN_OFFSET_DIGITAL2] |= 0x40;   /* CROSS */
-          else if (ph >= 120 && ph < 132)
+          else if (ph >= 120 && ph < 132 && !s_nostart)
               data->button[CELL_PAD_BTN_OFFSET_DIGITAL1] |= 0x08;   /* START */
       } }
 
@@ -566,12 +572,13 @@ skip_inject: ;
                  s_v[2]=(unsigned char)c; s_v[3]=(unsigned char)d; } }
       /* PAD_STICK_FROM=<sec>: gli stick fissi solo da quel secondo in poi (prima
        * restano al centro: nel menu lo stick sposterebbe la selezione). */
+      int stick_ok = 1;
       { static double s_from = -1.0; static unsigned long long s_t0s = 0;
         if (s_from < 0) { const char* e = getenv("PAD_STICK_FROM"); s_from = e ? atof(e) : 0.0; }
-        if (s_st && s_from > 0) { extern unsigned long long ps3_ms_now(void);
+        if (s_from > 0) { extern unsigned long long ps3_ms_now(void);
             unsigned long long now = ps3_ms_now(); if (!s_t0s) s_t0s = now;
-            if ((double)(now - s_t0s) / 1000.0 < s_from) s_st = 2; else if (s_st == 2) s_st = 1; } }
-      if (s_st == 1) { hs->analog_lx = s_v[0]; hs->analog_ly = s_v[1];
+            if ((double)(now - s_t0s) / 1000.0 < s_from) stick_ok = 0; } }
+      if (s_st && stick_ok) { hs->analog_lx = s_v[0]; hs->analog_ly = s_v[1];
                   hs->analog_rx = s_v[2]; hs->analog_ry = s_v[3];
                   hs->connected = 1; }
       /* PAD_SWEEP=<seconds per step>: walk the sticks through a fixed set of
@@ -582,7 +589,7 @@ skip_inject: ;
       { static int sw = -1; static clock_t t0 = 0;
         if (sw < 0) { const char* e = getenv("PAD_SWEEP");
                       sw = e ? atoi(e) : 0; if (sw < 0) sw = 0; }
-        if (sw) {
+        if (sw && stick_ok) {   /* PAD_STICK_FROM vale anche per lo sweep */
             static const unsigned char steps[9][4] = {
                 {128,128,128,128},
                 {128,  0,128,128}, {128,255,128,128},
@@ -590,8 +597,10 @@ skip_inject: ;
                 {128,128,128,  0}, {128,128,128,255},
                 {128,128,  0,128}, {128,128,255,128},
             };
-            if (!t0) t0 = clock();
-            long el = (long)((double)(clock() - t0) / (double)CLOCKS_PER_SEC);
+            /* tempo di parete, non clock() (CPU): con 12 thread il passo cambiava a caso */
+            extern unsigned long long ps3_ms_now(void);
+            if (!t0) t0 = (clock_t)ps3_ms_now();
+            long el = (long)((ps3_ms_now() - (unsigned long long)t0) / 1000);
             int k = (int)((el / (sw > 0 ? sw : 1)) % 9);
             hs->analog_lx = steps[k][0]; hs->analog_ly = steps[k][1];
             hs->analog_rx = steps[k][2]; hs->analog_ry = steps[k][3];

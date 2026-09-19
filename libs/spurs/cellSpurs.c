@@ -1153,8 +1153,8 @@ s32 cellSpursAddWorkload(CellSpurs* spurs, CellSpursWorkloadId* wid,
 
             /* wid out-param is guest BE */
             vm_write32((u32)(uintptr_t)wid, i);
-            printf("[cellSpurs] AddWorkload(wid=%u, pm=%p, size=%u, arg=0x%llx)\n",
-                   i, pm, sizePm, (unsigned long long)data);
+            printf("[cellSpurs] AddWorkload(wid=%u, pm=%p, size=%u, arg=0x%llx, minC=%u maxC=%u)\n",
+                   i, pm, sizePm, (unsigned long long)data, minContention, maxContention);
             /* SPU_PM_DUMP=<dir>: write the guest's policy module out as it is
              * registered. The image a title hands to SPURS is not always one
              * that extract_spu_images.py can find in the EBOOT -- Uncharted's
@@ -1781,7 +1781,18 @@ static DWORD WINAPI spurs_kernel_thread(LPVOID p)
             { static int s_fs = -2;
               if (s_fs == -2) { const char* e = getenv("SPURS_FORCE_SPUS");
                 s_fs = e ? atoi(e) : -1; }
-              if (s_fs > 0) maxcont = (u8)(s_fs > 6 ? 6 : s_fs); }
+              /* Solo per i workload che il titolo dichiara multi-SPU (maxC>1).
+               * Le liste a UNA SPU (Uncharted: wid 2/3/4/7/9/10, maxC=1, fra cui
+               * la BasicJobList del wid 3: job che leggono-modificano-scrivono
+               * gli stessi buffer, es. il ragdoll alla morte di Drake) girate su
+               * 6 lane in parallelo si pestano i piedi: l'ultimo job scrive il
+               * marcatore "fatto" (16 byte in testa al buffer), un altro job in
+               * corsa riscrive il buffer intero con la copia vecchia e il PPU
+               * aspetta per sempre (s.35: lo stallo alla morte di Drake e quello
+               * quando Drake parla). */
+              static int s_fs_all = -1;   /* SPURS_FORCE_SPUS_ALL=1: come prima della s.35 (A/B) */
+              if (s_fs_all < 0) { const char* e = getenv("SPURS_FORCE_SPUS_ALL"); s_fs_all = (e && *e && *e != '0') ? 1 : 0; }
+              if (s_fs > 0 && (maxcont > 1 || s_fs_all)) maxcont = (u8)(s_fs > 6 ? 6 : s_fs); }
             *(vm_base + ea + SPURS_WKL_CURCONT + wid) = maxcont;
             {
                 static int s_lstat = -1; if (s_lstat < 0) s_lstat = getenv("SPURS_LANE_STAT") ? 1 : 0;
@@ -1832,9 +1843,12 @@ static DWORD WINAPI spurs_kernel_thread(LPVOID p)
              * stata chiesta (kick) o che ha trovato lavoro (polls>0). Serve a
              * dire QUALE wid gira quando il PPU arma un lavoro e nessuno lo
              * completa: il trace `poll #1` non nomina il workload. */
-            { static int s_dt = -1;
-              if (s_dt < 0) s_dt = getenv("SPURS_DISPATCH_TRACE") ? 1 : 0;
-              if (s_dt && (kicked || g_spurs_pm_polls)) {
+            { static int s_dt = -1; static long s_dt_wid = -1;
+              if (s_dt < 0) { s_dt = getenv("SPURS_DISPATCH_TRACE") ? 1 : 0;
+                              /* SPURS_DISPATCH_TRACE_WID=<n>: solo quel workload (nel livello il
+                               * wid 12 trova lavoro a ogni corsa e sommerge il log, s.35) */
+                              const char* w = getenv("SPURS_DISPATCH_TRACE_WID"); s_dt_wid = w ? atol(w) : -1; }
+              if (s_dt && (kicked || g_spurs_pm_polls) && (s_dt_wid < 0 || (long)wid == s_dt_wid)) {
                   /* Anche l'intestazione della job list DOPO la corsa (0x00..0x3F:
                    * intestazione + primi 4 job): dice se il job c'era e se il
                    * manager l'ha preso. Le scritture del PPU qui non passano da
@@ -2990,16 +3004,41 @@ s32 cellSpursGetWorkloadInfo(u64 spurs_ea, u32 wid, u64 info_ea)
     return CELL_OK;
 }
 
+/* Diagnostica (s.35, park-watchdog del walker): la job list viva del wid --
+ * intestazione (ticket per SPU a +0x12..+0x1E) e i primi 28 slot da 8 byte. */
+void cellSpurs_dump_wid_joblist(u32 wid)
+{
+    if (wid >= CELL_SPURS_MAX_WORKLOAD) return;
+    const SpursWorkload* w = &s_workloads[wid];
+    u32 ea = w->spurs_ea;
+    u64 arg = ea ? vm_read64(ea + SPURS_WKL_INFO1 + wid * SPURS_WKL_INFO_SZ + 8) : 0;
+    fprintf(stderr, "[wid-joblist] wid=%u in_use=%d spurs=0x%08X arg=0x%08llX (mirror 0x%08llX)\n",
+            wid, w->in_use, ea, (unsigned long long)arg, (unsigned long long)w->data);
+    if (!arg || (u32)arg + 0x100 > 0x30000000u) return;
+    for (u32 o = 0; o < 0x100; o += 0x20) {
+        fprintf(stderr, "[wid-joblist]   +%03X:", o);
+        for (u32 k = 0; k < 0x20; k += 4) fprintf(stderr, " %08X", vm_read32((u32)arg + o + k));
+        fputc('\n', stderr);
+    }
+}
+
+static void spurs_park_dump_hook(void) { cellSpurs_dump_wid_joblist(12); }
+__attribute__((constructor)) static void spurs_register_park_dump_hook(void)
+{
+    extern void (*g_gcm_park_dump_hook)(void);
+    g_gcm_park_dump_hook = spurs_park_dump_hook;
+}
+
 s32 cellSpursShutdownWorkload(u64 spurs_ea, u32 wid)
 {
     static int _n = 0;
-    if (_n++ < 8) printf("[cellSpurs] ShutdownWorkload(wid=%u)\n", wid);
+    if (_n++ < 8 || (_n % 500) == 0) printf("[cellSpurs] ShutdownWorkload(wid=%u) #%d\n", wid, _n);
     return CELL_OK;
 }
 
 s32 cellSpursWaitForWorkloadShutdown(u64 spurs_ea, u32 wid)
 {
     static int _n = 0;
-    if (_n++ < 8) printf("[cellSpurs] WaitForWorkloadShutdown(wid=%u)\n", wid);
+    if (_n++ < 8 || (_n % 500) == 0) printf("[cellSpurs] WaitForWorkloadShutdown(wid=%u) #%d\n", wid, _n);
     return CELL_OK;
 }

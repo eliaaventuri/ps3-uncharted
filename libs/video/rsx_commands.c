@@ -457,6 +457,14 @@ void rsx_ring_guard_release(unsigned lane, u32 val)
 }
 /* il job sta per controllare il label per il blocco (r12, r5]: 1 = deve
  * aspettare (scrivi `*fake` nel label), 0 = scrivi il label vero */
+void rsx_ring_guard_dump(void)
+{
+    for (unsigned l = 0; l < RING_GUARD_LANES; l++)
+        fprintf(stderr, "[ring-guard] lane %u: prod_v=%llu cons_v=%llu (prod-cons=%llu) label=%08X attese=%lu in_attesa_da=%llu ms\n",
+                l, (unsigned long long)s_rg[l].prod_v, (unsigned long long)s_rg[l].cons_v,
+                (unsigned long long)(s_rg[l].prod_v - s_rg[l].cons_v), s_rg[l].real_label, s_rg[l].waits,
+                s_rg[l].wait_t0 ? (unsigned long long)(ps3_ms_now() - s_rg[l].wait_t0) : 0ull);
+}
 int rsx_ring_guard_check(unsigned lane, u32 r12, u32 r5, u32 r23, u32 r26, u32* fake, u32* real)
 {
     if (lane >= RING_GUARD_LANES || !ring_guard_on()) return -1;

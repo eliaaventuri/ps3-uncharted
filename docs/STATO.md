@@ -125,6 +125,14 @@ un puntatore nullo letto dai propri dati, e la scena 3D non si vede ancora
 finestra (frecce, Spazio/X = CROSS, C = CERCHIO, Invio = START); `PAD_SCRIPT`
 per le corse senza nessuno. Dettagli in "Sessione 27".
 
+**Dalla sessione 35 Drake puo' morire e il gioco riparte dal checkpoint.**
+Lo stallo intermittente dopo la morte (e quando Drake parlava) era il
+workload SPURS wid 3 (animazione/ragdoll, dichiarato a UNA SPU) che il
+nostro kernel faceva girare su 6 lane: i job si sovrascrivevano il flag di
+"fatto" e il PPU aspettava per sempre. Ora `SPURS_FORCE_SPUS` vale solo per
+i workload multi-SPU: 3 morti su 3 seguite dal ricaricamento del checkpoint.
+Dettagli in "Sessione 35".
+
 **Dalla sessione 33 Drake e' intero** (`docs/img_s33_drake_intero.jpg`):
 braccia e gambe della muta c'erano sempre state, ma le matrici delle
 giunture "twist" arrivavano allo skinning come riempimento 0xFFFF0000/
@@ -450,6 +458,103 @@ La lista dei comandi ora viene percorsa fino in fondo — sei coppie
 risultati in memoria principale.** Non era mai successo in nessuna sessione.
 Riproducibile: **tre corse su tre**, identiche -- 14 comandi, un overlay
 residente, zero microstep, cinque stall e due interrupt per corsa.
+
+## Sessione 35 — lo stallo alla morte di Drake era il wid 3 (lista a UNA SPU) girato su 6 lane
+
+**Trovato e corretto: 3 morti su 3 (fix16, fix18 x2) seguite dal ricaricamento
+del checkpoint e 90 s di gioco, contro 2 stalli su 3 morti prima (stab6,
+fix8; fix7 era passata per fortuna). fps nel livello invariati (8,3 nella
+finestra f#2300-2500).** Non era il walker
+ne' `RemoveWorkload`: dopo `kPlayerDied` il PPU chiama `func_005708E8`
+(manda un job SPU e ne aspetta il flag: `func_00571848`, ciclo a 0x571B00
+`while (!(flag & 1))`) sul workload **wid 3** (`BasicJobList`, `game/
+spumanager.cpp:701`, job list a 0x2A8D2900, job module 208 poi 211). Il
+titolo registra il wid 3 con **maxContention = 1** (una SPU), ma il nostro
+kernel applicava `SPURS_FORCE_SPUS=6` a TUTTI i workload: i job della lista
+(6 blocchi di parametri a 0x2B14B280+0x10*n, tutti a leggere-modificare-
+scrivere gli stessi buffer 0x2B14BC00/0x2B14FC00/0x2B14B970) giravano in
+parallelo su 3+ lane (`SPU_DMA_EAWIN_OVL=208`: contesti cF910/cF8CC/c053C
+sugli stessi EA). L'ultimo job scrive il marcatore "fatto" (16 byte a
+0x2B14BC00, pc 0x4434), un altro job in corsa riscrive il buffer intero con
+la copia vecchia (pc 0x2B58, 0x4000 byte da 0x2B14BC00) e il flag sparisce:
+il PPU gira per sempre, la FIFO si svuota, i fotogrammi si fermano. Il
+kick del wid 3 arriva alla morte di Drake (ragdoll) ma anche quando Drake
+PARLA ("Setting facial speech"): e' lo stesso stallo di death6 (senza
+morte, a 120 s) e di w3_10 (a 125 s), e spiega perche' era intermittente.
+Contention dei workload (nuovo nel log di `AddWorkload`: `minC/maxC`):
+wid 0/1/6/8/11 = 5, wid 5 = 8, **wid 2/3/4/7/9/10 = 1**.
+Fix in `libs/spurs/cellSpurs.c`: `SPURS_FORCE_SPUS` vale solo per i
+workload con maxC > 1 (il wid 12 resta a 6 lane).
+
+**Secondo difetto trovato per strada (fix8/death5, stallo all'ingresso del
+livello, f#2310):** il watchdog delle DMA identiche (`SPU_DMA_REPEAT_LIMIT`
+200.000) uccideva il job di geometria (ovl 215, pc 0x4B10) mentre
+interrogava il label RSX 0x50000490: con il walker indietro e la guardia
+dell'anello che trattiene la lane (valvola a 2 s) le letture identiche
+superano 200.000 in meno di 2 s. Job ucciso = pacchetto col JUMP-a-se-
+stessi mai patchato = walker parcheggiato per sempre (a 0A42CA90) = le
+altre lane nella guardia, valvole ogni 2 s (15 righe), PPU in
+`func_0074232C`/`func_007428C0`/`func_0074073C` (attesa della job list:
+min dei ticket per SPU a +0x12..+0x1E dell'intestazione >= n).
+Fix in `runtime/spu/spu_dma.h`: i poll dei label RSX (0x50000480-0x500004FF,
+GET da 4 byte) non contano per il watchdog.
+
+**Strumenti nuovi:**
+- `[park-watchdog]` (`GCM_PARK_DUMP_MS`, default 5000): fermi sullo stesso
+  park da piu' di N ms -> parole attorno, generazioni parkgen, stato della
+  guardia dell'anello per lane (`rsx_ring_guard_dump`), job list viva del
+  wid 12 (`cellSpurs_dump_wid_joblist`, hook registrato da cellSpurs.c
+  perche' il target `ps3recomp_host` non linka cellSpurs).
+- `SPURS_DISPATCH_TRACE_WID=<n>`: il trace dei dispatch solo per quel wid.
+- `PAD_STICK_FROM=<s>`: `PAD_STICK`/`PAD_SWEEP` solo da quel secondo (prima
+  lo stick muoveva la selezione nel menu); `PAD_SWEEP` ora a tempo di
+  parete (era `clock()`, CPU: il passo cambiava a caso).
+- `ShutdownWorkload`/`WaitForWorkloadShutdown` stampano il conteggio ogni
+  500 chiamate (il titolo li chiama a ogni fotogramma: #2500 a f#2600).
+- `scratchpad/stallcatch2.sh <log> <s> [VAR=..]`: corsa che campiona il
+  processo (`sample`) se i fotogrammi si fermano 30 s; `deathcatch.sh`
+  idem ma solo dopo `kPlayerDied`. (lldb `-p` resta appeso all'attach:
+  non usarlo dagli script.)
+
+**Riproduzione della morte:** senza tasti Drake muore a **~130 s dal
+lancio** (95 s con il boot veloce) in 5 corse su 8 (stab6, fix7, fix8,
+fix16, fix18 due volte; no in fix13/14/15/17), all'ondata dei pirati; con
+`PAD_STICK`/`PAD_SWEEP`/salti non muore (si sposta dalla linea di tiro).
+**Boot:** con i workload a una lane il boot e' a volte piu' veloce e
+l'impulso START dell'autopress finiva sul menu principale gia' interattivo:
+"New Game" non partiva (2 corse su 3, 0 su 3 con `SPURS_FORCE_SPUS_ALL=1`
+= comportamento vecchio). Ora `run.sh` mette `LBP_AUTOPRESS_NOSTART=1`
+(solo CROSS; "Press START" accetta CROSS): 4 boot su 4 + 3 su 3. Dopo la morte corretta (fix7) il
+gioco RICARICA IL CHECKPOINT: `GameTaskSubnodeReset 'dive-boat-encounter-
+first-wave'`, respawn delle entita', fotogrammi a 8-9 fps: e' il primo
+checkpoint ricaricato dal port.
+
+**Worker Gemini:** morto dopo aver letto 4 file (`Error: Requests ending
+with a model turn are not supported`), come in s.34 (appeso): le tre
+funzioni del poll le ho lette a mano (50-70 righe l'una).
+
+**Non risolto / visto:** (a) la lifter emette `sync/lwsync/eieio` come
+no-op (2.439 siti): su ARM64 e' un buco di ordinamento fra PPU e lane; i
+kick via `stwcx.` (CAS seq_cst) sono ordinati, gli store semplici no.
+Da fare: `__atomic_thread_fence` nel lifter e relift. (b) death4: assert
+`stopd @0x0423C` nel job 217 (slot della job list non vuoto: un job
+scrive un job header a joblist+0x20+8*idx e pretende lo slot a zero)
+fra `RemoveWorkload(12)` e `AddWorkload(12)`, 1 corsa su 12, stallo a
+f#720; probabilmente lo stesso problema di contention (wid 217 = ?) o la
+mancanza di `WaitForWorkloadShutdown` (no-op: il PPU ricicla la lista
+mentre una lane finisce il job precedente). (c) `RING_GUARD_LANES` e' 5:
+la sesta lane del wid 12 non ha guardia (label 0x4D0).
+
+### Fronte aperto (dopo la sessione 35)
+
+1. Verificare il fix del wid 3 su piu' corse (morte a 130 s + Drake che
+   parla) e poi giocare oltre il checkpoint.
+2. Barriere di memoria nel lifter PPU (sync/lwsync/eieio -> fence) e
+   relift a -O2.
+3. `WaitForWorkloadShutdown` vera (aspettare il quantum in volo) e
+   `RemoveWorkload` che aspetta: chiude la corsa di death4.
+4. Velocita' (8,2-8,8 fps), tonalita' vs RPCS3, IFE/LOOP nel decompilatore
+   FP, `spu_fi`: come in s.34.
 
 ## Sessione 34 — la tonalita' e' deterministica: il fotogramma "slavato" era l'effetto danno del gioco
 

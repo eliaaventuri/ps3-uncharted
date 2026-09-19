@@ -756,6 +756,7 @@ static int parkgen_slot(u32 ea, int create)
     }
     return -1;
 }
+void (*g_gcm_park_dump_hook)(void) = 0;   /* park-watchdog: dump extra (cellSpurs.c) */
 void cellGcm_note_park_put(u32 ea, u32 word)
 {
     /* e' un park solo se il JUMP punta a se stesso (IO -> EA) */
@@ -2053,6 +2054,24 @@ static void gcm_rsx_process_fifo_unlocked(void)
                                       fputc('\n', stderr); } }
                               { static int _n = 0; if (_n++ < 8)
                                 fprintf(stderr, "[cellGcmSys] FIFO parcheggiata a 0x%08X (put=0x%08X): aspetto la patch\n", tgt, put); }
+                              /* Park-watchdog (s.35): fermi sullo STESSO park da piu' di GCM_PARK_DUMP_MS
+                               * (default 5000) -> una volta per park: parole attorno, generazioni del
+                               * pacchetto, guardia dell'anello per lane, job list viva del wid 12. */
+                              { static long s_pdm = -1; static u32 s_pd_last = 0;
+                                if (s_pdm < 0) { const char* e = getenv("GCM_PARK_DUMP_MS"); s_pdm = e ? atol(e) : 5000; }
+                                if (s_pdm > 0 && s_pd_last != tgt && gcm_ns_now() - s_park_since > (unsigned long long)s_pdm * 1000000ull) {
+                                    s_pd_last = tgt; u32 tea = gcm_io2ea(tgt);
+                                    fprintf(stderr, "[park-watchdog] fermo su io=%08X (ea=%08X) da %.0f ms, put=%08X call-da=%08X, parkgen parked=%u consumed=%u:",
+                                            tgt, tea, (gcm_ns_now() - s_park_since) / 1e6, put, s_fifo_calloff,
+                                            parkgen_slot(tea, 0) >= 0 ? s_parkgen[parkgen_slot(tea, 0)].parked : 0,
+                                            parkgen_slot(tea, 0) >= 0 ? s_parkgen[parkgen_slot(tea, 0)].consumed : 0);
+                                    for (int k = -16; k <= 8; k++) { u32 e2 = gcm_io2ea(tgt + (u32)(k * 4)); fprintf(stderr, "%s%08X", k == 0 ? " |" : (k == 1 ? "| " : " "), e2 ? vm_read32(e2) : 0); }
+                                    fputc('\n', stderr);
+                                    { extern void rsx_ring_guard_dump(void); rsx_ring_guard_dump(); }
+                                    /* hook registrato da cellSpurs.c (costruttore): il target generico
+                                     * ps3recomp_host non linka cellSpurs, un riferimento diretto lo tirerebbe dentro */
+                                    if (g_gcm_park_dump_hook) g_gcm_park_dump_hook();
+                                    fflush(stderr); } }
                               /* GCM_PARKDUMP=1: i comandi dell'anello DOPO la CALL parcheggiata
                                * (cosa aspetta dietro il job SPU), primi 3 park dopo l'armo */
                               { static int pd = -1; static int pn = 0; extern int g_hle_trace_armed;
