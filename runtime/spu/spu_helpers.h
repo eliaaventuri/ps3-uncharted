@@ -147,6 +147,7 @@ static inline u128 spu_cntb(u128 a) { u128 r; for(int i=0;i<16;i++){ uint8_t v=a
 #endif /* !SPU_NEON_CNTB */
 
 /* ---- compares: all-ones / all-zeros per lane ---- */
+#ifndef SPU_NEON_ICMP
 static inline u128 spu_ceq(u128 a, u128 b)  { u128 r; for(int i=0;i<4;i++) r._u32[i]=(a._u32[i]==b._u32[i])?0xFFFFFFFFu:0; return r; }
 static inline u128 spu_ceqh(u128 a, u128 b) { u128 r; for(int i=0;i<8;i++) r._u16[i]=(a._u16[i]==b._u16[i])?0xFFFFu:0; return r; }
 static inline u128 spu_ceqb(u128 a, u128 b) { u128 r; for(int i=0;i<16;i++) r._u8[i]=(a._u8[i]==b._u8[i])?0xFFu:0; return r; }
@@ -156,6 +157,7 @@ static inline u128 spu_cgtb(u128 a, u128 b) { u128 r; for(int i=0;i<16;i++) r._u
 static inline u128 spu_clgt(u128 a, u128 b) { u128 r; for(int i=0;i<4;i++) r._u32[i]=(a._u32[i]>b._u32[i])?0xFFFFFFFFu:0; return r; }
 static inline u128 spu_clgth(u128 a, u128 b){ u128 r; for(int i=0;i<8;i++) r._u16[i]=(a._u16[i]>b._u16[i])?0xFFFFu:0; return r; }
 static inline u128 spu_clgtb(u128 a, u128 b){ u128 r; for(int i=0;i<16;i++) r._u8[i]=(a._u8[i]>b._u8[i])?0xFFu:0; return r; }
+#endif /* !SPU_NEON_ICMP */
 static inline u128 spu_ceqi(u128 a, int32_t imm) { u128 r; for(int i=0;i<4;i++) r._u32[i]=(a._s32[i]==imm)?0xFFFFFFFFu:0; return r; }
 static inline u128 spu_cgti(u128 a, int32_t imm) { u128 r; for(int i=0;i<4;i++) r._u32[i]=(a._s32[i]>imm)?0xFFFFFFFFu:0; return r; }
 static inline u128 spu_clgti(u128 a, int32_t imm){ u128 r; for(int i=0;i<4;i++) r._u32[i]=(a._u32[i]>(uint32_t)imm)?0xFFFFFFFFu:0; return r; }
@@ -181,17 +183,21 @@ static inline u128 spu_selb(u128 a, u128 b, u128 c) {
  * in ordine SPU, vqtbl2q_u8 fa la ricerca sui 32 byte concatenati, i casi
  * speciali (s >= 0x80: 0x00, s >= 0xC0: 0xFF, s >= 0xE0: 0x80) con tre
  * confronti, e un altro vrev32q_u8 riporta il risultato in ordine host. */
+/* Senza inversioni (sessione 36): il byte host h di c E' il controllo del byte
+ * SPU SPU_W(h), cioe' del byte host h del risultato; e il byte SPU s del
+ * concatenato {a,b} sta nel byte host s ^ 3 (SPU_W(s) = s ^ 3, anche per
+ * s in 16..31). Quindi indice = (c & 0x1F) ^ 3 sulla tabella {a,b} in ordine
+ * host, e i casi speciali si leggono da c cosi' com'e': da 4 vrev32 + 8 op a
+ * 8 op. */
 static inline u128 spu_shufb(u128 a, u128 b, u128 c) {
-    uint8x16_t va = vrev32q_u8(vld1q_u8(a._u8));
-    uint8x16_t vb = vrev32q_u8(vld1q_u8(b._u8));
-    uint8x16_t vc = vrev32q_u8(vld1q_u8(c._u8));
-    uint8x16x2_t tab; tab.val[0] = va; tab.val[1] = vb;
-    uint8x16_t look = vqtbl2q_u8(tab, vandq_u8(vc, vdupq_n_u8(0x1F)));
+    uint8x16_t vc = vld1q_u8(c._u8);
+    uint8x16x2_t tab; tab.val[0] = vld1q_u8(a._u8); tab.val[1] = vld1q_u8(b._u8);
+    uint8x16_t look = vqtbl2q_u8(tab, veorq_u8(vandq_u8(vc, vdupq_n_u8(0x1F)), vdupq_n_u8(3)));
     uint8x16_t hi    = vcgeq_u8(vc, vdupq_n_u8(0x80));
     uint8x16_t is_ff = vcgeq_u8(vc, vdupq_n_u8(0xC0));
     uint8x16_t is_80 = vcgeq_u8(vc, vdupq_n_u8(0xE0));
     uint8x16_t special = vbslq_u8(is_80, vdupq_n_u8(0x80), vbslq_u8(is_ff, vdupq_n_u8(0xFF), vdupq_n_u8(0x00)));
-    u128 r; vst1q_u8(r._u8, vrev32q_u8(vbslq_u8(hi, special, look)));
+    u128 r; vst1q_u8(r._u8, vbslq_u8(hi, special, look));
     return r;
 }
 #else
@@ -402,8 +408,10 @@ static inline u128 spu_cgx(u128 a, u128 b, u128 t){ u128 r; for(int i=0;i<4;i++)
  * MPYHHAU/DFCGT/DFCMGT/XORBI/DFTSV). Completes the lifter's opcode coverage. ---- */
 static inline u128 spu_eqv(u128 a, u128 b)   { u128 r; for(int i=0;i<4;i++) r._u32[i]=~(a._u32[i]^b._u32[i]); return r; }
 static inline u128 spu_xorbi(u128 a, int32_t imm){ u128 r; for(int i=0;i<16;i++) r._u8[i]=(uint8_t)(a._u8[i]^(uint8_t)imm); return r; }
+#ifndef SPU_NEON_ICMP
 static inline u128 spu_absdb(u128 a, u128 b)  { u128 r; for(int i=0;i<16;i++){ uint8_t x=a._u8[i],y=b._u8[i]; r._u8[i]=(uint8_t)(x>y?x-y:y-x); } return r; }
 static inline u128 spu_avgb(u128 a, u128 b)   { u128 r; for(int i=0;i<16;i++) r._u8[i]=(uint8_t)(((uint32_t)a._u8[i]+(uint32_t)b._u8[i]+1u)>>1); return r; }
+#endif /* !SPU_NEON_ICMP */
 /* mpyhha/mpyhhau: high-16 x high-16, ACCUMULATE into rt (3-register). */
 static inline u128 spu_mpyhha(u128 a, u128 b, u128 t)  { u128 r; for(int i=0;i<4;i++) r._s32[i]=t._s32[i]+(int32_t)a._s16[2*i+1]*(int32_t)b._s16[2*i+1]; return r; }
 static inline u128 spu_mpyhhau(u128 a, u128 b, u128 t) { u128 r; for(int i=0;i<4;i++) r._u32[i]=t._u32[i]+(uint32_t)a._u16[2*i+1]*(uint32_t)b._u16[2*i+1]; return r; }
@@ -414,10 +422,12 @@ static inline u128 spu_dfcmgt(u128 a, u128 b) { u128 r; for(int i=0;i<2;i++){ do
 static inline u128 spu_dftsv(u128 a, int32_t imm){ (void)a; (void)imm; u128 r; memset(&r,0,sizeof r); return r; }
 
 /* ---- Phase 2: register-variable shifts/rotates ---- */
+#ifndef SPU_NEON_VSHIFT
 static inline u128 spu_shl(u128 a, u128 b)   { u128 r; for(int i=0;i<4;i++){ uint32_t sh=b._u32[i]&0x3F; r._u32[i]=(sh>31)?0:(a._u32[i]<<sh); } return r; }
 static inline u128 spu_shlh(u128 a, u128 b)  { u128 r; for(int i=0;i<8;i++){ uint32_t sh=b._u16[i]&0x1F; r._u16[i]=(sh>15)?0:(uint16_t)(a._u16[i]<<sh); } return r; }
 static inline u128 spu_rot(u128 a, u128 b)   { u128 r; for(int i=0;i<4;i++){ uint32_t sh=b._u32[i]&31; r._u32[i]= sh ? ((a._u32[i]<<sh)|(a._u32[i]>>(32-sh))) : a._u32[i]; } return r; }
 static inline u128 spu_roth(u128 a, u128 b)  { u128 r; for(int i=0;i<8;i++){ uint32_t sh=b._u16[i]&15; r._u16[i]= sh ? (uint16_t)((a._u16[i]<<sh)|(a._u16[i]>>(16-sh))) : a._u16[i]; } return r; }
+#endif /* !SPU_NEON_VSHIFT */
 static inline u128 spu_shlqbi(u128 a, u128 b){ int sh=b._u32[0]&7; if(!sh) return a;
     uint64_t hi=((uint64_t)a._u32[0]<<32)|a._u32[1], lo=((uint64_t)a._u32[2]<<32)|a._u32[3];
     uint64_t nhi=(hi<<sh)|(lo>>(64-sh)), nlo=(lo<<sh);
@@ -466,6 +476,7 @@ static inline u128 spu_cg(u128 a, u128 b)   { u128 r; for(int i=0;i<4;i++) r._u3
 /* sumb: sum the 4 bytes of each word. Per CBEA, RT halfword 2i (the HIGH half of
  * word i) = sum of RB's 4 bytes of word i; halfword 2i+1 (LOW half) = sum of RA's
  * 4 bytes of word i. Computed on word VALUES so byte order is irrelevant. */
+#ifndef SPU_NEON_ICMP
 static inline u128 spu_sumb(u128 a, u128 b) {
     u128 r;
     for(int i=0;i<4;i++) {
@@ -476,6 +487,7 @@ static inline u128 spu_sumb(u128 a, u128 b) {
     }
     return r;
 }
+#endif /* !SPU_NEON_ICMP */
 /* Borrow generate: carry-out of (b + ~a + 1) == (b >= a unsigned ? 1 : 0).
  * The subtract-side sibling of cg; pairs with sf/sfx for extended subtraction. */
 static inline u128 spu_bg(u128 a, u128 b)   { u128 r; for(int i=0;i<4;i++) r._u32[i]=(uint32_t)(((uint64_t)b._u32[i]+(uint64_t)(~a._u32[i])+1u)>>32); return r; }
@@ -552,6 +564,7 @@ static inline u128 spu_fsmh(u128 a) {
  * andbi(fsmbi(0x101),-128) building a +0x80 EA offset in the low byte of words
  * 1,3) places the value in the correct byte lane. Raw _u8[P] would put 0x80 in
  * the high byte (bit 31) instead -> wrong DMA EA. */
+#ifndef SPU_NEON_FSMB
 static inline u128 spu_fsmb(u128 a) {
     u128 r; uint32_t v = a._u32[0] & 0xFFFF;
     for(int i=0;i<16;i++) r._u8[SPU_W(i)] = ((v>>(15-i))&1) ? 0xFFu : 0;
@@ -562,6 +575,7 @@ static inline u128 spu_fsmbi(int32_t imm) {
     for(int i=0;i<16;i++) r._u8[SPU_W(i)] = ((v>>(15-i))&1) ? 0xFFu : 0;
     return r;
 }
+#endif /* !SPU_NEON_FSMB */
 
 /* ---- Phase 3: constant generators (insertion shuffle patterns) ---- */
 /* Generate-controls (cbd/chd/cwd/cdd) — insertion selectors for the (now
@@ -608,10 +622,12 @@ static inline u128 spu_cwx(u128 a, u128 b){ return spu_cwd_pos((int)(a._u32[0]+b
 static inline u128 spu_cdx(u128 a, u128 b){ return spu_cdd_pos((int)(a._u32[0]+b._u32[0])); }
 
 /* ---- Phase 3: rotate-and-mask family ---- */
+#ifndef SPU_NEON_VSHIFT
 static inline u128 spu_rotm(u128 a, u128 b)   { u128 r; for(int i=0;i<4;i++){ uint32_t sh=(0-b._u32[i])&0x3F; r._u32[i]=(sh>31)?0:(a._u32[i]>>sh); } return r; }
 static inline u128 spu_rotma(u128 a, u128 b)  { u128 r; for(int i=0;i<4;i++){ uint32_t sh=(0-b._u32[i])&0x3F; r._s32[i]=(sh>31)?(a._s32[i]>>31):(a._s32[i]>>sh); } return r; }
 static inline u128 spu_rothm(u128 a, u128 b)  { u128 r; for(int i=0;i<8;i++){ uint32_t sh=(0-b._u16[i])&0x1F; r._u16[i]=(sh>15)?0:(uint16_t)(a._u16[i]>>sh); } return r; }
 static inline u128 spu_rothma(u128 a, u128 b) { u128 r; for(int i=0;i<8;i++){ uint32_t sh=(0-b._u16[i])&0x1F; r._s16[i]=(sh>15)?(a._s16[i]>>15):(a._s16[i]>>sh); } return r; }
+#endif /* !SPU_NEON_VSHIFT */
 static inline u128 spu_rothmi(u128 a, int i7) { u128 r; int sh=(0-i7)&0x1F; for(int i=0;i<8;i++) r._u16[i]=(sh>15)?0:(uint16_t)(a._u16[i]>>sh); return r; }
 static inline u128 spu_rotqmbi(u128 a, u128 b)   { int sh=(0-(int)b._u32[0])&7; if(!sh) return a;
     uint64_t hi=((uint64_t)a._u32[0]<<32)|a._u32[1], lo=((uint64_t)a._u32[2]<<32)|a._u32[3];

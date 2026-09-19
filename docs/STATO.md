@@ -125,7 +125,7 @@ un puntatore nullo letto dai propri dati, e la scena 3D non si vede ancora
 finestra (frecce, Spazio/X = CROSS, C = CERCHIO, Invio = START); `PAD_SCRIPT`
 per le corse senza nessuno. Dettagli in "Sessione 27".
 
-**Dalla sessione 36 il livello gira a 10,4 fps** (era 8,0-8,6): via il
+**Dalla sessione 36 il livello gira a 10,4-10,6 fps** (era 8,0-8,6): via il
 ramo delle sonde negli accessi alla LS (il compilatore scaricava tutti i
 registri a ogni accesso), FPCR delle lane come la SPU (denormali a zero,
 troncamento) con la via veloce dei float che guarda solo il risultato, e
@@ -502,10 +502,10 @@ rado (<1000 su ~2.200 Shutdown per corsa) e dura 0,08 ms in media, mai
 il tetto; fps 8,0/7,9/8,0 (f#2300-2500), 0 stalli, 1 morte (sd3) con
 ricaricamento del checkpoint.
 
-**Velocita': da 8,0-8,6 a 10,3-10,4 fps (f#2300-2500; 11-12 fps a
-f#3000-3400), stessa immagine (`docs/img_s36_dive_boat_neon_fz_rz.jpg`),
-3 corse da 200 s senza stallo ne' assert, 1 morte col checkpoint.** Tre
-cose, in ordine di resa:
+**Velocita': da 8,0-8,6 a 10,4-10,6 fps (f#2300-2500; 11,7-13,4 fps a
+f#3000-3400, finestra che dipende da cosa succede nel gioco), stessa
+immagine (`docs/img_s36_dive_boat_neon_fz_rz.jpg`), 5 corse da 200 s senza
+stallo ne' assert, 1 morte col checkpoint.** In ordine di resa:
 
 1. **`-DSPU_LS_NODIAG` (default in `build.sh`, +10%: 9,4 -> 10,3).** Gli
    accessori della LS (`spu_ls_read128/write128`) testavano `g_spu_ls_diag`
@@ -544,6 +544,18 @@ cose, in ordine di resa:
    (`vcvtq_s32_f32` tronca e satura come la SPU; estesi saturati per segno).
    Differenziale NEON/scalare: 0 discrepanze su 200.000 prove.
 
+4. **`spu_shufb` senza inversioni (10,3 -> 10,6 fps).** Il byte host h del
+   controllo c E' il controllo del byte host h del risultato (stesso
+   SPU_W), e il byte SPU s del concatenato {a,b} sta nel byte host s ^ 3:
+   indice = (c & 0x1F) ^ 3 su {a,b} cosi' come sono, casi speciali letti
+   da c cosi' com'e'. Da 4 vrev32 + 8 op a 8 op. Differenziale 300.000
+   prove: 0 discrepanze.
+5. Anche `ceq/cgt/clgt` (parola, halfword, byte), `absdb/avgb/sumb`,
+   `shl/shlh/rot/roth/rotm/rotma/rothm/rothma` (vshlq con quantita' per
+   corsia, negativa = destra, oltre la larghezza = 0/segno come la SPU) e
+   `fsmb/fsmbi` in NEON: corretti (differenziale 0 su 300.000) ma dentro il
+   rumore (10,4 fps): erano piccoli anche prima.
+
 **Come si e' misurato:** i due moduli caldi (215 geometria, 218 tavolozza)
 compilati con `-fno-inline` e `sample` per 10 s nel livello (fps 5,5 cosi',
 ma le proporzioni si vedono): helper 3.683 campioni, corpi liftati 2.837,
@@ -576,13 +588,12 @@ finestra NON e' "on screen" per CGWindowList, serve `.optionAll`).
 
 ### Fronte aperto (dopo la sessione 36)
 
-1. Velocita' (10,4 fps): `spu_shufb` e' l'helper piu' caldo (3 vrev32 +
-   tbl2 + 3 confronti = 21 istruzioni); la rappresentazione u128 "parole
-   in ordine SPU, byte in ordine host" costa un rev32 a ogni lqd/stqd e a
-   ogni op sui byte -- passare ai byte in ordine SPU (rev32 solo nei
-   canali/DMA e negli helper per parola) e' la mossa grossa. Poi i 41-46
-   ms di PPU da solo per fotogramma e la cache dei registri con le analisi
-   di flusso.
+1. Velocita' (10,4-10,6 fps): gli helper sono quasi tutti NEON ora; quel
+   che resta e' il corpo liftato (un load+store di ctx->gpr per istruzione,
+   piu' rev32 a ogni lqd/stqd) -> la cache dei registri con le analisi di
+   flusso (sporchi/vivi ai punti di sync), oppure il profilo a -fno-inline
+   rifatto per vedere cosa e' salito in testa. Poi i 41-46 ms di PPU da
+   solo per fotogramma (`vm_read32` chiamata, PPU a -O2).
 2. Giocare oltre il checkpoint (Elia con la tastiera, o `PAD_SCRIPT`).
 3. `RING_GUARD_LANES` 5 (la sesta lane del wid 12 senza guardia), death4
    (mai piu' visto in 9 corse dopo lo shutdown vero: da confermare).
