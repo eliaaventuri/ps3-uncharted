@@ -993,6 +993,10 @@ def decode(insn: int, addr: int = 0) -> Instruction:
             260: "vslb", 324: "vslh", 388: "vslw",
             516: "vsrb", 580: "vsrh", 644: "vsrw",
             772: "vsrab", 836: "vsrah", 900: "vsraw",
+            # quadword shifts (s.32: prima uscivano come vmx_x452/708/1036/1100
+            # e il lifter li emetteva come no-op: 141 siti in Uncharted)
+            452: "vsl", 708: "vsr", 1036: "vslo", 1100: "vsro",
+            384: "vaddcuw", 1408: "vsubcuw",
 
             # (vspltisb/h/w moved to the SIMM handler below the UIMM block — their
             # vA field (bits 11-15) is a 5-bit SIGNED immediate, not a register.)

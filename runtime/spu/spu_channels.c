@@ -1025,6 +1025,14 @@ spu_fn spu_lookup(uint32_t addr, int image_id)   /* exported: clang-built fast-p
  * spu_fn_registry.c before the registry was consolidated into this TU. */
 spu_lifted_fn spu_lifted_lookup(const spu_context* ctx, uint32_t lsa)
 {
+    /* SPU_INTERP_OVL=<ovl>[,<fotogramma>] (s.32): il modulo di job <ovl> gira
+     * TUTTO nell'interprete (spu_interp.c) dal fotogramma RSX indicato in poi:
+     * l'oracolo per il lifter (stessi helper, decodifica e ordine degli
+     * operandi indipendenti). Lento: solo per confronti. */
+    { static long s_io = -2, s_from = 0; if (s_io == -2) { const char* e = getenv("SPU_INTERP_OVL"); s_io = -1;
+          if (e) { char* c = 0; s_io = strtol(e, &c, 10); if (c && *c == ',') s_from = strtol(c + 1, 0, 10); } }
+      if (s_io >= 0 && ctx && ctx->resident_ovl == (int)s_io) { extern unsigned rsx_backend_frame_no(void);
+          if ((long)rsx_backend_frame_no() >= s_from) return (spu_lifted_fn)0; } }
     return (spu_lifted_fn)spu_lookup(lsa, ctx ? ctx->image_id : 0);
 }
 

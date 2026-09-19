@@ -2128,20 +2128,29 @@ class PPULifter:
             vd = int(ops[0][1:]) if ops[0].startswith("v") else _reg_idx(ops[0])
             ra = _reg_idx(ops[1])
             rb = _reg_idx(ops[2])
-            # These load a single element into the vector register.
-            # For simplicity, zero the register and load at the element position.
-            size = {"lvebx": 1, "lvehx": 2, "lvewx": 4}[mn]
-            return (f"{{ uint64_t ea = {_xea(ra,rb)}; "
-                    f"memset(&ctx->vr[{vd}], 0, 16); "
-                    f"memcpy(&ctx->vr[{vd}], vm_base + (uint32_t)ea, {size}); }}")
+            # Element loads: the element lands at its position in the
+            # quadword (EA & 0xF / & 0xE / & 0xC), the other elements are
+            # "undefined" -- and the PPE (like RPCS3's LVEWX) simply loads the
+            # whole aligned quadword. The old form zeroed the register and
+            # put the element at BYTE 0: Vectormath builds a Vector3 from
+            # floats with `lvewx` + `vspltw v,v,(EA&0xC)/4` (8.180 sites in
+            # Uncharted), so every scalar not at a 16-byte-aligned address
+            # came out as 0 (s.32: le matrici dei joint delle braccia e delle
+            # gambe, mesh schiacciate).
+            return (f"{{ uint64_t ea = ({_xea(ra,rb)}) & ~0xFULL; "
+                    f"memcpy(&ctx->vr[{vd}], vm_base + (uint32_t)ea, 16); }}")
 
         if mn == "stvebx" or mn == "stvehx" or mn == "stvewx":
             vs = int(ops[0][1:]) if ops[0].startswith("v") else _reg_idx(ops[0])
             ra = _reg_idx(ops[1])
             rb = _reg_idx(ops[2])
+            # Element stores: the element at position EA & 0xF/0xE/0xC of vS
+            # goes to EA aligned to the element size (the old form stored
+            # bytes 0..size of the register).
             size = {"stvebx": 1, "stvehx": 2, "stvewx": 4}[mn]
-            return (f"{{ uint64_t ea = {_xea(ra,rb)}; "
-                    f"memcpy(vm_base + (uint32_t)ea, &ctx->vr[{vs}], {size}); }}")
+            amask = {"stvebx": 0xF, "stvehx": 0xE, "stvewx": 0xC}[mn]
+            return (f"{{ uint64_t ea = ({_xea(ra,rb)}) & ~{(size - 1)}ULL; "
+                    f"memcpy(vm_base + (uint32_t)ea, (const uint8_t*)&ctx->vr[{vs}] + (ea & 0x{amask:X}), {size}); }}")
 
         if mn == "lvsl" or mn == "lvsr":
             vd = int(ops[0][1:]) if ops[0].startswith("v") else _reg_idx(ops[0])
@@ -2685,6 +2694,63 @@ class PPULifter:
             vd, va, vb = int(ops[0][1:]), int(ops[1][1:]), int(ops[2][1:])
             return (f"{{ uint32_t a[4],b[4],d[4]; ppu_vldu4(&ctx->vr[{va}],a); ppu_vldu4(&ctx->vr[{vb}],b); "
                     f"for(int i=0;i<4;i++) d[i]=a[i]>>(b[i]&31u); ppu_vstu4(&ctx->vr[{vd}],d); }}")
+        # Quadword shifts and the remaining halfword/byte shifts (s.32). Before
+        # this they were no-ops (TODO comments): vsl/vsr/vslo/vsro are the
+        # variable-shift idiom of Vectormath/compiler code, vrlh/vsrb/vslh
+        # the halfword ones, vpkuhum/vpkuwum the modulo packs, vsubcuw the
+        # borrow, vsum4sbs the byte sums, vrfip the ceil.
+        if mn in ("vslo", "vsro"):
+            vd = int(ops[0][1:]); va = int(ops[1][1:]); vb = int(ops[2][1:])
+            if mn == "vslo":
+                return (f"{{ const uint8_t* a=(const uint8_t*)&ctx->vr[{va}]; "
+                        f"unsigned sh=(((const uint8_t*)&ctx->vr[{vb}])[15]>>3)&0xFu; uint8_t t[16]; "
+                        f"for(int i=0;i<16;i++) t[i]=(i+sh<16)?a[i+sh]:0; memcpy(&ctx->vr[{vd}],t,16); }}")
+            return (f"{{ const uint8_t* a=(const uint8_t*)&ctx->vr[{va}]; "
+                    f"unsigned sh=(((const uint8_t*)&ctx->vr[{vb}])[15]>>3)&0xFu; uint8_t t[16]; "
+                    f"for(int i=0;i<16;i++) t[i]=((unsigned)i>=sh)?a[i-sh]:0; memcpy(&ctx->vr[{vd}],t,16); }}")
+        if mn in ("vsl", "vsr"):
+            vd = int(ops[0][1:]); va = int(ops[1][1:]); vb = int(ops[2][1:])
+            if mn == "vsl":
+                return (f"{{ const uint8_t* a=(const uint8_t*)&ctx->vr[{va}]; "
+                        f"unsigned sh=((const uint8_t*)&ctx->vr[{vb}])[15]&7u; uint8_t t[16]; "
+                        f"for(int i=0;i<16;i++) t[i]=(uint8_t)((a[i]<<sh)|((sh&&i<15)?(a[i+1]>>(8-sh)):0)); memcpy(&ctx->vr[{vd}],t,16); }}")
+            return (f"{{ const uint8_t* a=(const uint8_t*)&ctx->vr[{va}]; "
+                    f"unsigned sh=((const uint8_t*)&ctx->vr[{vb}])[15]&7u; uint8_t t[16]; "
+                    f"for(int i=0;i<16;i++) t[i]=(uint8_t)((a[i]>>sh)|((sh&&i>0)?(a[i-1]<<(8-sh)):0)); memcpy(&ctx->vr[{vd}],t,16); }}")
+        if mn in ("vrlh", "vslh", "vsrh", "vsrah"):
+            vd = int(ops[0][1:]); va = int(ops[1][1:]); vb = int(ops[2][1:])
+            expr = {"vrlh": "s?(uint16_t)((a[i]<<s)|(a[i]>>(16u-s))):a[i]",
+                    "vslh": "(uint16_t)(a[i]<<s)", "vsrh": "(uint16_t)(a[i]>>s)",
+                    "vsrah": "(uint16_t)((int16_t)a[i]>>s)"}[mn]
+            return (f"{{ uint16_t a[8],b[8],d[8]; ppu_vldu8h(&ctx->vr[{va}],a); ppu_vldu8h(&ctx->vr[{vb}],b); "
+                    f"for(int i=0;i<8;i++){{ unsigned s=b[i]&15u; d[i]={expr}; }} ppu_vstu8h(&ctx->vr[{vd}],d); }}")
+        if mn in ("vsrb", "vsrab"):
+            vd = int(ops[0][1:]); va = int(ops[1][1:]); vb = int(ops[2][1:])
+            expr = "(uint8_t)(a[i]>>s)" if mn == "vsrb" else "(uint8_t)((int8_t)a[i]>>s)"
+            return (f"{{ uint8_t* d=(uint8_t*)&ctx->vr[{vd}]; const uint8_t* a=(const uint8_t*)&ctx->vr[{va}]; "
+                    f"const uint8_t* b=(const uint8_t*)&ctx->vr[{vb}]; uint8_t t[16]; "
+                    f"for(int i=0;i<16;i++){{ unsigned s=b[i]&7u; t[i]={expr}; }} memcpy(d,t,16); }}")
+        if mn in ("vpkuhum", "vpkuwum"):
+            vd = int(ops[0][1:]); va = int(ops[1][1:]); vb = int(ops[2][1:])
+            if mn == "vpkuhum":
+                return (f"{{ uint16_t a[8],b[8]; uint8_t t[16]; ppu_vldu8h(&ctx->vr[{va}],a); ppu_vldu8h(&ctx->vr[{vb}],b); "
+                        f"for(int i=0;i<8;i++){{ t[i]=(uint8_t)a[i]; t[8+i]=(uint8_t)b[i]; }} memcpy(&ctx->vr[{vd}],t,16); }}")
+            return (f"{{ uint32_t a[4],b[4]; uint16_t t[8]; ppu_vldu4(&ctx->vr[{va}],a); ppu_vldu4(&ctx->vr[{vb}],b); "
+                    f"for(int i=0;i<4;i++){{ t[i]=(uint16_t)a[i]; t[4+i]=(uint16_t)b[i]; }} ppu_vstu8h(&ctx->vr[{vd}],t); }}")
+        if mn in ("vsubcuw", "vaddcuw"):
+            vd = int(ops[0][1:]); va = int(ops[1][1:]); vb = int(ops[2][1:])
+            expr = "(a[i]>=b[i])?1u:0u" if mn == "vsubcuw" else "((uint64_t)a[i]+b[i]>0xFFFFFFFFull)?1u:0u"
+            return (f"{{ uint32_t a[4],b[4],d[4]; ppu_vldu4(&ctx->vr[{va}],a); ppu_vldu4(&ctx->vr[{vb}],b); "
+                    f"for(int i=0;i<4;i++) d[i]={expr}; ppu_vstu4(&ctx->vr[{vd}],d); }}")
+        if mn == "vsum4sbs":
+            vd = int(ops[0][1:]); va = int(ops[1][1:]); vb = int(ops[2][1:])
+            return (f"{{ const int8_t* a=(const int8_t*)&ctx->vr[{va}]; uint32_t b[4],d[4]; ppu_vldu4(&ctx->vr[{vb}],b); "
+                    f"for(int i=0;i<4;i++){{ int64_t s=(int64_t)(int32_t)b[i]+a[4*i]+a[4*i+1]+a[4*i+2]+a[4*i+3]; "
+                    f"d[i]=(uint32_t)(int32_t)(s>0x7FFFFFFFLL?0x7FFFFFFFLL:s<-0x80000000LL?-0x80000000LL:s); }} ppu_vstu4(&ctx->vr[{vd}],d); }}")
+        if mn == "vrfip":
+            vd = int(ops[0][1:]); vb = int(ops[1][1:])
+            return (f"{{ float b[4],d[4]; ppu_vldf4(&ctx->vr[{vb}],b); "
+                    f"for(int i=0;i<4;i++) d[i]=ceilf(b[i]); ppu_vstf4(&ctx->vr[{vd}],d); }}")
         if mn == "vrlb":
             vd, va, vb = int(ops[0][1:]), int(ops[1][1:]), int(ops[2][1:])
             return (f"{{ uint8_t* d=(uint8_t*)&ctx->vr[{vd}]; uint8_t* a=(uint8_t*)&ctx->vr[{va}]; "
