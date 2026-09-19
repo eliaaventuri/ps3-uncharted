@@ -125,6 +125,18 @@ un puntatore nullo letto dai propri dati, e la scena 3D non si vede ancora
 finestra (frecce, Spazio/X = CROSS, C = CERCHIO, Invio = START); `PAD_SCRIPT`
 per le corse senza nessuno. Dettagli in "Sessione 27".
 
+**Dalla sessione 37 il livello gira a 13-14,5 fps** (era 10,7-11,9 sulla
+stessa finestra di orologio): `cellGcmSetWaitFlip` bloccava il PPU fino al
+flip (64 ms di tetto), ma sul ferro e' un'attesa per la RSX dentro la FIFO e
+il PPU non si ferma. Bloccandolo, la fase PPU (31 ms) e quella del walker
+(46-57 ms) andavano in fila; ora si sovrappongono e il gioco si sincronizza
+da solo sul registro ref (`GCM_WAITFLIP_BLOCK=0` in `run.sh`). Il flip che
+il walker raggiunge ma il tick non fa in tempo a chiudere si chiude alla
+richiesta successiva (stato DONE + gestore). La via in linea degli accessi
+alla memoria del PPU liftato e' fatta (`PPU_VM_INLINE` in `ppu_recomp.h`)
+ma misurata neutra: il PPU non e' sul cammino critico. Screenshot
+`docs/img_s37_dive_boat_waitflip_nb.jpg`. Dettagli in "Sessione 37".
+
 **Dalla sessione 36 il livello gira a 10,4-10,6 fps** (era 8,0-8,6): via il
 ramo delle sonde negli accessi alla LS (il compilatore scaricava tutti i
 registri a ogni accesso), FPCR delle lane come la SPU (denormali a zero,
@@ -467,6 +479,104 @@ La lista dei comandi ora viene percorsa fino in fondo — sei coppie
 risultati in memoria principale.** Non era mai successo in nessuna sessione.
 Riproducibile: **tre corse su tre**, identiche -- 14 comandi, un overlay
 residente, zero microstep, cinque stall e due interrupt per corsa.
+
+## Sessione 37 — cellGcmSetWaitFlip non blocca piu' il PPU: 10,7-11,9 -> 13-14,5 fps; via in linea degli accessi PPU (neutra)
+
+**Misura nuova, prima di tutto.** La finestra f#2300-2500 non e' piu'
+confrontabile fra corse a fps diversi (f#2300 cade in un momento di gioco
+diverso). Ora si usa la mediana del tempo per fotogramma nei blocchi
+`RSX_FRAMESTAT=50` fra 100 e 190 s di orologio dal primo fotogramma
+(`scratchpad/misura/fpsmed.sh <log>`); il gioco avanza a tempo reale,
+quindi la finestra copre lo stesso contenuto. Rumore fra corse identiche:
++-0,5 fps (A1/A2 del binario s.36: 11,9/10,9). Gli altri script in
+`scratchpad/misura/`: `fps.sh` (finestra f#), `fpswall.sh`, `tl.py`/`tl2.py`/
+`tl3.py` (timeline `GCM_TIMELINE`: attesa del flip, fase PPU, put->put),
+`runshots.sh` (corsa con screenshot a 95/110/125 s), `prof2.sh` (`sample` a
+100 s). `winid.swift` sta in `scratchpad/`, non in `tools/`.
+
+**1. Via in linea degli accessi alla memoria guest del PPU (fatta, neutra).**
+`tools/ppu_lifter.py`: i sorgenti liftati definiscono `PPU_VM_INLINE` e il
+header generato (`ppu_recomp.h`) definisce `vm_read8/16/32/64` e
+`vm_write*` come `static inline` (solo `__GNUC__`; MSVC e il runtime vedono
+le dichiarazioni di prima): limiti (`ua <= ppu_vm_size - n`, che con
+`ppu_vm_size == 0` di Win32 manda fuori linea solo gli ultimi n byte),
+poll del registro ref (`ppu_hle_inject_base + 0x2008` -> fuori linea),
+rilevatore di spin (`g_vm_spin` globale, a 4096 letture uguali -> fuori
+linea, che pompa i gestori), `put` (`g_gcm_put_watch_addr` -> fuori linea),
+poi `memcpy` + `bswap`. Tutto il resto passa da `vm_*_ool` in
+`ppu_loader.cpp` (che chiamano le funzioni di prima; `g_vm_fast` e
+`g_vm_spin` ora esportati). Lift nuovo identico al vecchio a meno del
+preambolo (1 riga per chunk + header); istruzioni host per chunk
+raddoppiate (2,4M -> 4,9M nel chunk 003); build -O2 2:48. **A/B a parita'
+di tutto il resto (modalita' bloccante): s.36 11,9/10,9 fps mediani, in
+linea 11,4/11,4 -- neutra.** Il profilo spiega perche': il thread PPU
+principale sta il 38% del tempo a lavorare e il 62% in `cellGcmSetWaitFlip`
+-> `nanosleep` (era il punto 1 del fronte s.36: sbagliato, il PPU non era
+il collo). Tenuta perche' corretta e gratuita; `PS3_VM_FAST=0` la spegne
+(tutto fuori linea). Backup: `uncharted-data/recomp.bak_s36`,
+`obj/o2_s36_backup/` (con il binario `uncharted` s.36).
+
+**2. Il vero collo: cellGcmSetWaitFlip bloccava il PPU.** Timeline
+(`GCM_TIMELINE`, `tl.py`) a f#2300+: fotogramma 89 ms = attesa del flip 57
+ms (put -> waitflip-out; il tetto di 64 ms scattava in 22 casi su 672) +
+fase PPU 31 ms (waitflip-out -> put successivo); il walker finiva a 46 ms
+dal put, il flip si chiudeva al tick dopo il present (+11 ms). Cioe' PPU e
+walker IN FILA. Sul ferro `cellGcmSetWaitFlip` scrive nella FIFO un'attesa
+per la RSX (niente comandi dopo finche' il flip non e' avvenuto) e torna
+subito; il PPU aspetta altrove (Uncharted: sul registro ref, `[WAIT]`).
+Il commento in `cellGcmSys.c` diceva che Uncharted la chiama una volta
+sola al boot (s.32): falso nel livello, la chiama a OGNI fotogramma subito
+dopo il put (2.964 volte in 130 s). Con `GCM_WAITFLIP_MS=1` (prova):
+14,6 fps a f#2300-2500, immagine giusta. Fatto bene: `GCM_WAITFLIP_BLOCK=0`
+(nuovo, `run.sh`; il default nel codice resta il blocco per gli altri
+titoli, che ci contano per il ritmo) -> `cellGcmSetWaitFlip` torna subito
+senza toccare lo stato del flip (evento `waitflip-nb`).
+
+**3. Il flip perso.** Senza il blocco, il titolo chiede il flip N+1 200 us
+dopo che il walker ha raggiunto il put di N (`walk` -> `put`: 0,2 ms), prima
+del tick (16 ms) che avrebbe chiuso il flip N; `cellGcmSetFlipCommand`
+azzerava `s_flip_reached` e il flip N spariva: **0 `flip-done` in 200
+fotogrammi**, stato WAITING per sempre, gestore del flip mai chiamato (il
+gioco andava lo stesso, 14,45 fps mediani, ma non e' il ferro). Ora in
+`cellGcmSetFlipCommand`: se il flip precedente e' stato raggiunto dal
+walker ed e' ancora WAITING, si chiude li' (`flip-done-late`: stessa
+attesa della GPU del tick, stato DONE prima del WAITING nuovo, gestore
+subito con `ppu_gcm_pump()`; bit 4 della pompa = solo gestore, senza
+toccare lo stato). 200 `flip-done-late` su 200 fotogrammi. Costa ~1 fps
+(13,7/13,2 contro 14,45 senza; `GCM_FLIP_LATE=0` per l'A/B), i draw per
+fotogramma sono gli stessi (~1.800): la differenza non e' spiegata, forse
+rumore + le morti (3 in nb1 e nb3, 0 in nb2).
+
+**Risultato: 13,2-13,7 fps mediani (100-190 s) contro 10,7-11,9; 4 corse
+da 200 s senza stallo ne' assert (nb1-3 + wf1), morti seguite dal
+checkpoint, immagine identica alla s.36** (`docs/img_s37_dive_boat_
+waitflip_nb.jpg`; il fotogramma scuro a 110 s in nb1 era Drake quasi
+morto, l'effetto di salute bassa del gioco). Per fotogramma ora: put ->
+walk 65-78 ms, walk -> put 0,2 ms: **il fotogramma e' il walker che aspetta
+i job SPU** (12 park), con il PPU in parallelo (spin sulla job list
+`func_0074232C`, 38%).
+
+**Profilo di oggi (`sample`, livello):** thread kernel SPURS 56% occupato,
+6 lane 37-42%, PPU principale 38%, ticker 32% (24% walker + 8% present):
+nessuno saturo. Il simbolo piu' caldo di tutti e' `jobmod_008dc900_..._
+spu_func_00010300` (job 215, blocchi 0x10300-0x12100, il ciclo caldo di
+0x11298 della s.34): 810 campioni contro 226 del secondo. 348 `spu_ls_
+read128` + 191 write + 183 `shufb` + 165 `selb` in 2.077 righe.
+
+### Fronte aperto (dopo la sessione 37)
+
+1. Velocita' (13-14 fps): il fotogramma e' il walker che aspetta i job SPU
+   del wid 12 (215/218) -- nessun thread saturo, quindi e' LATENZA della
+   catena PPU -> kernel SPURS -> lane -> walker, non throughput. Da
+   guardare: (a) il thread kernel SPURS al 56%, che esegue anche i job sul
+   proprio thread (`spu_run_policy_module` -> `jobmod_008dc900`), (b) i
+   park del walker (12 per fotogramma: quanto aspetta ognuno, e se il job
+   che sblocca era gia' in coda), (c) `spu_func_00010300` del job 215
+   (cache dei registri con analisi di flusso, o u128 in ordine SPU).
+2. Perche' chiudere il flip (gestore + DONE) costa ~1 fps rispetto a non
+   chiuderlo mai: cosa fa il gestore del flip del titolo.
+3. Giocare oltre il checkpoint (Elia con la tastiera, o `PAD_SCRIPT`).
+4. `RING_GUARD_LANES` 5, death4 (mai piu' visto).
 
 ## Sessione 36 — barriere di memoria nel lifter PPU; ShutdownWorkload/WaitForWorkloadShutdown veri
 

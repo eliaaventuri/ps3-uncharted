@@ -60,7 +60,8 @@ tools/gen_hle_nids.py        genera la tabella NID per il port (--all)
 tools/check_ppu_scaffold.py  ratchet del boot
 tools/spu_disasm.py, ppu_disasm.py  disassemblatori
 tools/gen_spu_neon_tables.py  genera runtime/spu/spu_neon_tables.h
-tools/winid.swift            id della finestra del port per screencapture -l (CGWindowList .optionAll)
+scratchpad/winid.swift       id della finestra del port per screencapture -l (CGWindowList .optionAll)
+scratchpad/misura/           fps.sh/fpsmed.sh (fps da RSX_FRAMESTAT), tl*.py (timeline GCM_TIMELINE), runshots.sh, prof2.sh (s.37)
 tools/lldb_guest_bp.py       breakpoint lldb sui func_XXXX del port vivo (r3-r5, f1, catena)
 tools/stallcatch.sh          corsa Uncharted che campiona il processo se il caricamento si ferma
 tests/                       torture e conformance del runtime

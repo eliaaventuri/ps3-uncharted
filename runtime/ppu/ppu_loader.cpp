@@ -763,7 +763,7 @@ extern "C" {
  * salta tutto e restano solo le cose con effetto: il controllo dei limiti,
  * il poll del registro ref (GCM_REFPOLL), la pompa dei gestori vblank/flip
  * quando il PPU gira in uno spin di letture, la scrittura di `put`. */
-static int g_vm_fast = -1;
+extern "C" int g_vm_fast = -1;   /* letto anche dalla via in linea dei sorgenti liftati (ppu_recomp.h) */
 static int vm_fast_init(void)
 {
     extern char** environ;
@@ -779,7 +779,8 @@ static int vm_fast_init(void)
  * letture ripetute) e un accesso TLS per lettura (_tlv_get_addr) costava piu'
  * della lettura stessa. Una corsa fra thread al peggio pompa un po' prima. */
 struct vm_spin_tls { uint32_t last, n; };
-static vm_spin_tls g_vm_spin;
+extern "C" vm_spin_tls g_vm_spin;
+vm_spin_tls g_vm_spin;
 uint8_t  vm_read8 (uint64_t a) { if (__builtin_expect(g_vm_fast > 0, 1)) { const uint32_t ua = (uint32_t)a; return vm_oob(ua, 1) ? 0 : vm_base[ua]; }
     if (g_vm_fast < 0) g_vm_fast = vm_fast_init();
     if (vm_oob((uint32_t)a,1)) return 0; vm_hotmap((uint32_t)a,1);
@@ -1548,6 +1549,20 @@ void vm_write64(uint64_t a, uint64_t v) {
         } } } }
     v = __builtin_bswap64(v); memcpy(vm_base + (uint32_t)a, &v, 8); }
 }
+
+/* Punti d'ingresso fuori linea per la via in linea dei sorgenti liftati
+ * (ppu_recomp.h con PPU_VM_INLINE, s.37): li' vm_read32 & co. sono static
+ * inline e chiamano questi per tutto cio' che non fanno da soli -- la via
+ * lenta con le sonde, l'inizializzazione di g_vm_fast, gli accessi fuori dai
+ * limiti, il poll del registro ref, la pompa dei gestori sugli spin, `put`. */
+extern "C" uint8_t  vm_read8_ool (uint64_t a) { return vm_read8(a); }
+extern "C" uint16_t vm_read16_ool(uint64_t a) { return vm_read16(a); }
+extern "C" uint32_t vm_read32_ool(uint64_t a) { return vm_read32(a); }
+extern "C" uint64_t vm_read64_ool(uint64_t a) { return vm_read64(a); }
+extern "C" void vm_write8_ool (uint64_t a, uint8_t  v) { vm_write8(a, v); }
+extern "C" void vm_write16_ool(uint64_t a, uint16_t v) { vm_write16(a, v); }
+extern "C" void vm_write32_ool(uint64_t a, uint32_t v) { vm_write32(a, v); }
+extern "C" void vm_write64_ool(uint64_t a, uint64_t v) { vm_write64(a, v); }
 
 /* ---- malloc allocation tracker (FLOW_ALLOCTAG) -------------------------------
  * Records recent guest malloc results {ptr,size,lr,id} in a ring so we can ask,

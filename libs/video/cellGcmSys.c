@@ -533,6 +533,20 @@ static void gcm_tl(const char* ev, unsigned a, unsigned b)
 }
 void cellGcmSetWaitFlip(void)
 {
+    /* GCM_WAITFLIP_BLOCK=0 (s.37): semantica del ferro. La cellGcmSetWaitFlip
+     * vera mette nella FIFO un'attesa per la RSX (niente comandi del
+     * fotogramma dopo finche' il flip non e' avvenuto) e torna subito: il
+     * PPU non si ferma e lo stato del flip lo chiude solo cellGcmTickFlip.
+     * Il lato FIFO qui lo copre gia' il ticker (present prima del drain
+     * successivo). Uncharted la chiama a OGNI fotogramma subito dopo il put:
+     * bloccare il PPU metteva in fila la sua fase (31 ms) e quella del
+     * walker (46-57 ms) invece di sovrapporle -- il gioco si sincronizza da
+     * solo sul registro ref prima del put successivo. Con il blocco: 10,3
+     * fps; senza: 14,6 (f#2300-2500). Il default resta il blocco (gli altri
+     * titoli ci contano per il ritmo, v. sotto); run.sh di Uncharted mette 0. */
+    { static int s_blk = -1;
+      if (s_blk < 0) { const char* e = getenv("GCM_WAITFLIP_BLOCK"); s_blk = (e && *e == '0') ? 0 : 1; }   /* GCM_WAITFLIP_BLOCK=0: cellGcmSetWaitFlip non blocca il PPU (semantica del ferro; Uncharted: 10,7 -> 13,5 fps) */
+      if (!s_blk) { gcm_tl("waitflip-nb", s_flip_status, 0); return; } }
     /* Block until the pending flip completes (the present thread marks it done
      * via cellGcmTickFlip, ~once per display refresh). This throttles the title
      * to vsync; without it the guest loops unthrottled and many frames batch
@@ -656,8 +670,8 @@ void ppu_gcm_pump(void)
         g_ps3_guest_caller(s_vblank_handler_opd, (uint64_t)s_vblank_count,
                            0, 0, 0, 0, 0, 0, 0);
     }
-    if (p & 2) {
-        s_flip_status = CELL_GCM_FLIP_STATUS_DONE;
+    if (p & 2) s_flip_status = CELL_GCM_FLIP_STATUS_DONE;
+    if (p & 6) {   /* 4: solo il gestore (flip chiuso in cellGcmSetFlipCommand, s.37) */
         if (s_flip_handler_opd && g_ps3_guest_caller) {
             ydkj_restore_handler_opd(s_flip_handler_opd, s_flip_handler_code);
             g_ps3_guest_caller(s_flip_handler_opd, 1, 0, 0, 0, 0, 0, 0, 0);
@@ -2558,6 +2572,30 @@ s32 cellGcmSetFlipCommand(u32 bufferId)
     s_current_display_buffer_id = bufferId;
     /* Flip requested but not yet shown: a subsequent cellGcmSetWaitFlip blocks
      * until the present thread's cellGcmTickFlip marks it done (vsync). */
+    /* s.37: senza il blocco del PPU in cellGcmSetWaitFlip (GCM_WAITFLIP_BLOCK=0)
+     * Uncharted chiede il flip N+1 200 us dopo che il walker ha raggiunto il
+     * put di N -- prima del tick (16 ms) che avrebbe chiuso il flip N -- e
+     * l'azzeramento di s_flip_reached qui sotto lo perdeva: stato WAITING per
+     * sempre, gestore del flip mai chiamato (misurato: 0 flip-done in 200
+     * fotogrammi). La RSX vera l'ha eseguito arrivando al put: lo si chiude
+     * qui, stato DONE subito (prima del WAITING del flip nuovo) e gestore
+     * dalla pompa (bit 4: solo il gestore, senza toccare lo stato). Stessa
+     * attesa della GPU del tick (i report delle occlusion query). */
+    { static int s_late = -1; if (s_late < 0) { const char* e = getenv("GCM_FLIP_LATE"); s_late = (e && *e == '0') ? 0 : 1; }   /* GCM_FLIP_LATE=0: solo per l'A/B */
+    if (s_late && s_flip_reached && s_flip_status == CELL_GCM_FLIP_STATUS_WAITING) {
+#ifdef __APPLE__
+        { extern int rsx_metal_backend_gpu_wait(unsigned); rsx_metal_backend_gpu_wait(8000); }
+#endif
+        gcm_tl("flip-done-late", 0, 0);
+        s_flip_status = CELL_GCM_FLIP_STATUS_DONE;
+        GCM_PENDING_SET(4);
+        /* Gestore subito, non alla prossima pompa: siamo su un thread PPU
+         * dentro un import, lo stesso contesto della pompa. Se il titolo
+         * aspetta il proprio contatore dei flip (avanzato dal gestore), la
+         * pompa rimandata lo faceva girare a vuoto: 12,0 fps con la pompa
+         * rimandata (nb2) contro 14,4 senza alcun gestore (nb1). */
+        ppu_gcm_pump();
+    } }
     s_flip_reached = s_flip_from_fifo; s_flip_from_fifo = 0;
     /* Flip HLE: se il walker ha gia' consumato tutto fino a `put` (il drain
      * sincrono sulla scrittura di put lo porta li' 300 us PRIMA di questa
