@@ -597,6 +597,17 @@ trampolino per blocco con due accessi thread-local, `spu_ls_read128` con
 controlli) e ridurre la latenza di dispatch del PM (6.118 corse per ~330
 job: ~20 passate a vuoto per job). E' un lavoro lungo, non una correzione.
 
+**CI locale (`.github/workflows/macos.yml`) rimessa in verde.** Il test di
+boot POSIX (`tools/test_boot_posix.py`) non linkava piu': l'archivio del
+runtime contiene il backend Metal (Objective-C, ARC) e da s.32 il runtime
+SPU ne legge il contatore di fotogrammi, quindi servono `-framework
+Foundation/AppKit/Metal/QuartzCore -lobjc`. Il controllo `ps3recomp_host
+--fp` falliva ("MISMATCH", rosso invece di verde) da s.28: la compilazione
+asincrona dei fragment program lasciava al test la coppia incorporata; in
+headless ora la compilazione e' sincrona. Ratchet dello scaffold, 63 test
+degli helper SPU, 1311 controlli di conformita' PPU, tutti i `tools/test_*`:
+verdi.
+
 ### Fronte aperto (dopo la sessione 33)
 
 1. Confrontare il fotogramma con RPCS3 (`docs/img_s31_rpcs3_dive_boat.jpg`):

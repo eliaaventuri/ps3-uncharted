@@ -67,6 +67,11 @@ def main():
             # ppu_hle.cpp references the flOw port's weak SPURS hook; Mach-O
             # needs the undefined symbol declared at link time, ELF does not.
             cmd += ["-Wl,-U,_flow_spurs_kernel_spawn_postinit"]
+            # The runtime archive carries the Metal backend (Objective-C, ARC):
+            # once anything in the link references it (the SPU runtime reads the
+            # RSX frame counter for its traces, s.32/33) the ObjC runtime and
+            # the frameworks must be on the link line.
+            cmd += ["-framework", "Foundation", "-framework", "AppKit", "-framework", "Metal", "-framework", "QuartzCore", "-lobjc"]
         for inc in INCLUDES:
             cmd += ["-I", os.path.join(ROOT, inc)]
         cmd += ["-I", recomp, "-isystem", "/opt/homebrew/include"]

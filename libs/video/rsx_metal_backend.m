@@ -1988,7 +1988,11 @@ static id<MTLLibrary> guest_fp_library(u32 fp_addr, int vp, u32 ctrl, u32 mrt, u
              * draw intanto usano la coppia incorporata, e appena la
              * compilazione finisce i draw seguenti trovano il programma.
              * RSX_FP_SYNC=1 ripristina la compilazione sincrona. */
-            static int s_sync = -1; if (s_sync < 0) s_sync = getenv("RSX_FP_SYNC") ? 1 : 0;
+            /* In headless (i test del host: --fp, --fp-tex) la compilazione
+             * resta sincrona: il test presenta un solo fotogramma e leggeva
+             * il colore della coppia incorporata (rosso) invece del programma
+             * del guest (verde) -- "MISMATCH" da s.28 (s.33). */
+            static int s_sync = -1; if (s_sync < 0) s_sync = (getenv("RSX_FP_SYNC") || s_headless) ? 1 : 0;
             if (s_sync) {
                 lib = [s_dev newLibraryWithSource:src options:co error:&err];
                 if (!lib && vp >= 0) {
