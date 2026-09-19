@@ -514,6 +514,40 @@ Strumenti nuovi, tutti a costo zero se spenti:
   `SPU_LIST_DUMP=lo:hi` + `SPU_LIST_DUMP_FROM`; `SPU_PALETTE_CHECK` ora
   esamina ogni matrice delle GET multiple di 0x30 e stampa il fotogramma.
 
+**La catena di post-processing leggeva i quadranti come memoria vuota
+(RISOLTO).** Dopo il pass HDR Uncharted lavora dentro 031E0000 (640x360
+RGBA16F) per quadranti: scrive il downsample in alto a destra (scissor
+320,0) e lo rilegge come texture "320x180 @ 031E0A00" (= base + 320 px), poi
+"@ 032C1000" (= base + 180 righe) per il bloom sfocato che entra nella
+composizione finale (A310E8C2: tex0 HDR, tex1 quadrante, tex2 160x90
+031B0000, tex3 depth). L'offset non era la base di nessuna superficie: la
+ricerca falliva, si decodificava la memoria guest (vuota) e 03120000 ->
+03EB/03EC/03ED0000 -> 00030000 (log-luminanza media 1x1) e 03150000/
+03180000/031B0000 (bloom) restavano neri. Ora `surface_subview_lookup`
+riconosce un offset DENTRO una superficie (stride = larghezza x byte per
+texel), tiene una texture della misura chiesta e la riempie con una blit dal
+quadrante prima del pass che la campiona (`subview_refresh`, nell'encode
+accanto al refresh delle copie del depth). Con `RSX_FRAMEDBG=1` si vede
+"texture 320x180 @031E0A00 = superficie 031E0000 + (320,0)". Nota: la
+log-luminanza 1x1 (00030000, fmt 14D) non la legge nessuno (ne' PPU, ne'
+SPU, ne' RSX, ne' NV0039: `YDKJ_PAGEWATCH=C0030000 YDKJ_PAGEWATCH_READ=1`,
+`SPU_DMA_EAWIN`, `GCM_NV0039_TRACE`, `GCM2D_TRACE` tutti muti) — il titolo
+usa solo NV0039 fra i metodi 2D. `[drawlist]` ora marca `MAIN` le superfici
+con DMA context 0xFEED0001 (`NV4097_SET_CONTEXT_DMA_COLOR_A` decodificato;
+nel livello nessuna).
+
+**Confronto con RPCS3 (`docs/img_s31_rpcs3_dive_boat.jpg`).** La nostra
+scena e' piu' satura e luminosa (cielo azzurro, mare blu) dove RPCS3 e'
+grigia e velata; la scena vera del gioco e' soleggiata, quindi non e' detto
+che l'oracolo abbia ragione qui. I "blob bianchi" sono sprite TRANSITORI
+(vampe/schizzi: nel fotogramma della sonda c32 non ci sono e la scia della
+barca a destra e' corretta); 6852BBAF e' il materiale del mare
+(`RSX_FP_PROBE`), 7D51FF19 piccoli sprite sul ponte. Le texture DXT5
+256x256 del livello sono normal map (G, A) e si decodificano bene
+(`RSX_TEX_SAVE` ora salva anche l'alpha in `_a.pgm`; `RSX_TEX_SAVE_FROM`).
+L'icona della pistola nell'HUD non e' disegnata (2 soli draw sul display:
+composizione + "40"): probabilmente uno stato dell'HUD, non un difetto.
+
 ### Fronte aperto (dopo la sessione 33)
 
 1. Confrontare il fotogramma con RPCS3 (`docs/img_s31_rpcs3_dive_boat.jpg`):

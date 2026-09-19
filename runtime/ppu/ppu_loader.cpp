@@ -148,34 +148,47 @@ static struct sigaction s_prev_segv, s_prev_bus;
 #include <execinfo.h>
 #include <unistd.h>
 static uint8_t* s_pw_page = 0; static size_t s_pw_len = 0; static volatile int s_pw_armed = 0; static long s_pw_from = 0;
+static int s_pw_read = 0;   /* YDKJ_PAGEWATCH_READ=1: anche le LETTURE (PROT_NONE), riarmata a ogni write32 del PPU */
 static void pw_init(void) { static int done = 0; if (done) return; done = 1;
     const char* e = getenv("YDKJ_PAGEWATCH"); if (!e || !*e || !vm_base) return;
     uint32_t ea = (uint32_t)strtoul(e, 0, 16); size_t pg = (size_t)sysconf(_SC_PAGESIZE);
     s_pw_page = (uint8_t*)(((uintptr_t)(vm_base + ea)) & ~(pg - 1)); s_pw_len = pg;
     const char* f = getenv("YDKJ_PAGEWATCH_FROM"); s_pw_from = f ? atol(f) : 0;
+    s_pw_read = getenv("YDKJ_PAGEWATCH_READ") ? 1 : 0;
     fprintf(stderr, "[pagewatch] ea=%08X pagina host %p (+0x%zX) da f#%ld\n", ea, (void*)s_pw_page, s_pw_len, s_pw_from); }
 extern "C" unsigned rsx_backend_frame_no(void);
 static inline int pw_in(uint32_t ea) { return s_pw_page && vm_base + ea >= s_pw_page && vm_base + ea < s_pw_page + s_pw_len; }
 /* prima/dopo uno store scalare del PPU nella pagina */
 static inline void pw_open(void) { if (s_pw_armed) mprotect(s_pw_page, s_pw_len, PROT_READ | PROT_WRITE); }
 static inline void pw_close(void) {
-    if (s_pw_armed) { mprotect(s_pw_page, s_pw_len, PROT_READ); return; }
-    if ((long)rsx_backend_frame_no() >= s_pw_from) { s_pw_armed = 1; mprotect(s_pw_page, s_pw_len, PROT_READ); } }
+    if (s_pw_armed) { mprotect(s_pw_page, s_pw_len, s_pw_read ? PROT_NONE : PROT_READ); return; }
+    if ((long)rsx_backend_frame_no() >= s_pw_from) { s_pw_armed = 1; mprotect(s_pw_page, s_pw_len, s_pw_read ? PROT_NONE : PROT_READ); } }
+/* in modalita' lettura la pagina si riarma a ogni write32 del PPU, ovunque */
+static inline void pw_rearm_any(void) { if (s_pw_read && s_pw_page && !s_pw_armed && (long)rsx_backend_frame_no() >= s_pw_from) { s_pw_armed = 1; mprotect(s_pw_page, s_pw_len, PROT_NONE); } }
 static int pw_fault(uintptr_t at, void* uctx) {
-    if (!s_pw_page || !s_pw_armed || at < (uintptr_t)s_pw_page || at >= (uintptr_t)s_pw_page + s_pw_len) return 0;
-    s_pw_armed = 0; mprotect(s_pw_page, s_pw_len, PROT_READ | PROT_WRITE);
-    static int _n = 0; if (_n++ >= 60) return 1;
-    uintptr_t pc = 0;
+    if (!s_pw_page || at < (uintptr_t)s_pw_page || at >= (uintptr_t)s_pw_page + s_pw_len) return 0;
+    /* anche se un altro thread ha gia' disarmato (due fault insieme): la
+     * pagina va comunque riaperta, altrimenti il secondo e' un crash vero */
+    int was = s_pw_armed; s_pw_armed = 0; mprotect(s_pw_page, s_pw_len, PROT_READ | PROT_WRITE);
+    static int _n = 0; if (!was || _n++ >= 60) return 1;
+    uintptr_t pc = 0, fp = 0, lr = 0;
 #if defined(__APPLE__) && defined(__aarch64__)
     pc = (uintptr_t)((ucontext_t*)uctx)->uc_mcontext->__ss.__pc;
+    fp = (uintptr_t)((ucontext_t*)uctx)->uc_mcontext->__ss.__fp;
+    lr = (uintptr_t)((ucontext_t*)uctx)->uc_mcontext->__ss.__lr;
 #endif
-    char buf[1400]; int p = snprintf(buf, sizeof buf, "[pagewatch] f#%u scrittura a guest %08X da pc=%p", rsx_backend_frame_no(), (uint32_t)(at - (uintptr_t)vm_base), (void*)pc);
-    { Dl_info di; if (pc && dladdr((void*)pc, &di) && di.dli_sname) p += snprintf(buf + p, sizeof buf - p, " (%s+0x%lx)", di.dli_sname, (unsigned long)(pc - (uintptr_t)di.dli_saddr)); }
-    { uint32_t g = ppu_prof_resolve_host((void*)pc); if (g) p += snprintf(buf + p, sizeof buf - p, " guest-fn=%08X", g); }
-    void* bt[16]; int fr = backtrace(bt, 16);
-    for (int i = 0; i < fr && p < (int)sizeof buf - 80; i++) { uint32_t g = ppu_prof_resolve_host(bt[i]); Dl_info di;
-        if (g) p += snprintf(buf + p, sizeof buf - p, " <%08X>", g);
-        else if (dladdr(bt[i], &di) && di.dli_sname) p += snprintf(buf + p, sizeof buf - p, " <%s>", di.dli_sname); }
+    char buf[1400]; int p = snprintf(buf, sizeof buf, "[pagewatch] f#%u accesso a guest %08X da pc=%p", rsx_backend_frame_no(), (uint32_t)(at - (uintptr_t)vm_base), (void*)pc);
+    { Dl_info di; if (pc && dladdr((void*)pc, &di) && di.dli_sname) p += snprintf(buf + p, sizeof buf - p, " (%s)", di.dli_sname); }
+    /* catena dei frame dal contesto del fault (backtrace() dentro il gestore
+     * vede solo se stesso): lr, poi [fp+8] risalendo i frame */
+    uintptr_t ra = lr;
+    for (int i = 0; i < 14 && ra && p < (int)sizeof buf - 90; i++) {
+        uint32_t g = ppu_prof_resolve_host((void*)ra); Dl_info di;
+        if (g && g < 0x01000000u) p += snprintf(buf + p, sizeof buf - p, " <%08X>", g);
+        else if (dladdr((void*)ra, &di) && di.dli_sname) p += snprintf(buf + p, sizeof buf - p, " <%s>", di.dli_sname);
+        else p += snprintf(buf + p, sizeof buf - p, " <%p>", (void*)ra);
+        if (!fp || (fp & 7)) break;
+        uintptr_t nfp = *(uintptr_t*)fp; ra = *(uintptr_t*)(fp + 8); if (nfp <= fp) break; fp = nfp; }
     p += snprintf(buf + p, sizeof buf - p, "\n"); (void)!write(2, buf, (size_t)p); return 1; }
 
 /* Async-signal-safe enough: format into a static buffer, write(2) it out. */
@@ -1353,8 +1366,12 @@ void vm_write32(uint64_t a, uint32_t v) { barrier_watch_hit((uint32_t)a, v, 4, _
     v = __builtin_bswap32(v);
 #ifndef _WIN32
     if (pw_in((uint32_t)a)) { pw_open(); memcpy(vm_base + (uint32_t)a, &v, 4); pw_close(); } else
+    { pw_rearm_any();
 #endif
     memcpy(vm_base + (uint32_t)a, &v, 4);
+#ifndef _WIN32
+    }
+#endif
     /* La RSX vera comincia a consumare nell'istante in cui `put` si muove.
      * Drenare su un timer lascia una finestra in cui il titolo riempie il
      * segmento successivo mentre il walker e' ancora dentro il precedente --

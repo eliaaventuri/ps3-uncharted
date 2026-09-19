@@ -127,6 +127,9 @@ static int process_surface_method(rsx_state* state, u32 method, u32 data)
         state->surface_clip_h = (data >> 16) & 0xFFFF;
         state->surface_dirty = 1;
         return 0;
+    case NV4097_SET_CONTEXT_DMA_COLOR_A:
+        state->context_dma_color = data;
+        return 0;
     case NV4097_SET_SURFACE_COLOR_AOFFSET:
         state->surface_color_offset[0] = data;
         { static int _s = -1; if (_s < 0) _s = getenv("SURFDBG") ? 1 : 0;

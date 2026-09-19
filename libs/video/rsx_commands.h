@@ -45,6 +45,7 @@ extern "C" {
 #define NV4097_SET_SURFACE_CLIP_VERTICAL       0x00000204
 #define NV4097_SET_SURFACE_FORMAT              0x00000208
 #define NV4097_SET_SURFACE_PITCH_A             0x0000020C
+#define NV4097_SET_CONTEXT_DMA_COLOR_A         0x00000194
 #define NV4097_SET_SURFACE_COLOR_AOFFSET       0x00000210
 #define NV4097_SET_SURFACE_ZETA_OFFSET         0x00000214
 #define NV4097_SET_SURFACE_COLOR_BOFFSET       0x00000218
@@ -208,6 +209,7 @@ typedef struct rsx_state {
     u32 surface_clip_x, surface_clip_y;
     u32 surface_clip_w, surface_clip_h;
     u32 color_target;
+    u32 context_dma_color;   /* 0x0194: 0xFEED0000 = locale (VRAM), 0xFEED0001 = memoria principale (s.33) */
 
     /* Viewport */
     u32 viewport_x, viewport_y, viewport_w, viewport_h;

@@ -95,6 +95,7 @@ typedef struct {
     u32 surf2, surf3;              /* SURFACE_COLOR_C/DOFFSET */
     u32 n_mrt;                     /* bersagli di colore attivi (SET_SURFACE_COLOR_TARGET): 1..4 */
     u32 surf_fmt, color_target, surf_pitch0, surf1; /* SURFACE_FORMAT, COLOR_TARGET, pitch A, offset B */
+    u32 dma_color;                                  /* CONTEXT_DMA_COLOR_A (s.33): 0xFEED0001 = memoria principale */
     /* Vertex program del guest (sessione 27): indice in s_vps o -1 (percorso
      * incorporato: costanti 0..3 come MVP). vbase/vstride = dove stanno gli
      * attributi letti dal programma in s_vpd; cblock = blocco di costanti. */
@@ -861,7 +862,7 @@ static void record_draw(const rsx_state* st, u32 prim, u32 base, u32 count,
     d->depth_test = st->depth_test_enable; d->depth_func = st->depth_func; d->depth_mask = st->depth_mask;
     d->shader_ctrl = st->shader_control;
     d->surf           = st->surface_color_offset[0];
-    d->surf_fmt = st->surface_format; d->color_target = st->color_target; d->surf_pitch0 = st->surface_color_pitch[0]; d->surf1 = st->surface_color_offset[1];
+    d->surf_fmt = st->surface_format; d->color_target = st->color_target; d->dma_color = st->context_dma_color; d->surf_pitch0 = st->surface_color_pitch[0]; d->surf1 = st->surface_color_offset[1];
     d->surf2 = st->surface_color_offset[2]; d->surf3 = st->surface_color_offset[3];
     d->n_mrt = (st->color_target == 0x13) ? 2 : (st->color_target == 0x17) ? 3 : (st->color_target == 0x1F) ? 4 : 1;
     /* Il programma va tradotto ORA, finche' il microcodice in memoria e' quello
@@ -1002,7 +1003,7 @@ done:
     for (u32 t = 0; t < RSX_MAX_TEXTURES; t++) { d->tex_off[t] = s_state ? s_state->textures[t].offset : 0; d->tex_fmt[t] = s_state ? s_state->textures[t].format : 0;
         d->tex[t] = (s_state && (s_state->textures[t].control0 & 0x80000000u)) ? tex_with_remap(s_tex[t].tex, s_state->textures[t].control1) : nil; }
     d->surf           = s_state ? s_state->surface_color_offset[0] : 0;
-    d->surf_fmt = s_state ? s_state->surface_format : 0; d->color_target = s_state ? s_state->color_target : 0;
+    d->surf_fmt = s_state ? s_state->surface_format : 0; d->color_target = s_state ? s_state->color_target : 0; d->dma_color = s_state ? s_state->context_dma_color : 0;
     d->surf2 = s_state ? s_state->surface_color_offset[2] : 0; d->surf3 = s_state ? s_state->surface_color_offset[3] : 0;
     d->n_mrt = (d->color_target == 0x13) ? 2 : (d->color_target == 0x17) ? 3 : (d->color_target == 0x1F) ? 4 : 1;
     if (d->fp_addr) { s_fp_shadow_cur = d->tex_zfunc; s_fp_cube_cur = d->cube_mask; (void)guest_fp_library(d->fp_addr, (d->vp >= 0 && s_vps[d->vp].ok) ? d->vp : -1, d->shader_ctrl, d->n_mrt | (d->shadow_key << 8), d->fp_hash); }
@@ -1111,6 +1112,64 @@ static id<MTLTexture> surface_texture_lookup(u32 offset)
     for (u32 i = 0; i < s_surf_count; i++)
         if (s_surf[i].offset == offset && s_surf[i].tex) return s_surf[i].tex;
     return nil;
+}
+
+/* Sotto-rettangolo di una superficie letto come texture (s.33): la catena di
+ * post-processing di Uncharted disegna nei quattro quadranti di 031E0000
+ * (640x360 RGBA16F) e poi campiona "320x180 @ 031E0A00" (x = 320) e
+ * "@ 032C1000" (y = 180). L'offset non e' la base di nessuna superficie, la
+ * ricerca falliva e si decodificava la memoria guest (vuota): tutta la catena
+ * (bloom, esposizione) usciva nera. Metal non ha viste con origine: si tiene
+ * una texture della misura chiesta e la si riempie con una blit dal
+ * quadrante PRIMA del pass che la campiona (vedi l'encode). */
+typedef struct { id<MTLTexture> view; u32 surf_off, x0, y0, w, h; MTLPixelFormat pf; } MtlSubView;
+#define MTL_SUBVIEW_MAX 16
+static MtlSubView s_subview[MTL_SUBVIEW_MAX];
+static u32 s_subview_count;
+static u32 pixel_format_bytes(MTLPixelFormat pf)
+{
+    switch (pf) { case MTLPixelFormatRGBA16Float: return 8; case MTLPixelFormatRGBA32Float: return 16; default: return 4; }
+}
+static id<MTLTexture> surface_subview_lookup(u32 offset, u32 width, u32 height)
+{
+    for (u32 i = 0; i < s_surf_count; i++) {
+        const MtlSurface* sf = &s_surf[i];
+        if (!sf->tex || offset <= sf->offset) continue;
+        const u32 bpp = pixel_format_bytes(sf->pf), pitch = sf->w * bpp;
+        const u32 delta = offset - sf->offset;
+        if (delta >= pitch * sf->h) continue;
+        const u32 y0 = delta / pitch, x0 = (delta % pitch) / bpp;
+        if (x0 + width > sf->w || y0 + height > sf->h) continue;
+        for (u32 k = 0; k < s_subview_count; k++) {
+            MtlSubView* v = &s_subview[k];
+            if (v->surf_off == sf->offset && v->x0 == x0 && v->y0 == y0 && v->w == width && v->h == height && v->pf == sf->pf && v->view) return v->view;
+        }
+        MTLTextureDescriptor* td = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:sf->pf width:width height:height mipmapped:NO];
+        td.usage = MTLTextureUsageShaderRead; td.storageMode = MTLStorageModePrivate;
+        id<MTLTexture> t = [s_dev newTextureWithDescriptor:td];
+        if (!t) return nil;
+        u32 slot = s_subview_count < MTL_SUBVIEW_MAX ? s_subview_count++ : (u32)(s_frame_no % MTL_SUBVIEW_MAX);
+        s_subview[slot] = (MtlSubView){ t, sf->offset, x0, y0, width, height, sf->pf };
+        { static int sd = -1; if (sd < 0) sd = getenv("RSX_FRAMEDBG") ? 1 : 0; static int _n = 0;
+          if (sd && _n++ < 8) fprintf(stderr, "[RSX metal] texture %ux%u @%08X = superficie %08X + (%u,%u)\n", width, height, offset, sf->offset, x0, y0); }
+        return t;
+    }
+    return nil;
+}
+/* la blit che riempie la vista (prima del pass che la campiona) */
+static void subview_refresh(id<MTLCommandBuffer> cb, id<MTLTexture> view)
+{
+    for (u32 k = 0; k < s_subview_count; k++) {
+        MtlSubView* v = &s_subview[k];
+        if (v->view != view) continue;
+        id<MTLTexture> src = surface_texture_lookup(v->surf_off);
+        if (!src || src.pixelFormat != v->pf) return;
+        id<MTLBlitCommandEncoder> bl = [cb blitCommandEncoder];
+        [bl copyFromTexture:src sourceSlice:0 sourceLevel:0 sourceOrigin:MTLOriginMake(v->x0, v->y0, 0)
+                 sourceSize:MTLSizeMake(v->w, v->h, 1) toTexture:view destinationSlice:0 destinationLevel:0 destinationOrigin:MTLOriginMake(0, 0, 0)];
+        [bl endEncoding];
+        return;
+    }
 }
 
 /* ---- Buffer di profondita' -----------------------------------------------
@@ -1587,6 +1646,7 @@ static void mtl_bind_texture(void* ud, u32 unit, const rsx_texture_state* tex)
                  if (sd && _n++ < 8) fprintf(stderr, "[RSX metal] unita' %u legge il buffer di profondita' 0x%X\n", unit, tex->offset); }
                return; } } }
     { id<MTLTexture> st = surface_texture_lookup(tex->offset);
+      if (!st) st = surface_subview_lookup(tex->offset, width, height);
       if (st) {
           u->tex = st; u->offset = tex->offset; u->format = tex->format;
           u->image_rect = tex->image_rect;
@@ -1730,7 +1790,8 @@ static void mtl_bind_texture(void* ud, u32 unit, const rsx_texture_state* tex)
                         /* RSX_TEX_SAVE_WH=<w>x<h>: solo le texture di quella misura (gli offset cambiano da corsa a corsa, s.29) */
                         const char* ew = getenv("RSX_TEX_SAVE_WH"); if (ew) sscanf(ew, "%ux%u/%x", &ts_w, &ts_h, &ts_f); }   /* "<w>x<h>[/<fmt hex>]" */
           static int tn = 0;
-          if (ts && !hdr16 && tn < ts_max && (ts_off < 0 || (long)(tex->offset & 0x7FFFFFFFu) == ts_off) && (!ts_w || (width == ts_w && height == ts_h && (!ts_f || fmt == ts_f)))) {
+          static long ts_from = -2; if (ts_from == -2) { const char* e = getenv("RSX_TEX_SAVE_FROM"); ts_from = e ? atol(e) : 0; }   /* solo dal fotogramma dato (s.33) */
+          if (ts && !hdr16 && tn < ts_max && (long)s_frame_no >= ts_from && (ts_off < 0 || (long)(tex->offset & 0x7FFFFFFFu) == ts_off) && (!ts_w || (width == ts_w && height == ts_h && (!ts_f || fmt == ts_f)))) {
               char tp[96]; snprintf(tp, sizeof tp, "/tmp/rsx_tex%d_%08X.ppm", tn++, tex->offset);
               fprintf(stderr, "[RSX metal] texture salvata: %s (fotogramma #%lu, impronta %08X%s)\n", tp, s_frame_no, fpr, stale ? ", ridecodifica" : "");
               FILE* tf = fopen(tp, "wb");
@@ -1742,6 +1803,12 @@ static void mtl_bind_texture(void* ud, u32 unit, const rsx_texture_state* tex)
                   }
                   fclose(tf);
                   fprintf(stderr, "[RSX metal] texture salvata in %s\n", tp);
+                  /* e il canale alpha a parte (s.33: gli sprite portano la forma li') */
+                  snprintf(tp, sizeof tp, "/tmp/rsx_tex%d_%08X_a.pgm", tn - 1, tex->offset);
+                  FILE* ta = fopen(tp, "wb");
+                  if (ta) { fprintf(ta, "P5\n%u %u\n255\n", width, height);
+                            for (u32 q = 0; q < width * height; q++) fputc(staging[q*4+3], ta);
+                            fclose(ta); }
               } } }
         { static int td2 = -1;
           if (td2 < 0) td2 = getenv("RSX_TEX_DBG") ? 1 : 0;
@@ -2341,8 +2408,8 @@ void rsx_metal_backend_present(void)
                       s_frame_no, s_draw_count, s_vert_count, s_cb_count);
               for (u32 i = 0; i < s_draw_count; i++) {
                   const MtlDraw* d = &s_draws[i];
-                  fprintf(stderr, "[drawlist] #%-3u surf=%08X%s[fmt=%X ct=%X pitch=%u B=%X Z=%X dt=%d/%X/%d sc=%X] vp=%s%08X fp=%08X/%08X n=%-5u topo=%d blend=%d(%03X,%03X) cm=%X cull=%X va=%08X+%u sh=%X sc=%u,%u %ux%u vp=%g,%g %gx%g tex:",
-                          i, d->surf, cellGcmOffsetIsDisplay(d->surf) ? "*" : " ", d->surf_fmt, d->color_target, d->surf_pitch0, d->surf1, d->zeta_off, d->depth_test, d->depth_func, d->depth_mask, d->shader_ctrl,
+                  fprintf(stderr, "[drawlist] #%-3u surf=%08X%s[fmt=%X ct=%X%s pitch=%u B=%X Z=%X dt=%d/%X/%d sc=%X] vp=%s%08X fp=%08X/%08X n=%-5u topo=%d blend=%d(%03X,%03X) cm=%X cull=%X va=%08X+%u sh=%X sc=%u,%u %ux%u vp=%g,%g %gx%g tex:",
+                          i, d->surf, cellGcmOffsetIsDisplay(d->surf) ? "*" : " ", d->surf_fmt, d->color_target, d->dma_color == 0xFEED0001u ? " MAIN" : "", d->surf_pitch0, d->surf1, d->zeta_off, d->depth_test, d->depth_func, d->depth_mask, d->shader_ctrl,
                           d->vp >= 0 ? "" : "-", d->vp >= 0 ? s_vps[d->vp].hash : 0u, d->fp_addr, d->fp_hash, d->count, (int)d->topology,
                           d->blend_enable, d->blend_sfactor, d->blend_dfactor, d->color_mask, d->cull, d->attr0_off, d->first, d->shadow_key, d->sx, d->sy, d->sw, d->sh, (double)d->vx, (double)d->vy, (double)d->vw, (double)d->vh);
                   /* RSX_DRAWLIST_FPC=<hash>: le costanti inline (fp_constants[]) del primo draw con quel FP (s.30) */
@@ -2444,6 +2511,11 @@ void rsx_metal_backend_present(void)
                 for (u32 q = i; q < run_end; q++)
                     for (u32 t = 0; t < RSX_MAX_TEXTURES; t++)
                         if (s_draws[q].tex[t]) { MtlZeta* z = zeta_by_rgba(s_draws[q].tex[t]); if (z) zeta_refresh_rgba(cb, z); }
+            /* ...e le viste sui quadranti delle superfici (s.33) */
+            if (s_subview_count)
+                for (u32 q = i; q < run_end; q++)
+                    for (u32 t = 0; t < RSX_MAX_TEXTURES; t++)
+                        if (s_draws[q].tex[t]) subview_refresh(cb, s_draws[q].tex[t]);
             MTLRenderPassDescriptor* rp = [MTLRenderPassDescriptor renderPassDescriptor];
             rp.colorAttachments[0].texture = pass_target;
             if (vis) rp.visibilityResultBuffer = vis;
