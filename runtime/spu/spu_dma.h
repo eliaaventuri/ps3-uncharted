@@ -275,8 +275,11 @@ static inline int mfc_do_transfer(spu_context* spu, uint32_t lsa, uint64_t ea,
                               " size=%u covers 0x%08X\n",
                       (uint32_t)spu->pc & SPU_LS_MASK, cmd, lsa, (uint32_t)ea, size,
                       (uint32_t)s_w); } }
-    if (mfc_is_put(cmd)) { char kb[12]; snprintf(kb, sizeof kb, "P%02X@%X", cmd & 0xFF, lsa >> 4);
-        spu_wring_note(spu, kb, (uint32_t)ea, size, &spu->ls[lsa]);
+    if (mfc_is_put(cmd)) {
+        /* la nota va formattata solo con SPU_WRING acceso: la snprintf a ogni
+         * PUT era il 2% del tempo delle lane (s.38, `sample`) */
+        if (spu_wring_on()) { char kb[12]; snprintf(kb, sizeof kb, "P%02X@%X", cmd & 0xFF, lsa >> 4);
+            spu_wring_note(spu, kb, (uint32_t)ea, size, &spu->ls[lsa]); }
         /* Park dei pacchetti RSX (s.31): un PUT la cui prima parola e' un JUMP
          * (tipo 1) puo' essere il "JUMP-a-se-stesso" con cui il job 217
          * parcheggia un pacchetto CALLato; cellGcmSys decide (mappa IO->EA) e

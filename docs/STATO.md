@@ -125,7 +125,7 @@ un puntatore nullo letto dai propri dati, e la scena 3D non si vede ancora
 finestra (frecce, Spazio/X = CROSS, C = CERCHIO, Invio = START); `PAD_SCRIPT`
 per le corse senza nessuno. Dettagli in "Sessione 27".
 
-**Dalla sessione 38 il livello gira a 28 fps** (era 12,6 sulla stessa
+**Dalla sessione 38 il livello gira a 27-28 fps** (era 12,6 sulla stessa
 corsa di riferimento): il nostro kernel SPURS faceva fork-join per ogni
 quanto (sveglia 5 lane, aspetta la piu' lenta, un workload alla volta); ora
 ogni lane sceglie da sola il workload, come le SPU vere
@@ -571,6 +571,12 @@ della lista. Il backoff del workload ora scatta solo quando TUTTI gli
 spuNum hanno visto la lista vuota, e finche' non lo sono si scelgono per
 primi quelli mancanti. Misurato neutro (28,2 contro 28,4), tenuto perche'
 e' la semantica giusta.
+
+**Ultime due corse del binario finale (con la snprintf per ogni PUT del
+DMA tolta dal cammino caldo, 2% delle lane): 26,7 e 27,2 fps mediani, 200
+s l'una, nessuno stallo.** Il rumore fra corse e' ~+-1 fps (morti di Drake
+e stato del gioco diversi nella finestra): il numero della sessione e'
+**27-28 fps** (26,7 / 27,2 / 27,8 / 28,2 / 28,4).
 
 **Dove va il tempo ORA:** lane al 87% (wid 12: 129.000 quanti in 2 s da 52
 us = 120 ms di lane per fotogramma, gli altri wid ~35 ms; 155 ms per
