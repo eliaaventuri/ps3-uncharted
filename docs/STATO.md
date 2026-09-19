@@ -593,7 +593,14 @@ finestra NON e' "on screen" per CGWindowList, serve `.optionAll`).
    piu' rev32 a ogni lqd/stqd) -> la cache dei registri con le analisi di
    flusso (sporchi/vivi ai punti di sync), oppure il profilo a -fno-inline
    rifatto per vedere cosa e' salito in testa. Poi i 41-46 ms di PPU da
-   solo per fotogramma (`vm_read32` chiamata, PPU a -O2).
+   solo per fotogramma: OGNI load/store del PPU liftato e' una chiamata
+   fuori linea (`vm_read32` in `ppu_loader.cpp`: test g_vm_fast, oob,
+   controllo del registro ref per GCM_REFPOLL, rilevatore di spin in TLS
+   con `ppu_gcm_pump` ogni 4096 letture uguali, memcpy+bswap), e attorno a
+   una chiamata il compilatore scarica i registri. Una via in linea nel
+   header generato (accesso diretto per gli indirizzi fuori dalla finestra
+   HLE, chiamata per il resto) e' la leva; attenzione al pump: serve dove
+   il PPU gira su una parola che scrive un gestore vblank/flip.
 2. Giocare oltre il checkpoint (Elia con la tastiera, o `PAD_SCRIPT`).
 3. `RING_GUARD_LANES` 5 (la sesta lane del wid 12 senza guardia), death4
    (mai piu' visto in 9 corse dopo lo shutdown vero: da confermare).
