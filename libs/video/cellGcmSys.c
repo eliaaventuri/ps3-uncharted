@@ -518,6 +518,18 @@ void cellGcmSetFlipMode(u32 mode)
 }
 
 /* NID: 0xC44D8F34 */
+/* GCM_TIMELINE=1 (s.33): eventi del fotogramma con orologio in us (mod 1e8),
+ * sullo stesso asse di [ring]: put del PPU, passate e parcheggi del walker,
+ * flip, present, attesa del flip. Per vedere CHI aspetta CHI. */
+static int s_tl = -1;
+static void gcm_tl(const char* ev, unsigned a, unsigned b)
+{
+    if (s_tl < 0) s_tl = getenv("GCM_TIMELINE") ? 1 : 0;
+    if (!s_tl) return;
+    static int _n = 0; if (_n++ > 60000) return;
+    extern unsigned long long rsx_us_now(void);
+    fprintf(stderr, "[tl] %llu %s %08X %08X\n", rsx_us_now() % 100000000ull, ev, a, b);
+}
 void cellGcmSetWaitFlip(void)
 {
     /* Block until the pending flip completes (the present thread marks it done
@@ -537,8 +549,10 @@ void cellGcmSetWaitFlip(void)
     static long s_wf = -1; if (s_wf < 0) { const char* e = getenv("GCM_WAITFLIP_MS"); s_wf = e ? atol(e) : 64; }
     { static unsigned long s_n = 0, s_to = 0; s_n++;
       long i = 0;
+      gcm_tl("waitflip-in", s_flip_status, 0);
       for (; (s_wf <= 0 || i < s_wf) && s_flip_status == CELL_GCM_FLIP_STATUS_WAITING; i++)
           Sleep(1);
+      gcm_tl("waitflip-out", (unsigned)i, 0);
       if (s_flip_status == CELL_GCM_FLIP_STATUS_WAITING) { s_to++;
           static int _n = 0; if (_n++ < 8) fprintf(stderr, "[cellGcmSetWaitFlip] timeout dopo %ld ms (%lu su %lu attese)\n", i, s_to, s_n); } }
     s_flip_status = CELL_GCM_FLIP_STATUS_DONE;
@@ -687,7 +701,7 @@ void cellGcmTickFlip(void)
                    * ~100 fotogrammi). Se il flip viene dalla parola nella
                    * FIFO, il walker ha gia' consumato tutto il fotogramma N:
                    * basta questo. Il vincolo resta per il flip via import. */
-                  if (!s_flip_reached && s_fifo_getoff != put) return;
+                  if (!s_flip_reached && s_fifo_getoff != put) { static unsigned _k = 0; if ((_k++ & 63) == 0) gcm_tl("flip-tick-behind", s_fifo_getoff, put); return; }
 #ifdef __APPLE__
                   /* ...e che la GPU abbia finito il fotogramma presentato: i
                    * report delle occlusion query (GET_REPORT) vengono scritti
@@ -695,6 +709,7 @@ void cellGcmTickFlip(void)
                   { extern int rsx_metal_backend_gpu_wait(unsigned); if (!rsx_metal_backend_gpu_wait(8000)) return; }
 #endif
                 } }
+    gcm_tl("flip-done", 0, 0);
     GCM_PENDING_SET(2);
 }
 
@@ -1462,7 +1477,9 @@ void cellGcm_rsx_process_fifo(void)
       if (only && !s_in_put_hook && !s_parked) return; }
     AcquireSRWLockExclusive(&s_gcm_fifo_lock);
     if (s_wstat < 0) s_wstat = getenv("GCM_WSTAT") ? 1 : 0;
-    if (s_wstat) gcm_wstat_run(s_in_put_hook); else gcm_rsx_process_fifo_unlocked();
+    { u32 g0 = s_fifo_getoff; int p0 = s_parked;
+      if (s_wstat) gcm_wstat_run(s_in_put_hook); else gcm_rsx_process_fifo_unlocked();
+      if (s_tl != 0 && (g0 != s_fifo_getoff || p0 != s_parked)) gcm_tl(s_parked ? "walk-park" : "walk", g0, s_fifo_getoff); }
     ReleaseSRWLockExclusive(&s_gcm_fifo_lock);
 }
 
@@ -1594,6 +1611,7 @@ void cellGcm_on_put_write(void)
                       ((w >> 29) == 1) ? " = JUMP" : "", vm_read32(GCM_CONTROL_GUEST_ADDR + 0));
           s_strand_io = 0; } }
     gcm_ringdbg(vm_read32(GCM_CONTROL_GUEST_ADDR + 0));
+    gcm_tl("put", vm_read32(GCM_CONTROL_GUEST_ADDR + 0), s_fifo_getoff);
     cellGcm_rsx_process_fifo();
     { u32 put_now = vm_read32(GCM_CONTROL_GUEST_ADDR + 0);
       if (s_fifo_getoff != put_now) {
@@ -1923,6 +1941,7 @@ static void gcm_rsx_process_fifo_unlocked(void)
             extern s32 cellGcmSetFlipCommand(u32 bufferId);
             s_fifo_getoff += 4;
             s_flip_from_fifo = 1;   /* il walker E' arrivato al flip: tutto il fotogramma prima e' consumato */
+            gcm_tl("flip-cmd", w & 0xFFu, 0);
             cellGcmSetFlipCommand(w & 0xFFu);
             /* La RSX vera prosegue subito dopo il flip. Qui la passata si
              * ferma per il present, e con GCM_DRAIN_ONLY_PUT nessuno la
@@ -2385,6 +2404,14 @@ static void gcm_rsx_process_fifo_unlocked(void)
      * value stays observable to equality-waiters. The wrap recycle path polls
      * the drained EA. */
     g_gcm_fifo_drained_ea = gcm_io2ea(s_fifo_getoff);
+    /* Flip HLE (cellGcmSetFlip immediato, non una parola nella FIFO): il flip
+     * puo' completarsi quando il walker ha consumato tutto cio' che stava
+     * prima di `put` al momento della richiesta. Il tick del flip (16 ms)
+     * controllava get == put NEL MOMENTO del tick, ma il PPU muove `put` di
+     * nuovo 200 us dopo che il walker lo raggiunge (s.33, GCM_TIMELINE): il
+     * flip non si completava mai e cellGcmSetWaitFlip usciva sempre per
+     * timeout (64 ms buttati a fotogramma). Qui si annota il raggiungimento. */
+    if (s_fifo_getoff == put && s_flip_status == CELL_GCM_FLIP_STATUS_WAITING) s_flip_reached = 1;
     vm_write32(GCM_CONTROL_GUEST_ADDR + 4, s_fifo_getoff);              /* get */
     AcquireSRWLockExclusive(&s_ref_pub_lock);                           /* ref */
     gcm_ref_publish_one();
@@ -2512,6 +2539,13 @@ s32 cellGcmSetFlipCommand(u32 bufferId)
     /* Flip requested but not yet shown: a subsequent cellGcmSetWaitFlip blocks
      * until the present thread's cellGcmTickFlip marks it done (vsync). */
     s_flip_reached = s_flip_from_fifo; s_flip_from_fifo = 0;
+    /* Flip HLE: se il walker ha gia' consumato tutto fino a `put` (il drain
+     * sincrono sulla scrittura di put lo porta li' 300 us PRIMA di questa
+     * chiamata, s.33 GCM_TIMELINE), il fotogramma e' completo: il flip puo'
+     * completarsi al prossimo tick. Altrimenti lo annota il walker quando
+     * arriva a put (v. fine di gcm_rsx_process_fifo_unlocked). */
+    if (!s_flip_reached && s_gcm_context_ea && s_fifo_getoff == vm_read32(GCM_CONTROL_GUEST_ADDR + 0)) s_flip_reached = 1;
+    gcm_tl("flip-req", s_fifo_getoff, s_gcm_context_ea ? vm_read32(GCM_CONTROL_GUEST_ADDR + 0) : 0);
     s_flip_status = CELL_GCM_FLIP_STATUS_WAITING;
     s_flip_pending = 1;   /* ticker: present BEFORE the next drain */
     s_flip_request_count++;
@@ -2537,7 +2571,15 @@ s32 cellGcmSetFlipCommand(u32 bufferId)
  * a no-op, GetFlipStatus never cleared, and init timed out into exit(-1). */
 s32 cellGcmSetFlip(void* context, u32 bufferId)
 {
-    (void)context;   /* command context — flip is immediate in HLE */
+    /* context = CellGcmContextData (begin, end, current, callback): `current`
+     * e' dove la libgcm vera scriverebbe la parola di flip. Misurato (s.33,
+     * GCM_TIMELINE): il walker ci arriva solo dopo aver consumato TUTTI i
+     * blocchi dei job SPU del fotogramma (~180 ms da noi, 16-33 sul ferro),
+     * cioe' proprio quando il PPU sta gia' chiedendo il flip successivo. Un
+     * flip "corretto" farebbe aspettare il PPU tutto quel tempo: il timeout
+     * di cellGcmSetWaitFlip (64 ms) e' quello che oggi tiene PPU e SPU in
+     * pipeline. Il flip resta immediato. */
+    (void)context;
     return cellGcmSetFlipCommand(bufferId);
 }
 

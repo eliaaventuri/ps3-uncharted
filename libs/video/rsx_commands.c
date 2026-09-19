@@ -379,6 +379,8 @@ int rsx_report_shadow_get(u32 ea, u32* val)
         if (s_rsh_ea[h] == 0) return 0; }
     return 0;
 }
+#include <time.h>
+unsigned long long rsx_us_now(void) { struct timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts); return (unsigned long long)ts.tv_sec * 1000000ull + (unsigned long long)ts.tv_nsec / 1000ull; }
 static u32 s_report_ctx = 0xFEED0001u;   /* NV4097_SET_CONTEXT_DMA_REPORT */
 /* Coalescenza dei DRAW_ARRAYS / DRAW_INDEX_ARRAY (sessione 30). Ogni parola
  * porta al massimo 256 vertici ((count-1) in 8 bit) e un draw grande arriva
@@ -619,7 +621,7 @@ int rsx_process_method(rsx_state* state, u32 method, u32 data)
               static long s_from = -2; if (s_from == -2) { const char* e = getenv("SPU_DMA_EAWIN_FROM"); s_from = e ? atol(e) : 0; }
               extern unsigned rsx_backend_frame_no(void);
               if ((long)rsx_backend_frame_no() >= s_from) { static int _n = 0; if (_n++ < 60000)
-                  fprintf(stderr, "[ring] lane %u RELEASE %08X\n", (((s_sem_off & 0xFFFFFFu) - 0x480u) >> 4) & 7, val); } } }
+                  fprintf(stderr, "[ring] %llu lane %u RELEASE %08X\n", rsx_us_now() % 100000000ull, (((s_sem_off & 0xFFFFFFu) - 0x480u) >> 4) & 7, val); } } }
         /* RSX_LABEL_DBG=<hex offset>: tutte le scritture di quel label (il job
          * 215 aspetta il 0x480 = "fin dove la RSX ha consumato l'anello SPU") */
         { static long s_ld = -2; if (s_ld == -2) { const char* e = getenv("RSX_LABEL_DBG"); s_ld = e ? strtol(e, 0, 16) : -1; }

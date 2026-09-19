@@ -548,6 +548,42 @@ barca a destra e' corretta); 6852BBAF e' il materiale del mare
 L'icona della pistola nell'HUD non e' disegnata (2 soli draw sul display:
 composizione + "40"): probabilmente uno stato dell'HUD, non un difetto.
 
+**Velocita': dove va il tempo del fotogramma (5,5-6 fps nel livello, misurato).**
+Strumenti: `sample` di macOS sul processo (4 s), `RSX_FRAMESTAT=50`,
+`GCM_WSTAT=1`, `SPURS_LANE_STAT=1` e il nuovo `GCM_TIMELINE=1` (eventi
+`[tl] <us> put/walk/walk-park/flip-req/present-in/out/waitflip-in/out`
+sullo stesso orologio di `[ring]`). Il quadro:
+- Il fotogramma dura ~180 ms. Il walker RSX consuma ~30 blocchi dei job SPU
+  per fotogramma, UNO per passata (442 passate in 2 s, 98% parcheggiate: il
+  blocco successivo non e' ancora scritto). `GCM_PARK_POLL_US=200` (invece
+  dei 4 ms del ticker) non cambia niente, `GCM_RING_GUARD=0` nemmeno: i
+  blocchi arrivano davvero uno ogni ~6 ms.
+- Le lane SPU stanno nel job 215 il 38% del tempo, in attesa di lavoro il
+  45%; `wid=12` (geometria): 6.118 corse del PM in 2 s da <=1 ms l'una, 40%
+  di utilizzo delle 5 lane. Un blocco costa ~11 ms di lane (sul ferro ~50
+  us): la traduzione SPU e' ~200x piu' lenta del Cell su questo job.
+- Il thread PPU: 34% in `cellGcmSetWaitFlip` (SEMPRE per timeout di 64 ms:
+  il flip HLE non si completa mai perche' `context->current` al momento di
+  cellGcmSetFlip sta DOPO le CALL ai blocchi SPU del fotogramma, e il walker
+  ci arriva 180 ms dopo, quando il PPU chiede gia' il flip seguente; il
+  timeout e' di fatto cio' che tiene PPU e SPU in pipeline) e ~39% a girare
+  in `func_007428C0`/`func_0074073C` da `SwapBuffers` (func_0014F528) e dal
+  BigLoop: un poll a vuoto sui risultati dei job (`[HOTREAD] 0x2000A910`).
+  Il resto e' logica di gioco.
+- La via veloce degli accessi alla memoria guest (`vm_read32` & co. senza
+  i ~30 controlli diagnostici e le variabili thread-local, se nessuna
+  variabile YDKJ_/FLOW_/LBP_WV/LBP_WW/GCM_SEQ/GCM_JMPWATCH/GCM_PUT_BT/
+  RD_FORCE/PPU_WW_GUARD e' impostata; `PS3_VM_FAST=0` la spegne) toglie
+  il 60% del tempo CPU del thread PPU ma NON cambia i fps: il PPU aspetta.
+- Gli helper float della SPU con la semantica del Cell costavano il 30% dei
+  fotogrammi nella prima versione; ora hanno la via veloce (ingressi e
+  risultato normali -> float dell'host) e costano come prima.
+Conclusione: per salire di fps bisogna far girare piu' in fretta i job SPU
+(costo per istruzione del codice liftato: helper u128 per valore, salto del
+trampolino per blocco con due accessi thread-local, `spu_ls_read128` con
+controlli) e ridurre la latenza di dispatch del PM (6.118 corse per ~330
+job: ~20 passate a vuoto per job). E' un lavoro lungo, non una correzione.
+
 ### Fronte aperto (dopo la sessione 33)
 
 1. Confrontare il fotogramma con RPCS3 (`docs/img_s31_rpcs3_dive_boat.jpg`):
@@ -557,7 +593,9 @@ composizione + "40"): probabilmente uno stato dell'HUD, non un difetto.
    se qualcosa "esplode" (NaN che prima era un numero enorme) cercare li'.
    `spu_fi` resta un pass-through dell'estimate (Newton-Raphson non fatto).
 3. IFE/LOOP nel decompilatore FP; `RSX_DUMP_COUNT>1`; VP/FP compilati per
-   coppia; 8 fps.
+   coppia.
+4. Velocita' (5,5-6 fps): v. sopra, il collo e' l'emulazione dei job SPU e la
+   latenza del dispatch, non il PPU ne' la RSX.
 
 ## Sessione 32 — il fantasma di Drake era la WPOS: i materiali leggevano i buffer di luce con x raddoppiata
 

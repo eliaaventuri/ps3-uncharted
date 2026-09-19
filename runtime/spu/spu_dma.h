@@ -1224,7 +1224,8 @@ static inline int mfc_submit(mfc_engine* mfc, spu_context* spu, uint32_t cmd)
           extern unsigned rsx_backend_frame_no(void);
           if ((long)rsx_backend_frame_no() >= s_from) { static int _n = 0; if (_n++ < 60000) {
               uint32_t v = 0; memcpy(&v, vm_base + (uint32_t)ea, 4); v = __builtin_bswap32(v);
-              fprintf(stderr, "[ring] lane %u check r12=%08X r5=%08X label=%08X r23=%08X r26=%08X pc=%05X\n", (((uint32_t)ea - 0x50000480u) >> 4) & 7,
+              extern unsigned long long rsx_us_now(void);
+              fprintf(stderr, "[ring] %llu lane %u check r12=%08X r5=%08X label=%08X r23=%08X r26=%08X pc=%05X\n", rsx_us_now() % 100000000ull, (((uint32_t)ea - 0x50000480u) >> 4) & 7,
                       spu->gpr[12]._u32[0], spu->gpr[5]._u32[0], v, spu->gpr[23]._u32[0], spu->gpr[26]._u32[0], (uint32_t)spu->pc & SPU_LS_MASK); } } } }
     /* SPU_LABEL_POLL=1 (sessione 28): il job 215 di Uncharted aspetta in
      * `func_4B48` che la posizione della RSX (label 0x480+16*lane) esca da

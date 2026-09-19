@@ -264,8 +264,32 @@ static inline uint32_t spu__d2f(double v) {
     if ((double)f > a) r--;                                      /* verso lo zero (f e' normale positivo) */
     return r | s; }
 #define SPU__F(x, i) spu__f2d((x)._u32[i])
-static inline u128 spu_fa(u128 a, u128 b) { u128 r; for(int i=0;i<4;i++) r._u32[i]=spu__d2f(SPU__F(a,i)+SPU__F(b,i)); return r; }
-static inline u128 spu_fs(u128 a, u128 b) { u128 r; for(int i=0;i<4;i++) r._u32[i]=spu__d2f(SPU__F(a,i)-SPU__F(b,i)); return r; }
+/* Via veloce (misurata con `sample`: spu_fma/fm/fa erano le funzioni piu'
+ * calde del port, e la versione in double costava il 30% dei fotogrammi):
+ * se nessun ingresso ha esponente 0 o 255 e il risultato e' un normale, il
+ * float dell'host coincide con la SPU a meno dell'arrotondamento (la SPU
+ * tronca, qui al piu' vicino: come nelle 32 sessioni precedenti). Tutti gli
+ * altri casi (zero, denormali, estesi, overflow) passano dalla via esatta. */
+#define SPU__NORM(w) ((((w) + 0x00800000u) & 0x7F800000u) > 0x00800000u)   /* esponente in 1..254 */
+#define SPU__FLOAT2(NAME, EXPR) \
+static inline u128 NAME(u128 a, u128 b) { u128 r; for(int i=0;i<4;i++) { uint32_t wa=a._u32[i], wb=b._u32[i]; \
+    if (SPU__NORM(wa) && SPU__NORM(wb)) { float x, y; memcpy(&x,&wa,4); memcpy(&y,&wb,4); float f = (EXPR); uint32_t w; memcpy(&w,&f,4); \
+        if (SPU__NORM(w)) { r._u32[i]=w; continue; } } \
+    r._u32[i]=spu__d2f(spu__f2d(wa) OP2_##NAME spu__f2d(wb)); } return r; }
+#define OP2_spu_fa +
+#define OP2_spu_fs -
+#define OP2_spu_fm *
+SPU__FLOAT2(spu_fa, x + y)
+SPU__FLOAT2(spu_fs, x - y)
+SPU__FLOAT2(spu_fm, x * y)
+#define SPU__FLOAT3(NAME, EXPR, DEXPR) \
+static inline u128 NAME(u128 a, u128 b, u128 c) { u128 r; for(int i=0;i<4;i++) { uint32_t wa=a._u32[i], wb=b._u32[i], wc=c._u32[i]; \
+    if (SPU__NORM(wa) && SPU__NORM(wb) && SPU__NORM(wc)) { float x, y, z; memcpy(&x,&wa,4); memcpy(&y,&wb,4); memcpy(&z,&wc,4); float f = (EXPR); uint32_t w; memcpy(&w,&f,4); \
+        if (SPU__NORM(w)) { r._u32[i]=w; continue; } } \
+    double x=spu__f2d(wa), y=spu__f2d(wb), z=spu__f2d(wc); r._u32[i]=spu__d2f(DEXPR); } return r; }
+SPU__FLOAT3(spu_fma,  fmaf(x, y, z),   x * y + z)
+SPU__FLOAT3(spu_fms,  fmaf(x, y, -z),  x * y - z)
+SPU__FLOAT3(spu_fnms, fmaf(-x, y, z),  z - x * y)
 
 /* Float<->int conversions with scale (RI8). CBEA: cflts/cfltu multiply by
  * 2^(173-I8), csflt/cuflt by 2^(I8-155) (rpcs3: scale[173-i8] / scale[i8-155]
@@ -282,10 +306,6 @@ static inline u128 spu_csflt(u128 a, int i8){ u128 r; float f=exp2f((float)(i8-1
     for(int i=0;i<4;i++) r._f32[i]=(float)a._s32[i]*f; return r; }
 static inline u128 spu_cuflt(u128 a, int i8){ u128 r; float f=exp2f((float)(i8-155));
     for(int i=0;i<4;i++) r._f32[i]=(float)a._u32[i]*f; return r; }
-static inline u128 spu_fm(u128 a, u128 b) { u128 r; for(int i=0;i<4;i++) r._u32[i]=spu__d2f(SPU__F(a,i)*SPU__F(b,i)); return r; }
-static inline u128 spu_fma(u128 a, u128 b, u128 c)  { u128 r; for(int i=0;i<4;i++) r._u32[i]=spu__d2f(SPU__F(a,i)*SPU__F(b,i)+SPU__F(c,i)); return r; }
-static inline u128 spu_fms(u128 a, u128 b, u128 c)  { u128 r; for(int i=0;i<4;i++) r._u32[i]=spu__d2f(SPU__F(a,i)*SPU__F(b,i)-SPU__F(c,i)); return r; }
-static inline u128 spu_fnms(u128 a, u128 b, u128 c) { u128 r; for(int i=0;i<4;i++) r._u32[i]=spu__d2f(SPU__F(c,i)-SPU__F(a,i)*SPU__F(b,i)); return r; }
 static inline u128 spu_fceq(u128 a, u128 b) { u128 r; for(int i=0;i<4;i++) r._u32[i]=(SPU__F(a,i)==SPU__F(b,i))?0xFFFFFFFFu:0; return r; }
 static inline u128 spu_fcgt(u128 a, u128 b) { u128 r; for(int i=0;i<4;i++) r._u32[i]=(SPU__F(a,i)>SPU__F(b,i))?0xFFFFFFFFu:0; return r; }
 

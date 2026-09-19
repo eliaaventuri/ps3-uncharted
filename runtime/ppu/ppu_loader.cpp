@@ -753,7 +753,33 @@ static void pt_restore(uint32_t addr) { for (int i=0;i<g_pt_n;i++) if (g_pt_addr
 static PPU_THREAD_LOCAL uint32_t g_vcall_stk[128];
 static PPU_THREAD_LOCAL int      g_vcall_sp = 0;
 extern "C" {
-uint8_t  vm_read8 (uint64_t a) { if (vm_oob((uint32_t)a,1)) return 0; vm_hotmap((uint32_t)a,1);
+/* Via veloce degli accessi alla memoria guest (s.33). vm_read32/vm_write32 &
+ * co. portano decine di controlli diagnostici (watch per indirizzo/valore,
+ * rilevatori di spin, mappa dei letti caldi, sequenze GCM), ognuno con il suo
+ * `static` da controllare e qualche variabile thread-local (_tlv_get_addr):
+ * misurato con `sample` nel livello, il 60% del thread PPU stava in
+ * vm_read32/vm_write32/barrier_watch_hit/_tlv_get_addr, non nel codice del
+ * gioco. Se nessuna variabile d'ambiente di diagnostica e' impostata si
+ * salta tutto e restano solo le cose con effetto: il controllo dei limiti,
+ * il poll del registro ref (GCM_REFPOLL), la pompa dei gestori vblank/flip
+ * quando il PPU gira in uno spin di letture, la scrittura di `put`. */
+static int g_vm_fast = -1;
+static int vm_fast_init(void)
+{
+    extern char** environ;
+    /* le variabili lette dentro gli accessori (grep getenv in vm_read, vm_write, barrier_watch_hit) */
+    static const char* pre[] = { "YDKJ_", "FLOW_", "LBP_WV", "LBP_WW", "GCM_SEQ", "GCM_JMPWATCH", "GCM_PUT_BT", "RD_FORCE", "PPU_WW_GUARD", "PT=", "PS3_TTY_BT", 0 };
+    for (char** e = environ; e && *e; e++)
+        for (int k = 0; pre[k]; k++)
+            if (!strncmp(*e, pre[k], strlen(pre[k]))) { fprintf(stderr, "[vm] via lenta degli accessi (%s)\n", *e); return 0; }
+    const char* off = getenv("PS3_VM_FAST"); if (off && *off == '0') return 0;
+    return 1;
+}
+struct vm_spin_tls { uint32_t last, n; };
+static PPU_THREAD_LOCAL vm_spin_tls g_vm_spin;
+uint8_t  vm_read8 (uint64_t a) { if (__builtin_expect(g_vm_fast > 0, 1)) { const uint32_t ua = (uint32_t)a; return vm_oob(ua, 1) ? 0 : vm_base[ua]; }
+    if (g_vm_fast < 0) g_vm_fast = vm_fast_init();
+    if (vm_oob((uint32_t)a,1)) return 0; vm_hotmap((uint32_t)a,1);
     /* YDKJ_LV2_SAT (diagnostic): the game polls 0x00543580 ("Continue... (Lv-2 is
      * still N)") for an SPU/worker completion that never arrives in the HLE path,
      * then exits(1). Force a value here to test whether it then proceeds to draws.
@@ -771,7 +797,9 @@ uint8_t  vm_read8 (uint64_t a) { if (vm_oob((uint32_t)a,1)) return 0; vm_hotmap(
           n=0; } }
       else { last=(uint32_t)a; n=0; } }
     return vm_base[(uint32_t)a]; }
-uint16_t vm_read16(uint64_t a) { if (vm_oob((uint32_t)a,2)) return 0; vm_hotmap((uint32_t)a,2); uint16_t v; memcpy(&v, vm_base + (uint32_t)a, 2);
+uint16_t vm_read16(uint64_t a) { if (__builtin_expect(g_vm_fast > 0, 1)) { const uint32_t ua = (uint32_t)a; if (vm_oob(ua, 2)) return 0; uint16_t v; memcpy(&v, vm_base + ua, 2); return __builtin_bswap16(v); }
+    if (g_vm_fast < 0) g_vm_fast = vm_fast_init();
+    if (vm_oob((uint32_t)a,2)) return 0; vm_hotmap((uint32_t)a,2); uint16_t v; memcpy(&v, vm_base + (uint32_t)a, 2);
     { static PPU_THREAD_LOCAL uint32_t last=0xFFFFFFFFu; static PPU_THREAD_LOCAL uint32_t n=0;
       if ((uint32_t)a==last) { if (++n==200000) { fprintf(stderr, "[HOTREAD16] spinning on 0x%08X\n", (uint32_t)a); n=0; } } else { last=(uint32_t)a; n=0; } }
     return __builtin_bswap16(v); }
@@ -792,7 +820,21 @@ extern "C" uint32_t g_gcm_put_watch_addr;
 void ppu_hle_dump_ring(void);   /* ppu_hle.cpp: ultimi import chiamati */
 void cellSync_lfq_dump_ultima(void);  /* cellSyncLFQueue.c: puntatori della coda */
 
-uint32_t vm_read32(uint64_t a) { if (vm_oob((uint32_t)a,4)) return 0;
+uint32_t vm_read32(uint64_t a) {
+    if (__builtin_expect(g_vm_fast > 0, 1)) {
+        const uint32_t ua = (uint32_t)a;
+        if (vm_oob(ua, 4)) return 0;
+        if (__builtin_expect(ua == (VM_HLE_INJECT_BASE + 0x2008u), 0)) { static int _rp = -1;
+            if (_rp < 0) { const char* e = getenv("GCM_REFPOLL"); _rp = (e && *e == '0') ? 0 : 1; }
+            if (_rp) { extern void cellGcm_ref_on_poll(void); cellGcm_ref_on_poll(); } }
+        /* spin di letture sullo stesso indirizzo: pompa i gestori vblank/flip (v. sotto) */
+        vm_spin_tls* sp = &g_vm_spin;
+        if (ua == sp->last) { if (++sp->n >= 4096) { sp->n = 0; extern void ppu_gcm_pump(void) __attribute__((weak)); if (ppu_gcm_pump) ppu_gcm_pump(); } }
+        else { sp->last = ua; sp->n = 0; }
+        uint32_t v; memcpy(&v, vm_base + ua, 4); return __builtin_bswap32(v);
+    }
+    if (g_vm_fast < 0) g_vm_fast = vm_fast_init();
+    if (vm_oob((uint32_t)a,4)) return 0;
     /* GCM_SEQ: la lettura del registro `ref` e' il punto in cui il titolo
      * comincia ad aspettare un fence. Va nello stesso flusso delle scritture,
      * perche' la domanda e' se aspetta PRIMA o DOPO aver riscritto il segmento. */
@@ -963,7 +1005,10 @@ uint32_t vm_read32(uint64_t a) { if (vm_oob((uint32_t)a,4)) return 0;
       } }
       else { last=(uint32_t)a; n=0; } }
     return __builtin_bswap32(v); }
-uint64_t vm_read64(uint64_t a) { if (vm_oob((uint32_t)a,8)) return 0; vm_hotmap((uint32_t)a,8); uint64_t v; memcpy(&v, vm_base + (uint32_t)a, 8);
+uint64_t vm_read64(uint64_t a) {
+    if (__builtin_expect(g_vm_fast > 0, 1)) { const uint32_t ua = (uint32_t)a; if (vm_oob(ua, 8)) return 0; uint64_t v; memcpy(&v, vm_base + ua, 8); return __builtin_bswap64(v); }
+    if (g_vm_fast < 0) g_vm_fast = vm_fast_init();
+    if (vm_oob((uint32_t)a,8)) return 0; vm_hotmap((uint32_t)a,8); uint64_t v; memcpy(&v, vm_base + (uint32_t)a, 8);
     { static int seq = -1;
       if (seq < 0) { const char* e = getenv("GCM_SEQ"); seq = (e && *e && *e != '0') ? 1 : 0; }
       if (seq && g_gcm_put_watch_addr && (uint32_t)a >= g_gcm_put_watch_addr && (uint32_t)a < g_gcm_put_watch_addr + 0x10) {
@@ -1162,7 +1207,9 @@ static int ydkj_wwatch_hit(uint32_t ea)
     return 0;
 }
 
-void vm_write8 (uint64_t a, uint8_t  v) { barrier_watch_hit((uint32_t)a, v, 1, __builtin_return_address(0)); if (vm_oob((uint32_t)a,1)) return;
+void vm_write8 (uint64_t a, uint8_t  v) { if (__builtin_expect(g_vm_fast > 0, 1)) { const uint32_t ua = (uint32_t)a; if (!vm_oob(ua, 1)) vm_base[ua] = v; return; }
+    if (g_vm_fast < 0) g_vm_fast = vm_fast_init();
+    barrier_watch_hit((uint32_t)a, v, 1, __builtin_return_address(0)); if (vm_oob((uint32_t)a,1)) return;
     /* YDKJ_WWATCH copre anche gli store a byte: i flag "ho finito" del
      * titolo sono bool, e senza questo una watch su di essi restava muta. */
     { static int64_t w=-2; if (w==-2) { const char* e=getenv("YDKJ_WWATCH"); w = e?(int64_t)strtoul(e,0,0):-1; }
@@ -1217,7 +1264,9 @@ void vm_write8 (uint64_t a, uint8_t  v) { barrier_watch_hit((uint32_t)a, v, 1, _
         else if(((uint32_t)a&3)==0 && v!=0) pt_restore(wa); /* MSB byte set non-zero = restored */ } }
 #endif
     vm_base[(uint32_t)a] = v; }
-void vm_write16(uint64_t a, uint16_t v) { barrier_watch_hit((uint32_t)a, v, 2, __builtin_return_address(0)); if (vm_oob((uint32_t)a,2)) return;
+void vm_write16(uint64_t a, uint16_t v) { if (__builtin_expect(g_vm_fast > 0, 1)) { const uint32_t ua = (uint32_t)a; if (vm_oob(ua, 2)) return; uint16_t bv = __builtin_bswap16(v); memcpy(vm_base + ua, &bv, 2); return; }
+    if (g_vm_fast < 0) g_vm_fast = vm_fast_init();
+    barrier_watch_hit((uint32_t)a, v, 2, __builtin_return_address(0)); if (vm_oob((uint32_t)a,2)) return;
     { static int64_t w=-2; if (w==-2) { const char* e=getenv("YDKJ_WWATCH"); w = e?(int64_t)strtoul(e,0,0):-1; }
       if (w>=0) { uint32_t ea=(uint32_t)a; if (ydkj_wwatch_hit(ea))
         fprintf(stderr,"[WWATCH] write16 0x%08X = 0x%04X  ra=%p\n", ea, v, __builtin_return_address(0)); } }
@@ -1225,7 +1274,15 @@ void vm_write16(uint64_t a, uint16_t v) { barrier_watch_hit((uint32_t)a, v, 2, _
 extern "C" uint32_t g_gcm_put_watch_addr;
 extern "C" void cellGcm_on_put_write(void);
 
-void vm_write32(uint64_t a, uint32_t v) { barrier_watch_hit((uint32_t)a, v, 4, __builtin_return_address(0)); if (vm_oob((uint32_t)a,4)) return;
+void vm_write32(uint64_t a, uint32_t v) {
+    if (__builtin_expect(g_vm_fast > 0, 1)) {
+        const uint32_t ua = (uint32_t)a; if (vm_oob(ua, 4)) return;
+        uint32_t bv = __builtin_bswap32(v); memcpy(vm_base + ua, &bv, 4);
+        if (__builtin_expect(g_gcm_put_watch_addr && ua == g_gcm_put_watch_addr, 0)) cellGcm_on_put_write();
+        return;
+    }
+    if (g_vm_fast < 0) g_vm_fast = vm_fast_init();
+    barrier_watch_hit((uint32_t)a, v, 4, __builtin_return_address(0)); if (vm_oob((uint32_t)a,4)) return;
     /* GCM_JMPWATCH=<ea_lo>:<ea_hi>: ogni parola di JUMP (tipo 1) o di ring che
      * il titolo scrive in [lo,hi): dice DOVE e QUANDO piazza le code dei
      * segmenti della FIFO, insieme alle mosse di `put` (GCM_RINGDBG). */
@@ -1446,6 +1503,8 @@ extern "C" void ppu_vwatch_hit(uint32_t ea, const void* v, uint32_t insn_addr) {
     fprintf(stderr, "[VWATCH] stvx 0x%08X = %08X %08X %08X %08X (%.4f %.4f %.4f %.4f) insn=0x%08X\n", ea, w[0], w[1], w[2], w[3], f[0], f[1], f[2], f[3], insn_addr);
 }
 void vm_write64(uint64_t a, uint64_t v) {
+    if (__builtin_expect(g_vm_fast > 0, 1)) { const uint32_t ua = (uint32_t)a; if (vm_oob(ua, 8)) return; uint64_t bv = __builtin_bswap64(v); memcpy(vm_base + ua, &bv, 8); return; }
+    if (g_vm_fast < 0) g_vm_fast = vm_fast_init();
     /* A 64-bit std used to be invisible to LBP_WW / LBP_WV: only write8/16/32
      * fed the watch, so "nothing writes this field" was a routine false
      * negative. GT5P's PDI task flag at 0x0107B798 reads back as 1 with no

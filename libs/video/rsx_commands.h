@@ -45,6 +45,8 @@ extern "C" {
 #define NV4097_SET_SURFACE_CLIP_VERTICAL       0x00000204
 #define NV4097_SET_SURFACE_FORMAT              0x00000208
 #define NV4097_SET_SURFACE_PITCH_A             0x0000020C
+/* orologio comune per le tracce temporali (s.33: GCM_TIMELINE) */
+unsigned long long rsx_us_now(void);
 #define NV4097_SET_CONTEXT_DMA_COLOR_A         0x00000194
 #define NV4097_SET_SURFACE_COLOR_AOFFSET       0x00000210
 #define NV4097_SET_SURFACE_ZETA_OFFSET         0x00000214

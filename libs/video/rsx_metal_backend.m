@@ -2349,7 +2349,16 @@ int rsx_metal_backend_pump_messages(void)
     return s_closed ? -1 : 0;
 }
 
+static void rsx_metal_backend_present_impl(void);
 void rsx_metal_backend_present(void)
+{
+    static int s_tl = -1; if (s_tl < 0) s_tl = getenv("GCM_TIMELINE") ? 1 : 0;
+    extern unsigned long long rsx_us_now(void);
+    if (s_tl) fprintf(stderr, "[tl] %llu present-in %08lX %u\n", rsx_us_now() % 100000000ull, s_frame_no, (unsigned)s_draw_count);
+    rsx_metal_backend_present_impl();
+    if (s_tl) fprintf(stderr, "[tl] %llu present-out %08lX 0\n", rsx_us_now() % 100000000ull, s_frame_no);
+}
+static void rsx_metal_backend_present_impl(void)
 {
     if (!s_ready) return;
     /* Block only when MTL_MAX_INFLIGHT frames are already queued. */
