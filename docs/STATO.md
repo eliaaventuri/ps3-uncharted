@@ -612,7 +612,13 @@ verdi.
 
 1. Confrontare il fotogramma con RPCS3 (`docs/img_s31_rpcs3_dive_boat.jpg`):
    tonalita' della pelle/muta, riflessi del mare, scie delle barche (blob
-   bianchi, sprite 09E6635A con blend ONE/INV_SRC_ALPHA).
+   bianchi, sprite 09E6635A con blend ONE/INV_SRC_ALPHA). Nota (c62/c63):
+   due corse allo stesso fotogramma 2450, stessa scena (barca dei pirati
+   con la scia di 8 ovali bianchi all'orizzonte), una esce slavata (mare
+   celeste chiaro, cielo bianco) e una satura: qualcosa di non
+   deterministico nella catena HDR/bloom appena riattivata, oppure
+   l'esposizione che reagisce agli sprite bianchi sbagliati. Da capire
+   PRIMA di giudicare la tonalita' contro RPCS3.
 2. Le stesse regole di virgola mobile valgono per i job di animazione/fisica:
    se qualcosa "esplode" (NaN che prima era un numero enorme) cercare li'.
    `spu_fi` resta un pass-through dell'estimate (Newton-Raphson non fatto).
