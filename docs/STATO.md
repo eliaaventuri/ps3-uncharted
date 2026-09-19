@@ -514,6 +514,43 @@ anche dopo f#3500.
 a mano con un `grep | sort | uniq -c | diff` (30 righe). Il vecchio task
 dell'audit degli helper SPU e' in `tasks/TASK_SPU_AUDIT.md`.
 
+**Velocita': dove va davvero il fotogramma (misurato, s.34).** `sample` di
+5 s nel livello (`scratchpad/sample.txt`, parser `sample_threads.py`): 6 thread
+lane SPU occupati il 45-63% (busy 681-946 su 1510 campioni), profilo PIATTO
+dentro il codice liftato (jobmod_008dc900 = job 215, nessun helper caldo:
+spu_indirect_branch 152, spu_cflts 60, retlink/tailret/pcwatch/tlv ~200
+campioni su ~4.500 di lane); thread PPU principale busy 53% di cui 26% a
+girare in `vm_read32` (poll su 0x2000A910: aspetta i job); walker RSX busy
+17%; il resto attese. Nessun thread saturo: e' una catena di latenze.
+- Timeline di un fotogramma (`GCM_TIMELINE=400000`, f#~2600, 123 ms):
+  put+flip-req+waitflip-in a t0; present 8,5 ms; 12 `walk-park` uno ogni
+  5-8 ms (i blocchi SPU arrivano cosi') fino a t0+82 ms; waitflip-out
+  (timeout 64 ms) a t0+78; `walk` (fine della FIFO) a t0+82; PUT successivo
+  a t0+123: **41-46 ms di PPU da solo** fra la fine del flip e il put dopo.
+- **Le lane SPU sono il collo nella fase di walk**: `SPURS_FORCE_SPUS=2`
+  -> 4,3-4,5 fps, `=3` -> 5,5, 5 (default del titolo per wid 12) -> 7,5-8,
+  **`=6` -> 8,2-8,7 fps** (f#2300-2500, tre corse di riferimento 7,7-8,3).
+  Modello: fotogramma ~ 80 ms + (224 ms di lane per fotogramma)/N lane. Il
+  lavoro SPU e' quasi tutto wid 12 (3,5-3,7 s di lane ogni 2 s; wid 13 0,4 s;
+  wid 7 0,26 s su una lane; gli altri trascurabili).
+- Salti del trampolino: **50 milioni al secondo** (nuovo contatore in
+  `[lane-stat]`: "salti del trampolino: N in 2 s (M per ms di lane)"), 16.000
+  per ms di lane = un salto ogni ~62 ns, cioe' ogni ~15 istruzioni SPU.
+  `SPU_HOPHIST=215`: il 78% dei salti sta in 8 pc del job 215 (11298 da solo
+  il 21%): un ciclo caldo spezzato in piu' funzioni liftate dai bersagli delle
+  jump table (`lift_jobmods.py` li aggiunge come `--extra-funcs`), e la
+  caduta in avanti fra un pezzo e l'altro passava dal trampolino.
+  Fatto: `--fallthrough-tailcall` in `tools/spu_lifter.py` (e passante in
+  `lift_jobmods.py`, acceso in `uncharted-data/relift_spu.sh`): la caduta
+  nella funzione successiva e' `SPU_TAILCALL` (musttail) invece dell'hop;
+  i salti veri restano sul trampolino (interrupt, lockstep, diagnostiche).
+  Misura: salti da 16.000 a 11.500 per ms di lane (-28%), fps 7,8/8,0/7,7
+  contro 7,6/7,8/7,4 nelle stesse finestre: **entro il rumore**. L'hop non
+  era il costo; il costo e' il corpo del codice liftato (registri in
+  memoria a ogni blocco, blocchi da ~15 istruzioni).
+- Il PPU liftato e' compilato a -O1 (`build.sh`, ora `PPU_OPT=-O2 ./build.sh`
+  lo cambia; gli oggetti -O1 sono in `obj/o1_backup/`): prova in corso.
+
 ### Fronte aperto (dopo la sessione 34)
 
 1. Tonalita' contro RPCS3: serve uno scatto RPCS3 in stato pulito (senza

@@ -530,9 +530,22 @@ class SPULifter:
         _TERMINATORS = {"br", "bra", "bi", "iret", "stop", "stopd"}
         if (last_insn is not None and last_insn.mnemonic not in _TERMINATORS
                 and end in getattr(self, "func_starts", set())):
-            func.body_lines.append(
-                f"    {{ ctx->pc = 0x{end:X}; "
-                f"g_spu_trampoline_fn = {self.prefix}spu_func_{end:08X}; return; }}")
+            if getattr(self, "fallthrough_tailcall", False):
+                # --fallthrough-tailcall (s.34): la caduta nella funzione
+                # successiva non e' un salto del guest -- e' la stessa
+                # sequenza di istruzioni spezzata da un confine artificiale
+                # (bersaglio di una jump table o di un brsl). Un hop del
+                # trampolino qui costa quanto ~15 istruzioni SPU e nel job di
+                # geometria di Uncharted erano 3 hop su 4 (SPU_HOPHIST).
+                # Tail call diretta (musttail: nessuna crescita dello stack);
+                # interrupt, lockstep e diagnostiche restano sui salti veri.
+                func.body_lines.append(
+                    f"    {{ ctx->pc = 0x{end:X}; "
+                    f"SPU_TAILCALL({self.prefix}spu_func_{end:08X}(ctx)); }}")
+            else:
+                func.body_lines.append(
+                    f"    {{ ctx->pc = 0x{end:X}; "
+                    f"g_spu_trampoline_fn = {self.prefix}spu_func_{end:08X}; return; }}")
 
         # Infinite no-op self-loop (the SPU `br .` halt idiom): a function whose
         # whole body is nops + an unconditional branch back into itself does
@@ -1090,6 +1103,10 @@ def main() -> None:
                         "targets + STT_FUNC symbols). When set, .text is "
                         "read from this ELF and the positional <input> arg "
                         "is ignored.")
+    p.add_argument("--fallthrough-tailcall", action="store_true",
+                   help="La caduta in avanti nella funzione liftata successiva "
+                        "e' una tail call diretta (musttail) invece di un hop "
+                        "del trampolino. Solo i salti veri passano dal trampolino.")
     p.add_argument("--trace", action="store_true",
                    help="Emit spu_trace_pc/spu_trace_rt around each instruction "
                         "for §3 diff-vs-RPCS3 validation. Output goes to stderr "
@@ -1216,6 +1233,7 @@ def main() -> None:
               f"(`bi $rN` where rN is a brsl/bisl link reg): "
               f"{', '.join(f'0x{a:X}' for a in sorted(lifter.link_return))}")
     lifter.func_starts = {s for s, e in bounds}  # for fall-through tail-call chaining
+    lifter.fallthrough_tailcall = bool(args.fallthrough_tailcall)
     for s, e in bounds:
         lifter.lift_function(insns, s, e)
 

@@ -56,6 +56,8 @@ def main():
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--jobmods", default=JOBMODS, help="cartella con i moduli .bin")
+    ap.add_argument("--fallthrough-tailcall", action="store_true",
+                    help="passa --fallthrough-tailcall a spu_lifter.py (caduta in avanti = tail call, s.34)")
     ap.add_argument("--lifted", default=OUTDIR, help="cartella di destinazione del C liftato")
     ap.add_argument("--register-c", default=REGISTER_C, help="file di registrazione da generare")
     ap.add_argument("--register-fn", default="lbp_jobmods_register_all",
@@ -112,6 +114,8 @@ def main():
                 run = []; nz = 0; zrun = 0
         if extras:
             cmd += ["--extra-funcs", ",".join(hex(x) for x in sorted(extras))]
+        if a.fallthrough_tailcall:
+            cmd += ["--fallthrough-tailcall"]
         r = subprocess.run(cmd, capture_output=True, text=True)
         if r.returncode != 0:
             print(f"  FAIL {name}\n{r.stderr}", file=sys.stderr)

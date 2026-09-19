@@ -98,6 +98,9 @@ static void spurs_pm_wd_disarm(uint32_t wid, uint32_t spu_num)
     s_pm_wd[wid][spu_num].ctx = 0;
 }
 
+/* Salti del trampolino (SPU_DRAIN) di tutte le corse del PM: SPURS_LANE_STAT li stampa per finestra. */
+uint64_t g_spu_hops_total = 0;
+
 /* Dati (EA della coda) con cui il contesto persistente di ogni (workload,
  * SPU virtuale) e' stato avviato l'ultima volta: se cambiano, LS fresco. */
 enum { SPURS_PM_MAX_WKL_ = 16 };
@@ -227,6 +230,7 @@ int spu_run_policy_module(spu_lifted_entry_fn entry, int image_id,
 #undef KBE32
 
     /* Entry registers per cellSpursModuleEntry. */
+    const uint64_t hops0 = ctx->hops;   /* SPURS_LANE_STAT: salti del trampolino per corsa */
     ctx->gpr[0]._u32[0] = SPURS_PM_EXIT_TO_KERNEL_LS;  /* return-to-kernel link */
     ctx->gpr[1]._u32[0] = 0x3FFB0;                     /* stack (PM reloads its own) */
     ctx->gpr[3]._u32[0] = 0x100;                       /* context */
@@ -556,6 +560,7 @@ int spu_run_policy_module(spu_lifted_entry_fn entry, int image_id,
         fflush(stderr);
     }
 
+    __atomic_fetch_add(&g_spu_hops_total, ctx->hops - hops0, __ATOMIC_RELAXED);
     return g_spurs_pm_exited ? 0 : -2;
 }
 

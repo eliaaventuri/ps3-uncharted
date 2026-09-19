@@ -1531,11 +1531,17 @@ static LaneWorker* spurs_lane_pool_get(unsigned k)
  * se le lane lavorano in parallelo o se una sola fa tutto. */
 static struct { unsigned runs, lanes; unsigned long long wall_ns, lane_ns, max_lane_ns; } s_ls[16];
 static unsigned long long s_ls_t0;
+extern uint64_t g_spu_hops_total;   /* spurs_policy.c: salti del trampolino di tutte le corse */
 static void spurs_lane_stat_flush(void)
 {
     unsigned long long now = spurs_ns_now();
     if (!s_ls_t0) s_ls_t0 = now;
     if (now - s_ls_t0 < 2000000000ull) return;
+    { static uint64_t h0 = 0; uint64_t h = __atomic_load_n(&g_spu_hops_total, __ATOMIC_RELAXED);
+      unsigned long long lane_ns = 0; for (int w = 0; w < 16; w++) lane_ns += s_ls[w].lane_ns;
+      fprintf(stderr, "[lane-stat] salti del trampolino: %llu in %.1f s (%.0f per ms di lane)\n",
+              (unsigned long long)(h - h0), (now - s_ls_t0) / 1e9, lane_ns ? (double)(h - h0) / (lane_ns / 1e6) : 0.0);
+      h0 = h; }
     for (int w = 0; w < 16; w++) if (s_ls[w].runs)
         fprintf(stderr, "[lane-stat] wid=%d corse=%u lane/corsa=%.1f parete=%.0f ms lane=%.0f ms (max lane %.0f ms) in %.1f s\n",
                 w, s_ls[w].runs, (double)s_ls[w].lanes / s_ls[w].runs, s_ls[w].wall_ns / 1e6, s_ls[w].lane_ns / 1e6,
