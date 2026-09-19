@@ -21,6 +21,7 @@
 #include <dlfcn.h>
 #endif
 #include <stdint.h>
+#include <math.h>
 #include <stdatomic.h>
 #include <string.h>
 #include <stdlib.h>
@@ -296,6 +297,43 @@ static inline int mfc_do_transfer(spu_context* spu, uint32_t lsa, uint64_t ea,
               fprintf(stderr, "[dma-lswatch] img=%d ovl=%d pc=0x%05X GET lsa=0x%05X size=0x%X ea=0x%08X copre LS 0x%05X\n",
                       spu->image_id, spu->resident_ovl, (uint32_t)spu->pc & SPU_LS_MASK, lsa, size,
                       (uint32_t)ea, (uint32_t)s_lw); } }
+    /* SPU_PALETTE_CHECK=<ovl> (s.32): ogni GET di quel modulo con size multiplo
+     * di 48 (>= 16 matrici) viene letta come tavolozza di matrici 3x4 per
+     * riga e si stampa quante hanno la 3x3 non ortonormale (|det-1| > 0.05 o
+     * righe non unitarie): per capire se lo skinning collassa per matrici
+     * gia' guaste in memoria (animazione/IK sul PPU) o dopo. */
+    { static long s_pc = -2; if (s_pc == -2) { const char* e = getenv("SPU_PALETTE_CHECK"); s_pc = e ? atol(e) : -1; }
+      static long s_plo = -1, s_phi = -1; if (s_plo < 0) { const char* e = getenv("SPU_PALETTE_EA"); s_plo = 0; s_phi = 0xFFFFFFFFl; if (e) { char* c = 0; s_plo = strtol(e, &c, 16); if (c && *c == ':') s_phi = strtol(c + 1, 0, 16); } }
+      if (s_pc >= 0 && spu->resident_ovl == (int)s_pc && mfc_is_get(cmd) && size == 48u && (uint32_t)ea >= (uint32_t)s_plo && (uint32_t)ea < (uint32_t)s_phi && mfc_ea_range_committed(ea, size)) {
+          /* matrici una per volta (Uncharted: 8.700 GET da 0x30 per corsa) */
+          static unsigned long s_tot = 0, s_bad = 0, s_nan = 0; static float s_worst = 0; static uint32_t s_lo = 0xFFFFFFFFu, s_hi = 0;
+          const uint8_t* p = vm_base + (uint32_t)ea; float m[12];
+          for (int k = 0; k < 12; k++) { uint32_t w = ((uint32_t)p[k*4] << 24) | ((uint32_t)p[k*4+1] << 16) | ((uint32_t)p[k*4+2] << 8) | p[k*4+3]; memcpy(&m[k], &w, 4); }
+          float r0 = sqrtf(m[0]*m[0]+m[1]*m[1]+m[2]*m[2]), r1 = sqrtf(m[4]*m[4]+m[5]*m[5]+m[6]*m[6]), r2 = sqrtf(m[8]*m[8]+m[9]*m[9]+m[10]*m[10]);
+          float det = m[0]*(m[5]*m[10]-m[6]*m[9]) - m[1]*(m[4]*m[10]-m[6]*m[8]) + m[2]*(m[4]*m[9]-m[5]*m[8]);
+          float e1 = fabsf(r0-1)+fabsf(r1-1)+fabsf(r2-1)+fabsf(det-1);
+          /* anche il layout per colonne (4 colonne da 3 + traslazione a parte) */
+          float c0 = sqrtf(m[0]*m[0]+m[4]*m[4]+m[8]*m[8]), c1 = sqrtf(m[1]*m[1]+m[5]*m[5]+m[9]*m[9]), c2 = sqrtf(m[2]*m[2]+m[6]*m[6]+m[10]*m[10]);
+          float e2 = fabsf(c0-1)+fabsf(c1-1)+fabsf(c2-1)+fabsf(det-1);
+          float e = e1 < e2 ? e1 : e2; if (e != e) { e = 99; s_nan++;
+              static int _nn = 0; if (_nn++ < 12) { fprintf(stderr, "[palette-nan] ea=%08X lsa=%05X pc=%05X:", (uint32_t)ea, lsa, (uint32_t)spu->pc & SPU_LS_MASK);
+                  for (int k = 0; k < 12; k++) { uint32_t w = ((uint32_t)p[k*4] << 24) | ((uint32_t)p[k*4+1] << 16) | ((uint32_t)p[k*4+2] << 8) | p[k*4+3]; fprintf(stderr, " %08X", w); } fputc('\n', stderr); } }
+          s_tot++; if (e > 0.15f) s_bad++; if (e > s_worst && e < 99) s_worst = e; if ((uint32_t)ea < s_lo) s_lo = (uint32_t)ea; if ((uint32_t)ea > s_hi) s_hi = (uint32_t)ea;
+          if ((s_tot % 500) == 0 || (e > 0.15f && e < 99 && s_bad < 20)) { fprintf(stderr, "[palette] ovl %d: %lu matrici 3x4 (GET da 0x30), %lu non ortonormali, %lu NaN, peggiore %.3f, ea %08X..%08X, ultima ea=%08X lsa=%05X: [%.3f %.3f %.3f %.2f | %.3f %.3f %.3f %.2f | %.3f %.3f %.3f %.2f]\n",
+                                          spu->resident_ovl, s_tot, s_bad, s_nan, s_worst, s_lo, s_hi, (uint32_t)ea, lsa, m[0],m[1],m[2],m[3],m[4],m[5],m[6],m[7],m[8],m[9],m[10],m[11]); } }
+      if (s_pc >= 0 && spu->resident_ovl == (int)s_pc && mfc_is_get(cmd) && size >= 48u * 16u && (size % 48u) == 0 && mfc_ea_range_committed(ea, size)) {
+          static int _n = 0; static uint32_t seen[64]; int dup = 0; for (int k = 0; k < _n && k < 64; k++) if (seen[k] == (uint32_t)ea) dup = 1;
+          if (!dup && _n < 64) { seen[_n] = (uint32_t)ea;
+              const uint8_t* p = vm_base + (uint32_t)ea; unsigned nb = size / 48, bad = 0, ident = 0; float worst = 0;
+              for (unsigned b = 0; b < nb; b++) { float m[12];
+                  for (int k = 0; k < 12; k++) { uint32_t w = ((uint32_t)p[b*48+k*4] << 24) | ((uint32_t)p[b*48+k*4+1] << 16) | ((uint32_t)p[b*48+k*4+2] << 8) | p[b*48+k*4+3]; memcpy(&m[k], &w, 4); }
+                  /* righe: (m0 m1 m2 | m3), (m4 m5 m6 | m7), (m8 m9 m10 | m11) */
+                  float r0 = sqrtf(m[0]*m[0]+m[1]*m[1]+m[2]*m[2]), r1 = sqrtf(m[4]*m[4]+m[5]*m[5]+m[6]*m[6]), r2 = sqrtf(m[8]*m[8]+m[9]*m[9]+m[10]*m[10]);
+                  float det = m[0]*(m[5]*m[10]-m[6]*m[9]) - m[1]*(m[4]*m[10]-m[6]*m[8]) + m[2]*(m[4]*m[9]-m[5]*m[8]);
+                  float e1 = fabsf(r0-1)+fabsf(r1-1)+fabsf(r2-1)+fabsf(det-1); if (e1 != e1) e1 = 99;
+                  if (e1 > worst) worst = e1; if (e1 > 0.15f) bad++; if (r0 == 0 && r1 == 0 && r2 == 0) ident++; }
+              _n++;
+              fprintf(stderr, "[palette] ovl %d GET ea=%08X size=0x%X lsa=%05X: %u matrici, %u non ortonormali (peggiore %.3f), %u nulle\n", spu->resident_ovl, (uint32_t)ea, size, lsa, nb, bad, worst, ident); } } }
     /* SPU_DMA_EAWIN=<lo>:<hi> -- ogni trasferimento la cui finestra di memoria
      * principale tocca [lo,hi). Serve quando la domanda non e' "cosa fa questa
      * immagine" ma "qualcuno arriva mai fin qui": il job manager di WwsJob

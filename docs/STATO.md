@@ -576,6 +576,34 @@ Risultato (`docs/img_s32_shadows.jpg`): ponte, casse e ombre come in RPCS3
 caldi del job 215 nel livello sono a 0x11260-0x13510 (0x12A98/0x12D68...),
 NON 0xD5AC/0xD070; solo i blocchi raggiunti dal trampolino si vedono.
 
+**Le gambe: cosa e' stato escluso (s.32, tanto lavoro, nessuna causa).**
+- Le mesh delle gambe/braccia della muta escono a pezzi: nel draw della
+  "coscia" (465 vertici) ci sono TRE gruppi (`RSX_VP_DBG_VERTS=2000` +
+  proiezione in Python): il polpaccio in basso e' un tubo ben formato, in mezzo
+  una pezza ripiegata, in alto un frammento. I pirati (gambe nude, pantaloncini)
+  sono interi: il difetto e' della risorsa/rig di Drake.
+- Non sono gli helper SPU: `tests/spu_helpers_audit.c` confronta 110 helper
+  con un'implementazione dalla specifica CBEA su 1,9 milioni di ingressi
+  casuali: 0 differenze (shufb, rotq*/shlq*, cwd/chd/cbd/cdd, fsm*, mpy*,
+  conversioni, confronti, gb*, sumb...).
+- Non e' il lifter SPU: `SPU_INTERP_OVL=215,2440` (nuovo) fa girare tutto il
+  job 215 nell'interprete dal fotogramma 2440: stesse gambe mancanti.
+- Non e' il PPU: `lvewx` & co. ora caricano il quadword intero (prima
+  l'elemento a byte 0, 8.180 siti Vectormath; RPCS3 fa lo stesso) e le 16
+  istruzioni VMX che erano no-op (vsl/vsr/vslo/vsro/vpkuhum/vpkuwum/vrlh/vsrb...
+  141 siti) sono implementate: identico. Le istruzioni PPU non tradotte sono
+  finite (restano `.word` = dati e 35 `vmx_x1604` = parola 0x11417E44 non
+  standard, probabilmente dati).
+- Le matrici dei joint: il job le prende UNA per volta (GET da 0x30, 8.700 per
+  corsa) dall'area 0x20700000-0x20800000 (`SPU_PALETTE_CHECK=215
+  SPU_PALETTE_EA=lo:hi`, nuovo): il 22% non e' ortonormale ma sono oggetti
+  scalati (0.1) e strutture non-matrice; le "NaN" sono riempimenti
+  0xFFFF0000/0x7FFF0000. Niente di conclusivo.
+- Restano: i dati della risorsa (formato dei vertici della muta: pesi/indici a
+  4 ossa, ossa "twist", remap degli indici) o la catena di caricamento
+  (decompressione). Oracolo possibile: la cattura RSX di RPCS3 (i vertici che
+  arrivano alla RSX per lo stesso draw).
+
 ### Fronte aperto (dopo la sessione 32)
 
 1. Braccia e gambe della muta schiacciate (skinning multi-osso): audit degli
