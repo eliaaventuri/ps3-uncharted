@@ -1667,10 +1667,15 @@ static void mtl_bind_texture(void* ud, u32 unit, const rsx_texture_state* tex)
      * conosce e lo leggeva come B8: le probe di luce di Uncharted (cubemap
      * 16x16 per il personaggio, s.31) uscivano rumore. Texture Metal RGBA16F:
      * i valori HDR restano tali. */
-    const int hdr16 = ((fmt & 0x9Fu) == 0x9Au);
+    /* W32_Z32_Y32_X32_FLOAT (0x9B): idem a 32 bit, 16 byte per texel. La
+     * composizione finale di Uncharted legge cosi' i parametri di tone mapping
+     * (tex15, 4x1 in memoria principale): cadeva nel default "R8" e usciva
+     * rumore (s.34). */
+    const u32 hdrb  = ((fmt & 0x9Fu) == 0x9Au) ? 8u : ((fmt & 0x9Fu) == 0x9Bu) ? 16u : 0u;
+    const int hdr16 = hdrb != 0;
     if (hdr16) {
-        tl.compressed = 0; tl.block_bytes = 0; tl.bytes_per_texel = 8;
-        tl.row_bytes = width * 8u; tl.rows = height; tl.face_bytes = tl.row_bytes * height;
+        tl.compressed = 0; tl.block_bytes = 0; tl.bytes_per_texel = hdrb;
+        tl.row_bytes = width * hdrb; tl.rows = height; tl.face_bytes = tl.row_bytes * height;
         tl.swizzled = (!(fmt & 0x20u) && !(width & (width - 1)) && !(height & (height - 1))) ? 1 : 0;
     }
 
@@ -1721,7 +1726,7 @@ static void mtl_bind_texture(void* ud, u32 unit, const rsx_texture_state* tex)
       if (ce) { stale = ce; static unsigned long s_nst = 0; s_nst++;
                 if (s_nst <= 8 || (s_nst % 1000) == 0) fprintf(stderr, "[RSX metal] texture %ux%u fmt=0x%02X @%08X cambiata in memoria: ridecodifica (#%lu)\n", width, height, fmt, tex->offset, s_nst); } }
 
-    const u32 pitch = width * (hdr16 ? 8u : 4u);
+    const u32 pitch = width * (hdr16 ? hdrb : 4u);
     u8* staging = (u8*)malloc((size_t)pitch * height * nfaces);
     if (!staging) return;
     /* Un formato compresso va DECOMPRESSO: la texture Metal qui e' RGBA8, e
@@ -1736,9 +1741,10 @@ static void mtl_bind_texture(void* ud, u32 unit, const rsx_texture_state* tex)
         if (hdr16) {
             const u32 lw = rsx_log2_ceil(width), lh = rsx_log2_ceil(height);
             for (u32 y = 0; y < height; y++) for (u32 x = 0; x < width; x++) {
-                const u8* q = src + (tl.swizzled ? rsx_swizzle_offset(x, y, lw, lh) * 8u : (y * width + x) * 8u);
-                u8* o = dst + y * pitch + x * 8u;
-                for (int c = 0; c < 4; c++) { o[c*2] = q[c*2+1]; o[c*2+1] = q[c*2]; }   /* u16 BE -> LE */
+                const u8* q = src + (tl.swizzled ? rsx_swizzle_offset(x, y, lw, lh) * hdrb : (y * width + x) * hdrb);
+                u8* o = dst + y * pitch + x * hdrb;
+                if (hdrb == 8) for (int c = 0; c < 4; c++) { o[c*2] = q[c*2+1]; o[c*2+1] = q[c*2]; }   /* u16 BE -> LE */
+                else           for (int c = 0; c < 4; c++) { o[c*4] = q[c*4+3]; o[c*4+1] = q[c*4+2]; o[c*4+2] = q[c*4+1]; o[c*4+3] = q[c*4]; }   /* u32 BE -> LE */
             }
         } else if (tl.compressed)
             rsx_texture_decode_bc(dst, pitch, src, width, height, &tl);
@@ -1746,7 +1752,12 @@ static void mtl_bind_texture(void* ud, u32 unit, const rsx_texture_state* tex)
             rsx_texture_decode(dst, pitch, src, width, height, &tl,
                                rsx_texture_argb_is_rgba());
     }
-    const MTLPixelFormat hostpf = hdr16 ? MTLPixelFormatRGBA16Float : MTLPixelFormatRGBA8Unorm;
+    if (hdrb == 16 && width * height <= 4) {   /* i parametri (tone mapping): le prime 8 decodifiche */
+        static int _n = 0; if (_n++ < 8) { const float* fv = (const float*)staging;
+            fprintf(stderr, "[RSX metal] texture fp32 %ux%u @%08X f#%lu:", width, height, tex->offset, s_frame_no);
+            for (u32 q = 0; q < width * height; q++) fprintf(stderr, " (%g %g %g %g)", fv[q*4], fv[q*4+1], fv[q*4+2], fv[q*4+3]);
+            fprintf(stderr, "\n"); } }
+    const MTLPixelFormat hostpf = hdrb == 16 ? MTLPixelFormatRGBA32Float : hdr16 ? MTLPixelFormatRGBA16Float : MTLPixelFormatRGBA8Unorm;
 
     MTLTextureDescriptor* td = cube
         ? [MTLTextureDescriptor textureCubeDescriptorWithPixelFormat:hostpf
@@ -2895,13 +2906,23 @@ static void rsx_metal_backend_present_impl(void)
                                     fromRegion:MTLRegionMake2D(0,0,SW,SH) mipmapLevel:0];
                       if (bpp != 4) {   /* FP16/FP32 -> BGRA8 (tone map 1:1 con clamp) */
                           u8* cv = (u8*)malloc(SW * SH * 4);
+                          /* [surfstat]: media/massimo per canale e conteggio dei NaN
+                           * sui valori FP VERI (il .ppm li taglia a [0,1]); le
+                           * superfici fino a 16 texel (esposizione) per intero. */
+                          double ssum[4] = {0,0,0,0}; float smax[4] = {0,0,0,0}; unsigned long snan = 0;
                           if (cv) { for (NSUInteger q = 0; q < SW*SH; q++) { float c[4];
                                   if (bpp == 8) { const uint16_t* hp = (const uint16_t*)(sp + q*8);
                                       for (int j = 0; j < 4; j++) { uint16_t hv = hp[j]; uint32_t sg = (hv >> 15) & 1, ex = (hv >> 10) & 0x1F, mn = hv & 0x3FF; float f;
-                                          if (ex == 0) f = ldexpf((float)mn, -24); else if (ex == 31) f = mn ? 0.f : 65504.f; else f = ldexpf((float)(mn | 0x400), (int)ex - 25);
+                                          if (ex == 0) f = ldexpf((float)mn, -24); else if (ex == 31) { f = mn ? 0.f : 65504.f; if (mn) snan++; } else f = ldexpf((float)(mn | 0x400), (int)ex - 25);
                                           c[j] = sg ? -f : f; } }
-                                  else memcpy(c, sp + q*16, 16);
+                                  else { memcpy(c, sp + q*16, 16); for (int j = 0; j < 4; j++) if (!(c[j] == c[j])) { snan++; c[j] = 0; } }
+                                  for (int j = 0; j < 4; j++) { ssum[j] += c[j]; if (c[j] > smax[j]) smax[j] = c[j]; }
+                                  if (SW*SH <= 16) fprintf(stderr, "[surfstat] 0x%X texel %lu: %g %g %g %g\n", s_surf[k].offset, (unsigned long)q, c[0], c[1], c[2], c[3]);
                                   for (int j = 0; j < 4; j++) { float v = c[j]; if (!(v == v)) v = 0; if (v < 0) v = 0; if (v > 1) v = 1; cv[q*4 + (j == 0 ? 2 : j == 2 ? 0 : j)] = (u8)(v * 255.f + 0.5f); } }
+                              { const double n = (double)(SW*SH);
+                                fprintf(stderr, "[surfstat] 0x%X %lux%lu fp%d media=(%.4g %.4g %.4g %.4g) max=(%.4g %.4g %.4g %.4g) nan=%lu\n",
+                                        s_surf[k].offset, (unsigned long)SW, (unsigned long)SH, bpp == 8 ? 16 : 32,
+                                        ssum[0]/n, ssum[1]/n, ssum[2]/n, ssum[3]/n, smax[0], smax[1], smax[2], smax[3], snan); }
                               free(sp); sp = cv; } }
                       char sp2[128];
                       snprintf(sp2, sizeof sp2, "/tmp/rsx_surf_%08X.ppm", s_surf[k].offset);

@@ -451,6 +451,84 @@ risultati in memoria principale.** Non era mai successo in nessuna sessione.
 Riproducibile: **tre corse su tre**, identiche -- 14 comandi, un overlay
 residente, zero microstep, cinque stall e due interrupt per corsa.
 
+## Sessione 34 — la tonalita' e' deterministica: il fotogramma "slavato" era l'effetto danno del gioco
+
+**Fronte 1 chiuso: 5 corse su 5 allo stesso fotogramma 2450 danno la stessa
+immagine** (media RGB del drawable 128-135 / 120-125 / 108-112; c1-c4 di oggi
+piu' il fotogramma delle 06:05). Il caso "slavato" di c62 non e' del nostro
+renderer: nel suo drawlist la catena di post-processing su 031E0000 usa
+SHADER DIVERSI (62ECDDEF, 68D8AE17, DEC27447 x3, B9FEED90, 753654F2 x13) da
+quelli di c63 e di tutte le corse di oggi (1ACB4037, 248E54C4, 46B7C135,
+7E141F22 x3, 7F519531, EBF9BB74, 753654F2 x6, piu' D5FE4484 -> 025D0000/
+033C0000), e 7E141F22 finisce su 016D0000 invece che su 031E0000: e' un altro
+stato del gioco (l'effetto "colpito/quasi morto" di Uncharted desatura e
+sbianca lo schermo; i pirati sparano e il colpo dipende dal tempo). Quindi
+per confrontare la tonalita' con RPCS3 serve uno scatto in stato pulito da
+entrambe le parti: quello di s.31 (`docs/img_s31_rpcs3_dive_boat.jpg`, grigio
+e velato) potrebbe essere nello stesso stato "colpito".
+
+**La composizione finale (fp A310E8C2, variante 00BAFDB5 in altre corse: il
+display alterna 00050000/00410000)** letta in MSL (`RSX_FP_DUMP=A310E8C2`):
+tex0 = scena HDR 016D0000, tex1 = quadrante 320x180@032C1000 (sfocato: DOF,
+pesato con la profondita' tex3 02D50000 e c0..c8), tex2 = bloom 160x90
+031B0000 moltiplicato per la sua alpha, poi `scena * c10.x + bloom`, poi
+`* c11 + c9` (esposizione e correzione colore: COSTANTI dal PPU, nessuna
+texture di luminanza). Non legge tex14/tex15. La catena della log-luminanza
+(03120000 -> 03EB0000 40x23 -> 03EC0000 10x6 -> 03ED0000 3x2 -> 00030000
+1x1, valori ~-1.3 = log della media) resta senza lettori noti; il titolo ha
+un'esposizione automatica ("Scene Luminance = (meas)", "tonemap-adaption-time",
+"tonemap-exposure-method"), ma nel livello la tonalita' e' stabile, quindi o
+il metodo e' manuale o l'adattamento e' gia' a regime. Se la tonalita'
+tornasse a cambiare fra corse: `RSX_DRAWLIST_FPC=A310E8C2` stampa c9/c10/c11.
+Nessuno dei 306 fragment program del livello legge l'ingresso FOGC
+(`RSX_FP_DUMP=1`, `grep input.fog` = 0): la foschia e' nei materiali.
+
+**Corretto: le texture float a 32 bit (formato 0x9B, W32_Z32_Y32_X32_FLOAT)
+cadevano nel default "R8".** Uncharted lega una 4x1 fp32 in memoria
+principale (@118800/118880/118900, tex15 della composizione e di altri pass:
+parametri, es. `(-0.063 -0.339 -0.063 0.288) (-0.034 0.510 -0.034 0.410)
+(-0.015 0.237 -0.015 0.960)`) che usciva rumore. Ora `hdrb` = 8 (0x9A) o 16
+(0x9B) byte per texel, swap a 32 bit, texture Metal RGBA32Float; le prime 8
+decodifiche di texture fp32 fino a 4 texel vengono stampate. Il fotogramma
+2450 non cambia (media 128.8/120.9/110.4): chi la legge non e' sul percorso
+principale.
+
+**Strumento nuovo: `[surfstat]`** nel dump delle superfici (`RSX_DRAWLIST=n
+RSX_DUMP_FRAME=100000`): per ogni superficie FP16/FP32 media e massimo per
+canale e conteggio dei NaN sui valori VERI (il .ppm li taglia a [0,1]), e le
+superfici fino a 16 texel per intero. Numeri del livello (f#2450): scena HDR
+016D0000 media 0.53/0.49/0.43 max ~20; 025D0000 = copia a mezza risoluzione
+nel quadrante in alto a sinistra (media = 1/4 esatto); bloom 031B0000 media
+~1e-4 (varia 10x fra corse: dipende dagli sprite luminosi transitori); 0 NaN
+ovunque.
+
+**Stallo intermittente (fronte 5): 4 corse da 240 s con `GCM_WSTAT=1
+GCM_TIMELINE=400000 RSX_FRAMESTAT=50` (stall1-4), tutte a f#3550-3700 senza
+fermarsi** (7 su 7 con WSTAT contando c57-c59). Non catturato; o e' raro (1
+su 8+) o il WSTAT ne cambia il ritmo. 50 fotogrammi ogni 6,2-6,4 s = 7,9 fps
+anche dopo f#3500.
+
+**Worker Gemini: appeso.** Lanciato alle 10:53 sul confronto c62/c63
+(`tasks/TASK.md`), dopo 16 minuti nessun messaggio nel database di opencode
+(ultimo alle 01:21 di notte) e nessun errore nel log: ucciso, confronto fatto
+a mano con un `grep | sort | uniq -c | diff` (30 righe). Il vecchio task
+dell'audit degli helper SPU e' in `tasks/TASK_SPU_AUDIT.md`.
+
+### Fronte aperto (dopo la sessione 34)
+
+1. Tonalita' contro RPCS3: serve uno scatto RPCS3 in stato pulito (senza
+   l'effetto danno) alla stessa inquadratura; il nostro e' `scratchpad`
+   c1-c4 (media 130/121/108). L'icona della pistola nell'HUD manca da noi.
+2. Velocita' (7,2-7,9 fps): il collo e' l'emulazione dei job SPU
+   (~11 ms/blocco) e la latenza del dispatch del PM. Prossimo passo: `sample`
+   di 4 s nel livello e classifica dei simboli SPU (helper u128, trampolino,
+   `spu_ls_read128`), poi un solo intervento misurato alla volta.
+3. Stallo dopo f#2700: non riprodotto in 7 corse con WSTAT. Se ricompare,
+   catturare "ultimo ... da N ms" del `GCM_WSTAT`.
+4. IFE/LOOP nel decompilatore FP; `RSX_DUMP_COUNT>1`; VP/FP per coppia.
+5. Virgola mobile SPU: `spu_fi` pass-through; se un job di animazione/fisica
+   "esplode", cercare li'.
+
 ## Sessione 33 — braccia e gambe di Drake: la SPU non ha i NaN
 
 **La causa: le giunture "twist" della muta arrivano allo skinning come

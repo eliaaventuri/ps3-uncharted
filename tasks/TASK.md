@@ -1,57 +1,45 @@
-# TASK SPECIFICATION: SPU-HELPERS-AUDIT — semantica degli helper SPU contro l'interprete di RPCS3
+# TASK SPECIFICATION: TONE-01 — perche' il fotogramma 2450 della corsa c62 e' uscito "slavato"
 
 ## 1. OBIETTIVO
-Confrontare OGNI helper `spu_<mnemonico>` definito in `runtime/spu/spu_helpers.h`
-(circa 175 funzioni `static inline`) con l'implementazione della stessa
-istruzione nell'interprete SPU di RPCS3 (`tasks/ref/SPUInterpreter.cpp`, copia
-locale del sorgente ufficiale) e produrre l'elenco delle DIFFERENZE SEMANTICHE:
-casi in cui, per qualche input, il nostro helper restituisce un valore diverso
-da RPCS3. Sola analisi: nessuna modifica al codice.
+Confrontare l'elenco dei draw (`[drawlist]`) del fotogramma 2450 in due log di
+due corse dello stesso port, `~/Documents/Coding/uncharted-data/run_s33_c62.log`
+(immagine SLAVATA: mare celeste chiaro, cielo bianco) e
+`~/Documents/Coding/uncharted-data/run_s33_c63.log` (immagine normale, uguale a
+tutte le altre corse), e dire COSA differisce nella catena di post-processing.
+Sola analisi: nessuna modifica al codice. Risposta in `tasks/RESULT.md`.
 
-## 2. CONTESTO & IPOTESI
-* Il port esegue il codice SPU di un gioco (Uncharted) ricompilato in C: il
-  lifter emette chiamate a questi helper. Se un helper e' sbagliato anche solo
-  per un sottoinsieme di input, la geometria del gioco esce distorta.
-* Due bug gia' trovati per darti il livello di attenzione richiesto:
-  - `spu_fi(a,b)` fa `b*(2-a*b)` (passo di Newton per il reciproco), ma `fi`
-    segue anche `frsqest`: con b = 1/sqrt(a) il risultato e' sbagliato.
-    (Questo e' GIA' noto: non riportarlo, ma usa lo stesso rigore.)
-  - `cflts/cfltu/csflt/cuflt` avevano il fattore di scala sbagliato (corretti).
-* Attenzione a: ordine dei byte/corsie (il register file e' big-endian per
-  corsia: vedi le macro `SPU_W`/`SPU_H`/`SPU_B` in cima al file), semantica
-  "preferred slot" (corsia 0), maschere di shift/rotate (`& 0x1F`, `& 0x3F`,
-  `& 0x0F` byte vs bit, direzione di `rotqmby`/`rotqmbi`/`shlqby`), `shufb`
-  (codici speciali 0x80/0xC0/0xE0, ordine degli operandi a/b), `cbd/chd/cwd/cdd`
-  (maschere di inserimento con base r1/`imm`), `gb/gbh/gbb`, `avgb/absdb/sumb`,
-  `clz/cntb`, `fsmbi/fsm/fsmh/fsmb`, `mpy*` (quali meta' a 16 bit, segno,
-  `mpyh` = (a_hi*b_lo)<<16, `mpys` = prodotto >>16), `addx/carry/sfx/bg/bgx`,
-  `cg/cgx`, `selb` (ordine: rt = (rc & rb) | (~rc & ra)), `heq/hgt/hlgt`,
-  `fcgt/fcmgt/fceq/fcmeq` (i confronti in valore assoluto), `fesd/frds`,
-  `dfa/dfm/dfma/dfms/dfnms/dfnma`, `fscrrd/fscrwr`, `frest/frsqest` (valore
-  assoluto in frsqest; nessun inf/NaN sulla SPU: saturazione), `csflt` con
-  arrotondamento, `cflts` con saturazione, `rotqbybi/rotqmbybi/shlqbybi`
-  (contano i byte da bits 3..6), `rotma/rotmah` (shift aritmetico con
-  negazione dell'ammontare), `rothm/rotm` (idem, `-count & 0x3F`), `xsbh/xshw/xswd`,
-  `orx`, `bisl/biz/binz/bihz/bihnz` (non sono helper: ignorali).
+## 2. CONTESTO
+* Ogni riga `[drawlist] #<n> surf=<superficie> [...] vp=<hash> fp=<addr>/<hash> n=<vertici> ... blend=... sc=<scissor> ... tex: <unita>:<WxH>@<offset>/f<fmt> ...`
+  e' un draw del fotogramma; `surf=` e' la superficie di destinazione, `tex:`
+  le texture lette. Le righe stanno in blocco dopo `[drawlist] fotogramma #2450`.
+* La catena di post-processing di Uncharted, in ordine, e' (superfici):
+  scena HDR 016D0000 (1280x720) -> 03120000 (160x90) -> 031E0000 (640x360,
+  quadranti) -> 03EB0000/03EC0000/03ED0000/00030000 (log-luminanza fino a 1x1)
+  -> 03150000/03180000/031B0000 (bloom 160x90) -> composizione finale sul
+  display (surf 00050000 o 00410000, fp A310E8C2 o 00BAFDB5, 6 vertici) ->
+  HUD (fp 77331AA8). La composizione legge tex0=016D0000, tex1=320x180@032C1000,
+  tex2=160x90@031B0000, tex3=depth 02D50000.
+* Il fotogramma 2450 delle due corse ha la stessa scena (barca dei pirati con
+  scia bianca all'orizzonte), ma solo c62 e' uscito slavato. Vogliamo sapere se
+  in c62 manca un pass, se un pass ha texture/scissor/blend diversi, o se
+  l'ordine dei pass e' diverso.
 
-## 3. VINCOLI & REGOLE DI INGAGGIAMENTO
-* NON modificare alcun file del repository.
-* Non compilare, non lanciare il gioco.
-* Leggi `runtime/spu/spu_helpers.h` per intero e, per ogni helper, la funzione
-  corrispondente in `tasks/ref/SPUInterpreter.cpp` (cerca `bool spu_interpreter::<MNEMONICO_MAIUSCOLO>(` o `template ... <MNEMONICO>`); se in RPCS3 la
-  semantica e' delegata a intrinseci SSE, ragiona sulla definizione
-  dell'istruzione (CBEA) e dillo.
-* Per ogni differenza fornisci un input concreto (valori delle corsie) e i due
-  risultati attesi (nostro vs RPCS3).
+## 3. COSA PRODURRE (in `tasks/RESULT.md`, max 60 righe)
+1. Per ciascuna delle superfici della catena (016D0000, 03120000, 031E0000,
+   03EB0000, 03EC0000, 03ED0000, 00030000, 03150000, 03180000, 031B0000,
+   025D0000, 033C0000, display): numero di draw in c62 e in c63, e per i pass
+   da 6 vertici (quad a schermo intero) le differenze in `tex:`, `sc=`, `blend=`.
+2. I draw presenti in una corsa e assenti nell'altra fra quelli con n=6 o n=12
+   (i pass a schermo intero), con la riga completa.
+3. L'ordine delle superfici di destinazione (sequenza dei cambi di `surf=`
+   negli ultimi 60 draw) nelle due corse, affiancato.
+4. Se c'e' una differenza che spiega "slavato" (esposizione, un pass saltato,
+   un bloom scritto due volte), dirlo in 2 frasi; se no, dire "nessuna
+   differenza strutturale" e cosa resta da misurare.
 
-## 4. CRITERI DI SUCCESSO
-`tasks/RESULT.md` (usa `tasks/RESULT_TEMPLATE.md`) con:
-* Stato `SUCCESS`.
-* Sezione "DIFFERENZE" : tabella `helper | riga in spu_helpers.h | cosa fa il nostro | cosa fa RPCS3 | input di esempio | gravita' (alta = geometria/matematica, media = interi/maschere, bassa = casi limite inf/NaN)`.
-* Sezione "VERIFICATI UGUALI": elenco compatto dei mnemonici controllati e
-  risultati uguali (solo i nomi).
-* Sezione "NON TROVATI": helper senza corrispondenza in RPCS3 o viceversa.
-* Massimo 200 righe in RESULT.md.
-
-## 5. STOP CONDITIONS
-* Se `tasks/ref/SPUInterpreter.cpp` manca o e' vuoto: `BLOCKED`.
+## 4. VINCOLI
+* Non modificare nessun file tranne `tasks/RESULT.md`.
+* I log sono lunghi (116k e 120k righe): estrarre solo le righe `[drawlist]`
+  (grep) prima di ragionare.
+* Stato finale in cima a RESULT.md: `SUCCESS` (analisi fatta) o
+  `NEEDS_OPUS_DECISION` (dati insufficienti, spiegare cosa manca).
