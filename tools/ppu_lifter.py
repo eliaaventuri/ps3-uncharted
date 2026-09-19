@@ -139,6 +139,7 @@ SOURCE_PREAMBLE = """\
 #include <stdio.h>
 #include <string.h>
 #include <math.h>
+#include <atomic>
 
 /* Float->int conversion per Book I 4.6.7: SATURATE out-of-range (positive
  * overflow => max, negative => min, NaN => min) and honor the rounding mode
@@ -2035,9 +2036,22 @@ class PPULifter:
             return (f"{{ uint64_t ea = ({_xea(ra,rb)}) & ~0x7FULL; "
                     f"memset(vm_base + (uint32_t)ea, 0, 128); }}")
 
-        if mn in ("dcbt", "dcbtst", "dcbf", "dcbst", "dcba", "icbi",
-                  "sync", "eieio", "isync", "lwsync", "ptesync"):
-            return f"/* {mn}: cache/sync — no-op */;"
+        if mn in ("dcbt", "dcbtst", "dcbf", "dcbst", "dcba", "icbi"):
+            return f"/* {mn}: cache — no-op */;"
+
+        # Memory barriers are NOT no-ops: the lifted loads/stores are plain
+        # host accesses, and the host (ARM64) is as weakly ordered as the PPU.
+        # Without a fence the SPU lanes and the other PPU threads see a job's
+        # data land AFTER the "go" word that publishes it. sync (L=0 and L=1,
+        # the disassembler folds lwsync into "sync") and ptesync = full
+        # barrier; eieio = ordered stores/loads to cacheable memory = acq_rel;
+        # isync closes the lwarx/stwcx acquire idiom = acquire.
+        if mn in ("sync", "lwsync", "ptesync"):
+            return f"std::atomic_thread_fence(std::memory_order_seq_cst); /* {mn} */"
+        if mn == "eieio":
+            return "std::atomic_thread_fence(std::memory_order_acq_rel); /* eieio */"
+        if mn == "isync":
+            return "std::atomic_thread_fence(std::memory_order_acquire); /* isync */"
 
         # ------- addme/subfme/subfze (carry arithmetic, 2-op) -------
         if mn.startswith("addme"):

@@ -459,6 +459,23 @@ risultati in memoria principale.** Non era mai successo in nessuna sessione.
 Riproducibile: **tre corse su tre**, identiche -- 14 comandi, un overlay
 residente, zero microstep, cinque stall e due interrupt per corsa.
 
+## Sessione 36 — barriere di memoria nel lifter PPU; ShutdownWorkload/WaitForWorkloadShutdown veri
+
+**Barriere (fronte 2 della s.35, fatto).** `tools/ppu_lifter.py` emetteva
+`sync/lwsync/eieio/isync/ptesync` come no-op (2.439 siti nell'ELF): su
+ARM64, ordinato debolmente come il PPU, le lane SPU e gli altri thread PPU
+potevano vedere i dati di un job DOPO la parola che li pubblica. Ora:
+`sync`/`lwsync`/`ptesync` -> `std::atomic_thread_fence(seq_cst)` (il
+disassemblatore piega lwsync in "sync"), `eieio` -> acq_rel, `isync` ->
+acquire; `#include <atomic>` nel preambolo dei sorgenti generati (sono
+C++). Le istruzioni di cache (`dcbt/dcbf/icbi/...`) restano no-op. Il
+lift nuovo e' identico al vecchio a meno di quelle righe (verificato con
+diff a righe filtrate); ricompilato a -O2 (6 min). Costo: zero misurabile
+-- f1/f2/f3: 8,6/8,0/8,0 fps nella finestra f#2300-2500 (s.35: 8,7), 3
+corse da 200 s senza stallo, 1 morte (f3) seguita dal ricaricamento del
+checkpoint e da altri 80 s di gioco a 8-9 fps. Backup del lift e degli
+oggetti precedenti: `uncharted-data/recomp.bak_s35`, `obj/o2_s35_backup/`.
+
 ## Sessione 35 — lo stallo alla morte di Drake era il wid 3 (lista a UNA SPU) girato su 6 lane
 
 **Trovato e corretto: 3 morti su 3 (fix16, fix18 x2) seguite dal ricaricamento
