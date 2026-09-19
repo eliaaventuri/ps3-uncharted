@@ -26,6 +26,12 @@ static void SW(be128* r, int i, uint32_t v) { r->b[4*i] = v >> 24; r->b[4*i+1] =
 static uint16_t H(const be128* r, int i) { return (uint16_t)(((uint16_t)r->b[2*i] << 8) | r->b[2*i+1]); }
 static void SH(be128* r, int i, uint16_t v) { r->b[2*i] = v >> 8; r->b[2*i+1] = v; }
 static float FW(const be128* r, int i) { uint32_t v = W(r, i); float f; memcpy(&f, &v, 4); return f; }
+/* Il valore che la SPU vede in una parola (CBEA, single precision): esponente
+ * 0 = zero, esponente 255 = numero finito "esteso" (2^128 * 1.m), mai NaN. */
+static double SPUV(const be128* r, int i) { uint32_t w = W(r, i), e = w & 0x7F800000u; double v;
+    if (e && e != 0x7F800000u) return FW(r, i);
+    v = e ? ldexp((double)((w & 0x7FFFFFu) | 0x800000u), 105) : 0.0;
+    return (w & 0x80000000u) ? -v : v; }
 static void SFW(be128* r, int i, float f) { uint32_t v; memcpy(&v, &f, 4); SW(r, i, v); }
 
 static uint64_t rng_state = 0x9E3779B97F4A7C15ull;
@@ -117,11 +123,11 @@ static be128 R_cwd(uint32_t pos) { be128 r; for (int i = 0; i < 16; i++) r.b[i] 
 static be128 R_cdd(uint32_t pos) { be128 r; for (int i = 0; i < 16; i++) r.b[i] = (uint8_t)(0x10 + i); int p = pos & 8; for (int k = 0; k < 8; k++) r.b[p+k] = (uint8_t)k; return r; }
 static be128 R_csflt(be128 a, int i8) { be128 r; float f = exp2f((float)(i8 - 155)); for (int i = 0; i < 4; i++) SFW(&r, i, (float)(int32_t)W(&a, i) * f); return r; }
 static be128 R_cuflt(be128 a, int i8) { be128 r; float f = exp2f((float)(i8 - 155)); for (int i = 0; i < 4; i++) SFW(&r, i, (float)W(&a, i) * f); return r; }
-static be128 R_cflts(be128 a, int i8) { be128 r; float f = exp2f((float)(173 - i8)); for (int i = 0; i < 4; i++) { double v = (double)FW(&a, i) * f; int32_t o; if (v != v) o = 0; else if (v >= 2147483647.0) o = 0x7FFFFFFF; else if (v <= -2147483648.0) o = (int32_t)0x80000000; else o = (int32_t)v; SW(&r, i, (uint32_t)o); } return r; }
-static be128 R_cfltu(be128 a, int i8) { be128 r; float f = exp2f((float)(173 - i8)); for (int i = 0; i < 4; i++) { double v = (double)FW(&a, i) * f; uint32_t o; if (v != v || v <= 0) o = 0; else if (v >= 4294967295.0) o = 0xFFFFFFFFu; else o = (uint32_t)v; SW(&r, i, o); } return r; }
-static be128 R_fcgt(be128 a, be128 b) { be128 r; for (int i = 0; i < 4; i++) SW(&r, i, FW(&a, i) > FW(&b, i) ? 0xFFFFFFFFu : 0); return r; }
-static be128 R_fcmgt(be128 a, be128 b) { be128 r; for (int i = 0; i < 4; i++) SW(&r, i, fabsf(FW(&a, i)) > fabsf(FW(&b, i)) ? 0xFFFFFFFFu : 0); return r; }
-static be128 R_fceq(be128 a, be128 b) { be128 r; for (int i = 0; i < 4; i++) SW(&r, i, FW(&a, i) == FW(&b, i) ? 0xFFFFFFFFu : 0); return r; }
+static be128 R_cflts(be128 a, int i8) { be128 r; double f = ldexp(1.0, 173 - i8); for (int i = 0; i < 4; i++) { double v = SPUV(&a, i) * f; int32_t o; if (v >= 2147483647.0) o = 0x7FFFFFFF; else if (v <= -2147483648.0) o = (int32_t)0x80000000; else o = (int32_t)v; SW(&r, i, (uint32_t)o); } return r; }
+static be128 R_cfltu(be128 a, int i8) { be128 r; double f = ldexp(1.0, 173 - i8); for (int i = 0; i < 4; i++) { double v = SPUV(&a, i) * f; uint32_t o; if (v <= 0) o = 0; else if (v >= 4294967295.0) o = 0xFFFFFFFFu; else o = (uint32_t)v; SW(&r, i, o); } return r; }
+static be128 R_fcgt(be128 a, be128 b) { be128 r; for (int i = 0; i < 4; i++) SW(&r, i, SPUV(&a, i) > SPUV(&b, i) ? 0xFFFFFFFFu : 0); return r; }
+static be128 R_fcmgt(be128 a, be128 b) { be128 r; for (int i = 0; i < 4; i++) SW(&r, i, fabs(SPUV(&a, i)) > fabs(SPUV(&b, i)) ? 0xFFFFFFFFu : 0); return r; }
+static be128 R_fceq(be128 a, be128 b) { be128 r; for (int i = 0; i < 4; i++) SW(&r, i, SPUV(&a, i) == SPUV(&b, i) ? 0xFFFFFFFFu : 0); return r; }
 static be128 R_il(int imm) { be128 r; for (int i = 0; i < 4; i++) SW(&r, i, (uint32_t)imm); return r; }
 static be128 R_ilh(int imm) { be128 r; for (int i = 0; i < 8; i++) SH(&r, i, (uint16_t)imm); return r; }
 static be128 R_ilhu(int imm) { be128 r; for (int i = 0; i < 4; i++) SW(&r, i, (uint32_t)imm << 16); return r; }

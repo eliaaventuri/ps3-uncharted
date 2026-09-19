@@ -240,9 +240,32 @@ static inline u128 spu_rotqbii(u128 a, int sh) { sh&=7; if(!sh) return a;
     uint64_t nhi=(hi<<sh)|(lo>>(64-sh)), nlo=(lo<<sh)|(hi>>(64-sh));
     u128 r; r._u32[0]=(uint32_t)(nhi>>32); r._u32[1]=(uint32_t)nhi; r._u32[2]=(uint32_t)(nlo>>32); r._u32[3]=(uint32_t)nlo; return r; }
 
-/* ---- single-precision float (4 lanes) ---- */
-static inline u128 spu_fa(u128 a, u128 b) { u128 r; for(int i=0;i<4;i++) r._f32[i]=a._f32[i]+b._f32[i]; return r; }
-static inline u128 spu_fs(u128 a, u128 b) { u128 r; for(int i=0;i<4;i++) r._f32[i]=a._f32[i]-b._f32[i]; return r; }
+/* ---- single-precision float (4 lanes) ----
+ * La SPU NON e' IEEE (CBEA, "SPU single-precision"): niente NaN e niente
+ * infinito -- esponente 255 e' un numero finito "esteso" (fino a ~2^128),
+ * i denormali valgono zero, il risultato e' troncato verso lo zero e in
+ * overflow satura a +-0x7FFFFFFF. Con l'aritmetica IEEE dell'host un valore
+ * sentinella (0x7FFF0000, 0xFFFF0000: costanti da ilhu) diventa NaN e
+ * NaN*0 = NaN, mentre sul ferro huge*0 = 0: Uncharted (s.33) riempie cosi'
+ * gli slot delle giunture non calcolate della tavolozza di skinning e i
+ * vertici che le citano a peso 0 sparivano (gambe e braccia di Drake). Si
+ * calcola in double (prodotto di due mantisse esatto) e si riconverte con
+ * le regole della SPU. */
+static inline double spu__f2d(uint32_t w) {
+    uint32_t e = w & 0x7F800000u;
+    if (e && e != 0x7F800000u) { float f; memcpy(&f, &w, 4); return (double)f; }   /* normale: via veloce */
+    double v = e ? ldexp((double)((w & 0x7FFFFFu) | 0x800000u), 255 - 150) : 0.0;  /* esteso (exp 255) o zero */
+    return (w & 0x80000000u) ? -v : v; }
+static inline uint32_t spu__d2f(double v) {
+    uint32_t s = signbit(v) ? 0x80000000u : 0; double a = fabs(v);
+    if (a >= 0x1p128) return (a != a) ? s : (s | 0x7FFFFFFFu);   /* saturazione (NaN: impossibile da ingressi finiti) */
+    if (a < 0x1p-126) return s;                                  /* denormale -> zero */
+    float f = (float)a; uint32_t r; memcpy(&r, &f, 4);
+    if ((double)f > a) r--;                                      /* verso lo zero (f e' normale positivo) */
+    return r | s; }
+#define SPU__F(x, i) spu__f2d((x)._u32[i])
+static inline u128 spu_fa(u128 a, u128 b) { u128 r; for(int i=0;i<4;i++) r._u32[i]=spu__d2f(SPU__F(a,i)+SPU__F(b,i)); return r; }
+static inline u128 spu_fs(u128 a, u128 b) { u128 r; for(int i=0;i<4;i++) r._u32[i]=spu__d2f(SPU__F(a,i)-SPU__F(b,i)); return r; }
 
 /* Float<->int conversions with scale (RI8). CBEA: cflts/cfltu multiply by
  * 2^(173-I8), csflt/cuflt by 2^(I8-155) (rpcs3: scale[173-i8] / scale[i8-155]
@@ -251,20 +274,20 @@ static inline u128 spu_fs(u128 a, u128 b) { u128 r; for(int i=0;i<4;i++) r._f32[
  * conversion multiplied by 2^-155 = 0.0f -- Uncharted's SPU triangle culling
  * (job 215, `cflts $r,$r,172` on the projected vertices) saw every triangle as
  * degenerate and drew nothing. */
-static inline u128 spu_cflts(u128 a, int i8){ u128 r; float f=exp2f((float)(173-i8));
-    for(int i=0;i<4;i++){ double v=(double)a._f32[i]*f; if(v!=v)v=0; if(v>2147483647.0)v=2147483647.0; if(v<-2147483648.0)v=-2147483648.0; r._s32[i]=(int32_t)v; } return r; }   /* NaN -> 0 (era UB) */
-static inline u128 spu_cfltu(u128 a, int i8){ u128 r; float f=exp2f((float)(173-i8));
-    for(int i=0;i<4;i++){ double v=(double)a._f32[i]*f; if(v!=v)v=0; if(v<0)v=0; if(v>4294967295.0)v=4294967295.0; r._u32[i]=(uint32_t)v; } return r; }   /* NaN -> 0 (era UB) */
+static inline u128 spu_cflts(u128 a, int i8){ u128 r; double f=ldexp(1.0,173-i8);
+    for(int i=0;i<4;i++){ double v=SPU__F(a,i)*f; if(v>2147483647.0)v=2147483647.0; if(v<-2147483648.0)v=-2147483648.0; r._s32[i]=(int32_t)v; } return r; }   /* saturazione come la SPU */
+static inline u128 spu_cfltu(u128 a, int i8){ u128 r; double f=ldexp(1.0,173-i8);
+    for(int i=0;i<4;i++){ double v=SPU__F(a,i)*f; if(v<0)v=0; if(v>4294967295.0)v=4294967295.0; r._u32[i]=(uint32_t)v; } return r; }
 static inline u128 spu_csflt(u128 a, int i8){ u128 r; float f=exp2f((float)(i8-155));
     for(int i=0;i<4;i++) r._f32[i]=(float)a._s32[i]*f; return r; }
 static inline u128 spu_cuflt(u128 a, int i8){ u128 r; float f=exp2f((float)(i8-155));
     for(int i=0;i<4;i++) r._f32[i]=(float)a._u32[i]*f; return r; }
-static inline u128 spu_fm(u128 a, u128 b) { u128 r; for(int i=0;i<4;i++) r._f32[i]=a._f32[i]*b._f32[i]; return r; }
-static inline u128 spu_fma(u128 a, u128 b, u128 c)  { u128 r; for(int i=0;i<4;i++) r._f32[i]=a._f32[i]*b._f32[i]+c._f32[i]; return r; }
-static inline u128 spu_fms(u128 a, u128 b, u128 c)  { u128 r; for(int i=0;i<4;i++) r._f32[i]=a._f32[i]*b._f32[i]-c._f32[i]; return r; }
-static inline u128 spu_fnms(u128 a, u128 b, u128 c) { u128 r; for(int i=0;i<4;i++) r._f32[i]=c._f32[i]-a._f32[i]*b._f32[i]; return r; }
-static inline u128 spu_fceq(u128 a, u128 b) { u128 r; for(int i=0;i<4;i++) r._u32[i]=(a._f32[i]==b._f32[i])?0xFFFFFFFFu:0; return r; }
-static inline u128 spu_fcgt(u128 a, u128 b) { u128 r; for(int i=0;i<4;i++) r._u32[i]=(a._f32[i]>b._f32[i])?0xFFFFFFFFu:0; return r; }
+static inline u128 spu_fm(u128 a, u128 b) { u128 r; for(int i=0;i<4;i++) r._u32[i]=spu__d2f(SPU__F(a,i)*SPU__F(b,i)); return r; }
+static inline u128 spu_fma(u128 a, u128 b, u128 c)  { u128 r; for(int i=0;i<4;i++) r._u32[i]=spu__d2f(SPU__F(a,i)*SPU__F(b,i)+SPU__F(c,i)); return r; }
+static inline u128 spu_fms(u128 a, u128 b, u128 c)  { u128 r; for(int i=0;i<4;i++) r._u32[i]=spu__d2f(SPU__F(a,i)*SPU__F(b,i)-SPU__F(c,i)); return r; }
+static inline u128 spu_fnms(u128 a, u128 b, u128 c) { u128 r; for(int i=0;i<4;i++) r._u32[i]=spu__d2f(SPU__F(c,i)-SPU__F(a,i)*SPU__F(b,i)); return r; }
+static inline u128 spu_fceq(u128 a, u128 b) { u128 r; for(int i=0;i<4;i++) r._u32[i]=(SPU__F(a,i)==SPU__F(b,i))?0xFFFFFFFFu:0; return r; }
+static inline u128 spu_fcgt(u128 a, u128 b) { u128 r; for(int i=0;i<4;i++) r._u32[i]=(SPU__F(a,i)>SPU__F(b,i))?0xFFFFFFFFu:0; return r; }
 
 /* ---- SPU double-precision (2 doubles/reg; dword i = words 2i(high),2i+1(low)).
  * Reassemble via _u32 -- our u128 is host-LE, so a naive _f64[i] would SWAP the
@@ -382,15 +405,15 @@ static inline u128 spu_mpyh(u128 a, u128 b) { u128 r; for(int i=0;i<4;i++) r._u3
 static inline u128 spu_mpyhh(u128 a, u128 b){ u128 r; for(int i=0;i<4;i++) r._s32[i]=(int32_t)a._s16[2*i+1] * (int32_t)b._s16[2*i+1]; return r; }
 static inline u128 spu_mpys(u128 a, u128 b) { u128 r; for(int i=0;i<4;i++){ int32_t p=(int32_t)a._s16[2*i]*(int32_t)b._s16[2*i]; r._s32[i]=(int16_t)(p>>16); } return r; }
 static inline u128 spu_mpyui(u128 a, int32_t imm) { u128 r; for(int i=0;i<4;i++) r._u32[i]=(uint32_t)a._u16[2*i]*(uint32_t)(uint16_t)imm; return r; }
-static inline u128 spu_fcmeq(u128 a, u128 b){ u128 r; for(int i=0;i<4;i++){ float fa=fabsf(a._f32[i]),fb=fabsf(b._f32[i]); r._u32[i]=(fa==fb)?0xFFFFFFFFu:0; } return r; }
-static inline u128 spu_fcmgt(u128 a, u128 b){ u128 r; for(int i=0;i<4;i++){ float fa=fabsf(a._f32[i]),fb=fabsf(b._f32[i]); r._u32[i]=(fa>fb)?0xFFFFFFFFu:0; } return r; }
+static inline u128 spu_fcmeq(u128 a, u128 b){ u128 r; for(int i=0;i<4;i++){ double fa=fabs(SPU__F(a,i)),fb=fabs(SPU__F(b,i)); r._u32[i]=(fa==fb)?0xFFFFFFFFu:0; } return r; }
+static inline u128 spu_fcmgt(u128 a, u128 b){ u128 r; for(int i=0;i<4;i++){ double fa=fabs(SPU__F(a,i)),fb=fabs(SPU__F(b,i)); r._u32[i]=(fa>fb)?0xFFFFFFFFu:0; } return r; }
 /* frsqest: 1/sqrt(|a|) (the sign is ignored, CBEA). The SPU has no inf: a
  * zero gives the largest float instead of inf (which would turn into NaN on
  * the first 0*inf downstream, where hardware gives a finite value). */
-static inline u128 spu_frsqest(u128 a){ u128 r; for(int i=0;i<4;i++){ float x=fabsf(a._f32[i]); r._f32[i]= x>0.0f ? 1.0f/sqrtf(x) : 3.4028235e38f; } return r; }
+static inline u128 spu_frsqest(u128 a){ u128 r; for(int i=0;i<4;i++){ double x=fabs(SPU__F(a,i)); r._u32[i]= x>0.0 ? spu__d2f(1.0/sqrt(x)) : 0x7F800000u; } return r; }
 /* frest: reciprocal estimate; exact 1/x (fi is then the identity). Zero ->
  * largest float with the sign of the input, as the hardware saturates. */
-static inline u128 spu_frest(u128 a){ u128 r; for(int i=0;i<4;i++){ float x=a._f32[i]; r._f32[i]= x!=0.0f ? 1.0f/x : copysignf(3.4028235e38f, x); } return r; }
+static inline u128 spu_frest(u128 a){ u128 r; for(int i=0;i<4;i++){ double x=SPU__F(a,i); r._u32[i]= x!=0.0 ? spu__d2f(1.0/x) : ((a._u32[i]&0x80000000u)|0x7F800000u); } return r; }
 
 /* ---- Phase 3: sign extension ----
  * LE host: low sub-lane = _u8[2i] / _s16[2i] / _s32[2i] (the byte/half/word

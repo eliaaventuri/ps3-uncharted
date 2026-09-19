@@ -302,12 +302,44 @@ static inline int mfc_do_transfer(spu_context* spu, uint32_t lsa, uint64_t ea,
      * riga e si stampa quante hanno la 3x3 non ortonormale (|det-1| > 0.05 o
      * righe non unitarie): per capire se lo skinning collassa per matrici
      * gia' guaste in memoria (animazione/IK sul PPU) o dopo. */
+    /* SPU_PALETTE_PUT=<ovl> (s.33): ogni PUT di quel modulo con size multiplo
+     * di 48 (>= 0x300) e' una tavolozza scritta: si contano gli slot con NaN
+     * (0xFFFF0000/0x7FFF0000) GIA' nei dati in LS, per sapere se le matrici
+     * guaste nascono nel job di animazione o nel tragitto fino allo skinning. */
+    /* SPU_PALETTE_FROM=<fotogramma>: entrambi i controlli solo da li' in poi */
+    static long s_pfrom = -2; if (s_pfrom == -2) { const char* e = getenv("SPU_PALETTE_FROM"); s_pfrom = e ? atol(e) : 0; }
+    { static long s_pp = -2; if (s_pp == -2) { const char* e = getenv("SPU_PALETTE_PUT"); s_pp = e ? atol(e) : -1; }
+      extern unsigned rsx_backend_frame_no(void);
+      if (s_pp >= 0 && spu->resident_ovl == (int)s_pp && mfc_is_put(cmd) && size >= 0x300u && (size % 48u) == 0 && (long)rsx_backend_frame_no() >= s_pfrom) {
+          const uint8_t* q = &spu->ls[lsa & SPU_LS_MASK]; unsigned nb = size / 48, nn = 0, nz = 0; char lst[160]; int lp = 0; lst[0] = 0;
+          for (unsigned b = 0; b < nb; b++) { int an = 0, az = 1;
+              for (int k = 0; k < 12; k++) { uint32_t w = ((uint32_t)q[b*48+k*4] << 24) | ((uint32_t)q[b*48+k*4+1] << 16) | ((uint32_t)q[b*48+k*4+2] << 8) | q[b*48+k*4+3]; if ((w & 0x7F800000u) == 0x7F800000u && (w & 0x007FFFFFu)) an = 1; if (w) az = 0; }
+              if (an) { nn++; if (lp < 140) lp += snprintf(lst + lp, sizeof lst - lp, " %u", b); } if (az) nz++; }
+          extern unsigned rsx_backend_frame_no(void);
+          static int _n = 0; static unsigned _lf = 0; unsigned _cf = rsx_backend_frame_no();
+          if (_n++ < 400 || _cf != _lf) fprintf(stderr, "[palette-put] f#%u ovl %d pc=%05X PUT ea=%08X size=0x%X lsa=%05X: %u slot, %u NaN, %u nulli%s%s\n",
+                                          _cf, spu->resident_ovl, (uint32_t)spu->pc & SPU_LS_MASK, (uint32_t)ea, size, lsa, nb, nn, nz, nn ? " ->" : "", lst);
+          _lf = _cf; } }
+    /* SPU_NANSCAN=<ovl> (s.33): ogni GET >= 0x100 di quel modulo (da
+     * SPU_PALETTE_FROM) viene scandita a quadword: quante contengono una
+     * parola NaN (esponente tutto 1, mantissa != 0) e quali. Per risalire
+     * dall'uscita guasta di un job all'INGRESSO che gliela porta. */
+    { static long s_ns = -2; if (s_ns == -2) { const char* e = getenv("SPU_NANSCAN"); s_ns = e ? atol(e) : -1; }
+      extern unsigned rsx_backend_frame_no(void);
+      if (s_ns >= 0 && spu->resident_ovl == (int)s_ns && mfc_is_get(cmd) && size >= 0x100u && (long)rsx_backend_frame_no() >= s_pfrom && mfc_ea_range_committed(ea, size)) {
+          const uint8_t* q = vm_base + (uint32_t)ea; unsigned nq = size / 16, nn = 0; char lst[200]; int lp = 0; lst[0] = 0;
+          for (unsigned b = 0; b < nq; b++) { int an = 0;
+              for (int k = 0; k < 4; k++) { uint32_t w = ((uint32_t)q[b*16+k*4] << 24) | ((uint32_t)q[b*16+k*4+1] << 16) | ((uint32_t)q[b*16+k*4+2] << 8) | q[b*16+k*4+3]; if ((w & 0x7F800000u) == 0x7F800000u && (w & 0x007FFFFFu)) an = 1; }
+              if (an) { nn++; if (lp < 180) lp += snprintf(lst + lp, sizeof lst - lp, " %u", b); } }
+          static int _n = 0; if (_n++ < 600) fprintf(stderr, "[nanscan] f#%u ovl %d pc=%05X GET ea=%08X size=0x%X lsa=%05X: %u quad, %u con NaN%s%s\n",
+                                          rsx_backend_frame_no(), spu->resident_ovl, (uint32_t)spu->pc & SPU_LS_MASK, (uint32_t)ea, size, lsa, nq, nn, nn ? " ->" : "", lst); } }
     { static long s_pc = -2; if (s_pc == -2) { const char* e = getenv("SPU_PALETTE_CHECK"); s_pc = e ? atol(e) : -1; }
       static long s_plo = -1, s_phi = -1; if (s_plo < 0) { const char* e = getenv("SPU_PALETTE_EA"); s_plo = 0; s_phi = 0xFFFFFFFFl; if (e) { char* c = 0; s_plo = strtol(e, &c, 16); if (c && *c == ':') s_phi = strtol(c + 1, 0, 16); } }
-      if (s_pc >= 0 && spu->resident_ovl == (int)s_pc && mfc_is_get(cmd) && size == 48u && (uint32_t)ea >= (uint32_t)s_plo && (uint32_t)ea < (uint32_t)s_phi && mfc_ea_range_committed(ea, size)) {
+      if (s_pc >= 0 && spu->resident_ovl == (int)s_pc && mfc_is_get(cmd) && size >= 48u && (size % 48u) == 0 && size < 48u * 16u && (uint32_t)ea >= (uint32_t)s_plo && (uint32_t)ea < (uint32_t)s_phi && mfc_ea_range_committed(ea, size) && (long)rsx_backend_frame_no() >= s_pfrom)
+        for (uint32_t mo = 0; mo < size; mo += 48u) { const uint32_t pea = (uint32_t)ea + mo;
           /* matrici una per volta (Uncharted: 8.700 GET da 0x30 per corsa) */
           static unsigned long s_tot = 0, s_bad = 0, s_nan = 0; static float s_worst = 0; static uint32_t s_lo = 0xFFFFFFFFu, s_hi = 0;
-          const uint8_t* p = vm_base + (uint32_t)ea; float m[12];
+          const uint8_t* p = vm_base + pea; float m[12];
           for (int k = 0; k < 12; k++) { uint32_t w = ((uint32_t)p[k*4] << 24) | ((uint32_t)p[k*4+1] << 16) | ((uint32_t)p[k*4+2] << 8) | p[k*4+3]; memcpy(&m[k], &w, 4); }
           float r0 = sqrtf(m[0]*m[0]+m[1]*m[1]+m[2]*m[2]), r1 = sqrtf(m[4]*m[4]+m[5]*m[5]+m[6]*m[6]), r2 = sqrtf(m[8]*m[8]+m[9]*m[9]+m[10]*m[10]);
           float det = m[0]*(m[5]*m[10]-m[6]*m[9]) - m[1]*(m[4]*m[10]-m[6]*m[8]) + m[2]*(m[4]*m[9]-m[5]*m[8]);
@@ -315,12 +347,23 @@ static inline int mfc_do_transfer(spu_context* spu, uint32_t lsa, uint64_t ea,
           /* anche il layout per colonne (4 colonne da 3 + traslazione a parte) */
           float c0 = sqrtf(m[0]*m[0]+m[4]*m[4]+m[8]*m[8]), c1 = sqrtf(m[1]*m[1]+m[5]*m[5]+m[9]*m[9]), c2 = sqrtf(m[2]*m[2]+m[6]*m[6]+m[10]*m[10]);
           float e2 = fabsf(c0-1)+fabsf(c1-1)+fabsf(c2-1)+fabsf(det-1);
-          float e = e1 < e2 ? e1 : e2; if (e != e) { e = 99; s_nan++;
-              static int _nn = 0; if (_nn++ < 12) { fprintf(stderr, "[palette-nan] ea=%08X lsa=%05X pc=%05X:", (uint32_t)ea, lsa, (uint32_t)spu->pc & SPU_LS_MASK);
+          /* ortogonale a meno di una scala uniforme: righe di pari lunghezza e perpendicolari */
+          { float d01 = m[0]*m[4]+m[1]*m[5]+m[2]*m[6], d02 = m[0]*m[8]+m[1]*m[9]+m[2]*m[10], d12 = m[4]*m[8]+m[5]*m[9]+m[6]*m[10];
+            float mx = r0 > r1 ? (r0 > r2 ? r0 : r2) : (r1 > r2 ? r1 : r2), mn = r0 < r1 ? (r0 < r2 ? r0 : r2) : (r1 < r2 ? r1 : r2);
+            float e3 = (mx > 0) ? ((mx - mn) / mx + (fabsf(d01) + fabsf(d02) + fabsf(d12)) / (mx * mx)) : 99;
+            float dc01 = m[0]*m[1]+m[4]*m[5]+m[8]*m[9], dc02 = m[0]*m[2]+m[4]*m[6]+m[8]*m[10], dc12 = m[1]*m[2]+m[5]*m[6]+m[9]*m[10];
+            float cx = c0 > c1 ? (c0 > c2 ? c0 : c2) : (c1 > c2 ? c1 : c2), cn = c0 < c1 ? (c0 < c2 ? c0 : c2) : (c1 < c2 ? c1 : c2);
+            float e4 = (cx > 0) ? ((cx - cn) / cx + (fabsf(dc01) + fabsf(dc02) + fabsf(dc12)) / (cx * cx)) : 99;
+            e1 = e3; e2 = e4; }
+          float e = e1 < e2 ? e1 : e2; { int anynan = 0; for (int k = 0; k < 12; k++) if (m[k] != m[k]) anynan = 1; if (anynan) e = 0.0f/0.0f; }
+          if (e != e) { e = 99; s_nan++;
+              extern unsigned rsx_backend_frame_no(void);
+              static int _nn = 0; if (_nn++ < 400) { fprintf(stderr, "[palette-nan] f#%u ea=%08X slot=%u lsa=%05X+%X pc=%05X:", rsx_backend_frame_no(), pea, (pea - 0x20700000u) / 48u, lsa, mo, (uint32_t)spu->pc & SPU_LS_MASK);
                   for (int k = 0; k < 12; k++) { uint32_t w = ((uint32_t)p[k*4] << 24) | ((uint32_t)p[k*4+1] << 16) | ((uint32_t)p[k*4+2] << 8) | p[k*4+3]; fprintf(stderr, " %08X", w); } fputc('\n', stderr); } }
-          s_tot++; if (e > 0.15f) s_bad++; if (e > s_worst && e < 99) s_worst = e; if ((uint32_t)ea < s_lo) s_lo = (uint32_t)ea; if ((uint32_t)ea > s_hi) s_hi = (uint32_t)ea;
+          if (r0 == 0 && r1 == 0 && r2 == 0) { static int _nz = 0; if (_nz++ < 40) fprintf(stderr, "[palette-zero] ea=%08X (slot %u) lsa=%05X pc=%05X\n", pea, (pea - 0x20700000u) / 48u, lsa, (uint32_t)spu->pc & SPU_LS_MASK); }
+          s_tot++; if (e > 0.15f) { s_bad++; static int _nb = 0; if (e < 99 && _nb++ < 30) fprintf(stderr, "[palette-bad] ea=%08X lsa=%05X e=%.3f: [%.3f %.3f %.3f %.2f | %.3f %.3f %.3f %.2f | %.3f %.3f %.3f %.2f]\n", pea, lsa, e, m[0],m[1],m[2],m[3],m[4],m[5],m[6],m[7],m[8],m[9],m[10],m[11]); } if (e > s_worst && e < 99) s_worst = e; if (pea < s_lo) s_lo = pea; if (pea > s_hi) s_hi = pea;
           if ((s_tot % 500) == 0 || (e > 0.15f && e < 99 && s_bad < 20)) { fprintf(stderr, "[palette] ovl %d: %lu matrici 3x4 (GET da 0x30), %lu non ortonormali, %lu NaN, peggiore %.3f, ea %08X..%08X, ultima ea=%08X lsa=%05X: [%.3f %.3f %.3f %.2f | %.3f %.3f %.3f %.2f | %.3f %.3f %.3f %.2f]\n",
-                                          spu->resident_ovl, s_tot, s_bad, s_nan, s_worst, s_lo, s_hi, (uint32_t)ea, lsa, m[0],m[1],m[2],m[3],m[4],m[5],m[6],m[7],m[8],m[9],m[10],m[11]); } }
+                                          spu->resident_ovl, s_tot, s_bad, s_nan, s_worst, s_lo, s_hi, pea, lsa, m[0],m[1],m[2],m[3],m[4],m[5],m[6],m[7],m[8],m[9],m[10],m[11]); } }
       if (s_pc >= 0 && spu->resident_ovl == (int)s_pc && mfc_is_get(cmd) && size >= 48u * 16u && (size % 48u) == 0 && mfc_ea_range_committed(ea, size)) {
           static int _n = 0; static uint32_t seen[64]; int dup = 0; for (int k = 0; k < _n && k < 64; k++) if (seen[k] == (uint32_t)ea) dup = 1;
           if (!dup && _n < 64) { seen[_n] = (uint32_t)ea;
@@ -379,6 +422,17 @@ static inline int mfc_do_transfer(spu_context* spu, uint32_t lsa, uint64_t ea,
                       spu->gpr[12]._u32[0], spu->gpr[5]._u32[0], spu->gpr[26]._u32[0], lab[0], lab[1], lab[2], lab[3], lab[4]); }
           /* Il PPU aspetta un BIT dentro la parola trasferita: sapere che il
            * DMA e' partito non basta, serve il valore che porta. */
+          /* SPU_MEMDUMP=<ea>:<len> (s.33): al primo hit della finestra, la
+           * memoria principale in quell'intervallo come righe di 4 float:
+           * per vedere la STRUTTURA intorno a un GET sospetto (stride, riga
+           * (0,0,0,1), sentinelle), non solo i byte che il GET porta via. */
+          { static long s_md = -2, s_ml = 0; if (s_md == -2) { const char* e = getenv("SPU_MEMDUMP"); s_md = -1; if (e && *e) { char* c = 0; s_md = (long)strtoul(e, &c, 16); s_ml = (c && *c == ':') ? (long)strtoul(c + 1, 0, 16) : 0x100; } }
+            static int s_done = 0;
+            if (s_md >= 0 && !s_done && mfc_ea_range_committed((uint64_t)(uint32_t)s_md, (uint32_t)s_ml)) { s_done = 1;
+                fprintf(stderr, "[memdump] f#%u %08lX..%08lX (hit ea=%08X pc=%05X ovl=%d)\n", rsx_backend_frame_no(), s_md, s_md + s_ml, (uint32_t)ea, (uint32_t)spu->pc & SPU_LS_MASK, spu->resident_ovl);
+                for (long o = 0; o < s_ml; o += 16) { const uint8_t* q = vm_base + (uint32_t)(s_md + o); uint32_t w[4]; float f[4];
+                    for (int k = 0; k < 4; k++) { w[k] = ((uint32_t)q[k*4] << 24) | ((uint32_t)q[k*4+1] << 16) | ((uint32_t)q[k*4+2] << 8) | q[k*4+3]; memcpy(&f[k], &w[k], 4); }
+                    fprintf(stderr, "  %08lX: %08X %08X %08X %08X  %9.4f %9.4f %9.4f %9.4f\n", s_md + o, w[0], w[1], w[2], w[3], f[0], f[1], f[2], f[3]); } } }
           if (_n <= 100000 && mfc_is_put(cmd)) {
               const unsigned char* _p = &spu->ls[lsa & SPU_LS_MASK];
               fprintf(stderr, "            dati: %02X%02X%02X%02X %02X%02X%02X%02X",
@@ -955,6 +1009,21 @@ static inline int mfc_do_list_transfer(spu_context* spu, uint32_t list_lsa,
     /* list_size is in bytes; each element is 8 bytes */
     uint32_t num_elements = list_size / 8;
     uint32_t base_cmd = cmd & ~0x04u; /* strip the 'list' bit to get base GET/PUT */
+    /* SPU_LIST_DUMP=<lo>:<hi> (s.33): se un elemento della lista tocca la
+     * finestra, tutta la lista (EA e size di ogni elemento, LS di arrivo):
+     * la finestra da sola mostra il pezzo sospetto, non la STRUTTURA che il
+     * job sta assemblando (quante matrici, con che base, in che ordine). */
+    { static long s_lo = -2, s_hi = 0; if (s_lo == -2) { const char* e = getenv("SPU_LIST_DUMP"); s_lo = -1; if (e && *e) { char* c = 0; s_lo = (long)strtoul(e, &c, 16); s_hi = (c && *c == ':') ? (long)strtoul(c + 1, 0, 16) : s_lo + 0x100; } }
+      extern unsigned rsx_backend_frame_no(void);
+      if (s_lo >= 0) { int hit = 0;
+          for (uint32_t i = 0; i < num_elements && i < 512; i++) { uint32_t el = (list_lsa + i * 8) & SPU_LS_MASK; uint32_t sz = spu_ls_read32(spu, el) & 0x7FFF, eal = spu_ls_read32(spu, el + 4);
+              if (sz && eal < (uint32_t)s_hi && eal + sz > (uint32_t)s_lo) hit = 1; }
+          static long s_from = -2; if (s_from == -2) { const char* e = getenv("SPU_LIST_DUMP_FROM"); s_from = e ? atol(e) : 0; }
+          static int _n = 0; if (hit && (long)rsx_backend_frame_no() >= s_from && _n++ < 40) {
+              fprintf(stderr, "[list-dump] f#%u ovl=%d pc=%05X %s lista@%05X %u elementi -> LS %05X\n", rsx_backend_frame_no(), spu->resident_ovl, (uint32_t)spu->pc & SPU_LS_MASK, mfc_is_get(base_cmd) ? "GET" : "PUT", list_lsa, num_elements, spu->mfc_lsa & SPU_LS_MASK);
+              uint32_t d = spu->mfc_lsa & SPU_LS_MASK;
+              for (uint32_t i = 0; i < num_elements && i < 512; i++) { uint32_t el = (list_lsa + i * 8) & SPU_LS_MASK; uint32_t sz = spu_ls_read32(spu, el) & 0x7FFF, eal = spu_ls_read32(spu, el + 4);
+                  fprintf(stderr, "    [%3u] ea=%08X size=0x%-4X ls=%05X%s\n", i, eal, sz, d, (eal < (uint32_t)s_hi && eal + sz > (uint32_t)s_lo) ? "  <==" : ""); d += sz; } } } }
     return mfc_run_list(spu, list_lsa & SPU_LS_MASK, num_elements,
                         spu->mfc_lsa & SPU_LS_MASK, ea_base, base_cmd,
                         spu->mfc_tag);

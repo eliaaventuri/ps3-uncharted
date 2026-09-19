@@ -125,6 +125,15 @@ un puntatore nullo letto dai propri dati, e la scena 3D non si vede ancora
 finestra (frecce, Spazio/X = CROSS, C = CERCHIO, Invio = START); `PAD_SCRIPT`
 per le corse senza nessuno. Dettagli in "Sessione 27".
 
+**Dalla sessione 33 Drake e' intero** (`docs/img_s33_drake_intero.jpg`):
+braccia e gambe della muta c'erano sempre state, ma le matrici delle
+giunture "twist" arrivavano allo skinning come riempimento 0xFFFF0000/
+0x7FFF0000, che per la SPU e' un numero enorme ma finito (nessun NaN sul
+Cell) e per l'host e' NaN: peso 0 x enorme = 0 sul ferro, NaN da noi, e i
+vertici sparivano. Gli helper SPU in virgola mobile ora seguono la specifica
+CBEA (niente NaN/infinito, denormali = 0, troncamento, saturazione).
+Dettagli in "Sessione 33".
+
 **Dalla sessione 30 il livello si vede come nel gioco** (`docs/img_s30_dive_boat_colormask.png`):
 cielo intero, gru, sartie, mare, casse, HUD; i "triangoli neri" erano le
 parole `DRAW_ARRAYS` da 256 vertici mandate al backend una per una (una
@@ -441,6 +450,80 @@ La lista dei comandi ora viene percorsa fino in fondo — sei coppie
 risultati in memoria principale.** Non era mai successo in nessuna sessione.
 Riproducibile: **tre corse su tre**, identiche -- 14 comandi, un overlay
 residente, zero microstep, cinque stall e due interrupt per corsa.
+
+## Sessione 33 — braccia e gambe di Drake: la SPU non ha i NaN
+
+**La causa: le giunture "twist" della muta arrivano allo skinning come
+riempimento `FFFF0000 FFFF0000 FFFF0000 7FFF0000`, e sull'host quello e' NaN.**
+Il job 218 (`jobmod_00903d80`, costruzione della tavolozza) scrive per Drake
+una tavolozza di 142 matrici 3x4 (PUT da 0x1AA0 a 0x207092D0, base +0x30 per
+slot: `SPU_PALETTE_PUT=218`, nuovo) e 16 slot (117 119 121 122 124 125 127 128
+130 132 134 135 137 138 140 141 — coppie: le twist di braccia e cosce) escono
+con quel riempimento; anche i pirati ne hanno (4 su 122, 8 su 141, 12 su
+188) ma non nelle parti che si vedono. Gli ingressi del job sono puliti
+(`SPU_NANSCAN=218`, nuovo: 0 quadword con NaN in 5 GET da 0x14D0-0x1F10): e'
+il job stesso a lasciare quegli slot al valore sentinella (costanti da
+`ilhu`). Il job 215 (skinning) li legge con la lista DMA di ogni parte
+(`SPU_LIST_DUMP=lo:hi[,FROM]`, nuovo: tutta la lista quando un elemento tocca
+la finestra: 20-30 elementi, matrici singole o contigue a 0x30 di passo) —
+con peso 0, che sul ferro basta.
+
+Sul Cell la SPU in singola precisione NON e' IEEE: esponente 255 e' un numero
+finito "esteso" (fino a 2^128), non esiste NaN ne' infinito, i denormali
+valgono 0, il risultato e' troncato verso lo zero e satura a +-0x7FFFFFFF.
+Quindi `0x7FFF0000 * 0 = 0` e la giuntura non pesata non fa danni. I nostri
+helper (`spu_helpers.h`) facevano `a * b` in float host: NaN * 0 = NaN, i
+vertici delle cosce/braccia diventavano NaN e Metal li scartava (da qui i
+"frammenti passati 3.209 su 20.000", il depth del ponte sotto le cosce, la
+"striscia" e i "tre gruppi" della s.32: erano i vertici SUPERSTITI, quelli
+senza influenze twist). Ora `spu_fa/fs/fm/fma/fms/fnms/fceq/fcgt/fcmeq/fcmgt/
+frest/frsqest/cflts/cfltu` passano da `spu__f2d` (esponente 255 -> 2^105 * m,
+esponente 0 -> 0, normale -> via veloce) e `spu__d2f` (saturazione,
+denormale -> 0, troncamento) in double: il prodotto di due mantisse e' esatto.
+Costo: la prima versione (ldexp sempre, nextafterf) dimezzava i fotogrammi nel
+livello (f#2288 in 100 s contro 2450); con la via veloce per i normali si
+torna a f#2467 in 100 s. `tests/spu_helpers_audit.c` aggiornato alla stessa
+semantica (`SPUV`): 1,9 M confronti, 0 differenze. Risultato
+(`docs/img_s33_drake_intero.jpg`, c18): Drake intero, muta, braccia, gambe,
+piedi; pirati e ponte come prima.
+
+**La pista sbagliata della s.32 (mezza sessione): "il PPU scrive la matrice
+16 byte piu' in basso".** Il confronto fra le scritture del PPU
+(`func_00474398`, 4x4 da 64 byte) e le GET del job (3x4 da 0x30) a
+0x2078A530/0x2078A540 mischiava DUE FASI: il PPU scrive li' solo nel menu/
+caricamento (92 scritture, tutte prima del livello: `[WWATCH]` non ha limite
+su POSIX ma si ferma perche' il titolo smette), nel livello la stessa memoria
+e' la tavolozza del job 218 (0x30 di passo, base diversa per fotogramma). La
+regola: ogni confronto fra scrittori e lettori va fatto NELLO STESSO
+FOTOGRAMMA (`SPU_DMA_EAWIN_FROM`, `SPU_PALETTE_FROM`, `SPU_LIST_DUMP_FROM`,
+tutti con il numero di fotogramma RSX).
+
+Strumenti nuovi, tutti a costo zero se spenti:
+- `SPU_MEMDUMP=<ea>:<len>` (con `SPU_DMA_EAWIN`): al primo hit della finestra
+  la memoria principale come righe di 4 float — la struttura intorno a una
+  GET (passo, righe (0,0,0,1), sentinelle).
+- `YDKJ_VWATCH=<lo>:<hi>`: gli `stvx` del PPU (memcpy diretti nel codice
+  liftato, invisibili a `YDKJ_WWATCH`) con l'indirizzo dell'istruzione guest
+  (il lifter emette la chiamata `ppu_vwatch_hit`; richiede il re-lift, fatto).
+- `YDKJ_PAGEWATCH=<ea>[,_FROM=<f>]`: la pagina host va in sola lettura dopo la
+  prima write32 del PPU dal fotogramma dato; la PRIMA scrittura successiva da
+  QUALUNQUE via (memcpy dei job, HLE, stvx) fa fault e stampa pc, simbolo,
+  funzione guest e catena; le write32 del PPU aprono e chiudono da sole.
+  Nessuno scriveva 0x2070AD40 nel livello: la pagina restava muta (giusto).
+- `SPU_PALETTE_PUT=<ovl>`, `SPU_PALETTE_FROM`, `SPU_NANSCAN=<ovl>`,
+  `SPU_LIST_DUMP=lo:hi` + `SPU_LIST_DUMP_FROM`; `SPU_PALETTE_CHECK` ora
+  esamina ogni matrice delle GET multiple di 0x30 e stampa il fotogramma.
+
+### Fronte aperto (dopo la sessione 33)
+
+1. Confrontare il fotogramma con RPCS3 (`docs/img_s31_rpcs3_dive_boat.jpg`):
+   tonalita' della pelle/muta, riflessi del mare, scie delle barche (blob
+   bianchi, sprite 09E6635A con blend ONE/INV_SRC_ALPHA).
+2. Le stesse regole di virgola mobile valgono per i job di animazione/fisica:
+   se qualcosa "esplode" (NaN che prima era un numero enorme) cercare li'.
+   `spu_fi` resta un pass-through dell'estimate (Newton-Raphson non fatto).
+3. IFE/LOOP nel decompilatore FP; `RSX_DUMP_COUNT>1`; VP/FP compilati per
+   coppia; 8 fps.
 
 ## Sessione 32 — il fantasma di Drake era la WPOS: i materiali leggevano i buffer di luce con x raddoppiata
 

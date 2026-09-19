@@ -136,6 +136,48 @@ extern "C" unsigned long long ps3_ms_now(void);          /* cellGcmSys.c: orolog
 
 static struct sigaction s_prev_segv, s_prev_bus;
 
+/* YDKJ_PAGEWATCH=<ea> (s.33): la pagina host che contiene <ea> viene messa in
+ * sola lettura appena il PPU ci scrive (da YDKJ_PAGEWATCH_FROM in poi, in
+ * fotogrammi RSX); la PRIMA scrittura successiva da qualunque via (memcpy
+ * dei job SPU, stvx, HLE, ...) fa fault e qui si stampa chi e' stata, con la
+ * catena host risolta a funzione guest. Poi la pagina torna scrivibile e si
+ * riarma alla prossima write32 del PPU. Gli store scalari del PPU (vm_write32)
+ * non fanno fault: aprono e richiudono la pagina da soli. */
+#include <sys/mman.h>
+#include <dlfcn.h>
+#include <execinfo.h>
+#include <unistd.h>
+static uint8_t* s_pw_page = 0; static size_t s_pw_len = 0; static volatile int s_pw_armed = 0; static long s_pw_from = 0;
+static void pw_init(void) { static int done = 0; if (done) return; done = 1;
+    const char* e = getenv("YDKJ_PAGEWATCH"); if (!e || !*e || !vm_base) return;
+    uint32_t ea = (uint32_t)strtoul(e, 0, 16); size_t pg = (size_t)sysconf(_SC_PAGESIZE);
+    s_pw_page = (uint8_t*)(((uintptr_t)(vm_base + ea)) & ~(pg - 1)); s_pw_len = pg;
+    const char* f = getenv("YDKJ_PAGEWATCH_FROM"); s_pw_from = f ? atol(f) : 0;
+    fprintf(stderr, "[pagewatch] ea=%08X pagina host %p (+0x%zX) da f#%ld\n", ea, (void*)s_pw_page, s_pw_len, s_pw_from); }
+extern "C" unsigned rsx_backend_frame_no(void);
+static inline int pw_in(uint32_t ea) { return s_pw_page && vm_base + ea >= s_pw_page && vm_base + ea < s_pw_page + s_pw_len; }
+/* prima/dopo uno store scalare del PPU nella pagina */
+static inline void pw_open(void) { if (s_pw_armed) mprotect(s_pw_page, s_pw_len, PROT_READ | PROT_WRITE); }
+static inline void pw_close(void) {
+    if (s_pw_armed) { mprotect(s_pw_page, s_pw_len, PROT_READ); return; }
+    if ((long)rsx_backend_frame_no() >= s_pw_from) { s_pw_armed = 1; mprotect(s_pw_page, s_pw_len, PROT_READ); } }
+static int pw_fault(uintptr_t at, void* uctx) {
+    if (!s_pw_page || !s_pw_armed || at < (uintptr_t)s_pw_page || at >= (uintptr_t)s_pw_page + s_pw_len) return 0;
+    s_pw_armed = 0; mprotect(s_pw_page, s_pw_len, PROT_READ | PROT_WRITE);
+    static int _n = 0; if (_n++ >= 60) return 1;
+    uintptr_t pc = 0;
+#if defined(__APPLE__) && defined(__aarch64__)
+    pc = (uintptr_t)((ucontext_t*)uctx)->uc_mcontext->__ss.__pc;
+#endif
+    char buf[1400]; int p = snprintf(buf, sizeof buf, "[pagewatch] f#%u scrittura a guest %08X da pc=%p", rsx_backend_frame_no(), (uint32_t)(at - (uintptr_t)vm_base), (void*)pc);
+    { Dl_info di; if (pc && dladdr((void*)pc, &di) && di.dli_sname) p += snprintf(buf + p, sizeof buf - p, " (%s+0x%lx)", di.dli_sname, (unsigned long)(pc - (uintptr_t)di.dli_saddr)); }
+    { uint32_t g = ppu_prof_resolve_host((void*)pc); if (g) p += snprintf(buf + p, sizeof buf - p, " guest-fn=%08X", g); }
+    void* bt[16]; int fr = backtrace(bt, 16);
+    for (int i = 0; i < fr && p < (int)sizeof buf - 80; i++) { uint32_t g = ppu_prof_resolve_host(bt[i]); Dl_info di;
+        if (g) p += snprintf(buf + p, sizeof buf - p, " <%08X>", g);
+        else if (dladdr(bt[i], &di) && di.dli_sname) p += snprintf(buf + p, sizeof buf - p, " <%s>", di.dli_sname); }
+    p += snprintf(buf + p, sizeof buf - p, "\n"); (void)!write(2, buf, (size_t)p); return 1; }
+
 /* Async-signal-safe enough: format into a static buffer, write(2) it out. */
 static void ppu_vldf4_host(const void* v, float o[4])
 {
@@ -147,6 +189,7 @@ static void ps3_fault_report(int sig, siginfo_t* si, void* uctx)
 {
     static volatile int reported = 0;
     const uintptr_t at = (uintptr_t)si->si_addr;
+    if (pw_fault(at, uctx)) return;
 
     if (!reported) {
         reported = 1;
@@ -234,6 +277,7 @@ extern "C" void ps3_install_guest_ptr_trap(void)
     sigaction(SIGSEGV, &sa, &s_prev_segv);
     sigaction(SIGBUS,  &sa, &s_prev_bus);
 
+    pw_init();
     fprintf(stderr, "[ps3] guest-pointer trap armed (POSIX: fault handler; the low "
                     "4 GB is unmappable here, so no reservation is needed)\n");
 }
@@ -1306,7 +1350,11 @@ void vm_write32(uint64_t a, uint32_t v) { barrier_watch_hit((uint32_t)a, v, 4, _
         for(int i=0;i<fr;i++) p+=snprintf(ln+p,sizeof(ln)-p," %llX",(unsigned long long)((char*)bt[i]-mb));
         fprintf(stderr,"%s\n",ln); } } }
 #endif
-    v = __builtin_bswap32(v); memcpy(vm_base + (uint32_t)a, &v, 4);
+    v = __builtin_bswap32(v);
+#ifndef _WIN32
+    if (pw_in((uint32_t)a)) { pw_open(); memcpy(vm_base + (uint32_t)a, &v, 4); pw_close(); } else
+#endif
+    memcpy(vm_base + (uint32_t)a, &v, 4);
     /* La RSX vera comincia a consumare nell'istante in cui `put` si muove.
      * Drenare su un timer lascia una finestra in cui il titolo riempie il
      * segmento successivo mentre il walker e' ancora dentro il precedente --
@@ -1366,6 +1414,20 @@ void vm_write32(uint64_t a, uint32_t v) { barrier_watch_hit((uint32_t)a, v, 4, _
                   fprintf(stderr, "[put-bt] ref=%ld put=%08X\n", r, __builtin_bswap32(v));
                   ppu_guest_callstack("put"); } } }
         cellGcm_on_put_write(); } }
+/* YDKJ_VWATCH=<lo>:<hi> (s.33): gli store vettoriali (stvx) sono memcpy diretti
+ * nel codice liftato, quindi YDKJ_WWATCH non li vede. Il lifter emette una
+ * chiamata qui per ogni stvx che cade nella finestra, con l'indirizzo guest
+ * dell'istruzione: cosi' si trova CHI scrive una riga di matrice. */
+uint32_t g_vwatch_lo = 0, g_vwatch_hi = 0;
+static void vwatch_init(void) __attribute__((constructor));
+static void vwatch_init(void) { const char* e = getenv("YDKJ_VWATCH"); if (!e || !*e) return;
+    char* c = 0; g_vwatch_lo = (uint32_t)strtoul(e, &c, 16); g_vwatch_hi = (c && *c == ':') ? (uint32_t)strtoul(c + 1, 0, 16) : g_vwatch_lo + 0x40; }
+extern "C" void ppu_vwatch_hit(uint32_t ea, const void* v, uint32_t insn_addr) {
+    static int _n = 0; if (_n++ >= 400) return;
+    const uint8_t* b = (const uint8_t*)v; uint32_t w[4]; float f[4];
+    for (int k = 0; k < 4; k++) { w[k] = ((uint32_t)b[k*4] << 24) | ((uint32_t)b[k*4+1] << 16) | ((uint32_t)b[k*4+2] << 8) | b[k*4+3]; memcpy(&f[k], &w[k], 4); }
+    fprintf(stderr, "[VWATCH] stvx 0x%08X = %08X %08X %08X %08X (%.4f %.4f %.4f %.4f) insn=0x%08X\n", ea, w[0], w[1], w[2], w[3], f[0], f[1], f[2], f[3], insn_addr);
+}
 void vm_write64(uint64_t a, uint64_t v) {
     /* A 64-bit std used to be invisible to LBP_WW / LBP_WV: only write8/16/32
      * fed the watch, so "nothing writes this field" was a routine false

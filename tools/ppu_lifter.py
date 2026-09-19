@@ -86,6 +86,10 @@ void     vm_write8 (uint64_t addr, uint8_t  val);
 void     vm_write16(uint64_t addr, uint16_t val);
 void     vm_write32(uint64_t addr, uint32_t val);
 void     vm_write64(uint64_t addr, uint64_t val);
+/* YDKJ_VWATCH (s.33): finestra sugli store vettoriali (stvx), invisibili a
+ * YDKJ_WWATCH perche' sono memcpy diretti. */
+extern uint32_t g_vwatch_lo, g_vwatch_hi;
+void     ppu_vwatch_hit(uint32_t ea, const void* v, uint32_t insn_addr);
 /* stwcx./stdcx. store-conditional: atomically store `val` at `addr` iff the raw
  * big-endian guest word still equals `expected` (the value the paired lwarx/ldarx
  * loaded). Returns 1 if the reservation held (store applied), 0 otherwise. This
@@ -2097,6 +2101,7 @@ class PPULifter:
             ra = _reg_idx(ops[1])
             rb = _reg_idx(ops[2])
             return (f"{{ uint64_t ea = ({_xea(ra,rb)}) & ~0xFULL; "
+                    f"if (g_vwatch_hi && (uint32_t)ea >= g_vwatch_lo && (uint32_t)ea < g_vwatch_hi) ppu_vwatch_hit((uint32_t)ea, &ctx->vr[{vs}], 0x{insn.addr:08X}u); "
                     f"memcpy(vm_base + (uint32_t)ea, &ctx->vr[{vs}], 16); }}")
 
         # Cell unaligned vector loads (CBEA / AltiVec): lvlx loads bytes
