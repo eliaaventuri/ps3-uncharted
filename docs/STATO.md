@@ -600,8 +600,17 @@ job: ~20 passate a vuoto per job). E' un lavoro lungo, non una correzione.
    `spu_fi` resta un pass-through dell'estimate (Newton-Raphson non fatto).
 3. IFE/LOOP nel decompilatore FP; `RSX_DUMP_COUNT>1`; VP/FP compilati per
    coppia.
-4. Velocita' (7,2 fps): v. sopra, il collo e' l'emulazione dei job SPU e la
-   latenza del dispatch, non il PPU ne' la RSX.
+4. Velocita' (7,2-7,9 fps): v. sopra, il collo e' l'emulazione dei job SPU e
+   la latenza del dispatch, non il PPU ne' la RSX.
+5. Stallo intermittente (1 corsa su 4 da 230 s, c56): dopo il fotogramma
+   ~2700 i fotogrammi si fermano (il gioco continua: combattimento, eventi),
+   il walker smette di parcheggiare (`[parkgen]` fermo a 0x2062F660, fuori
+   dagli anelli delle lane) e la guardia dell'anello scatta la valvola su
+   tutte le lane (`prod_v - cons_v` = 1,43 MB = anello meno margine): il
+   consumatore e' fermo. Sospetto: il walker bloccato su un ACQUIRE di
+   label scritto da un job che la guardia sta frenando (ciclo). Non si e'
+   ripresentato in 3 corse con `GCM_WSTAT=1`/`GCM_TIMELINE=400000`
+   (c57-c59, f#3500). Da catturare con `GCM_WSTAT=1` ("ultimo ... da N ms").
 
 ## Sessione 32 — il fantasma di Drake era la WPOS: i materiali leggevano i buffer di luce con x raddoppiata
 

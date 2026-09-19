@@ -524,9 +524,10 @@ void cellGcmSetFlipMode(u32 mode)
 static int s_tl = -1;
 static void gcm_tl(const char* ev, unsigned a, unsigned b)
 {
-    if (s_tl < 0) s_tl = getenv("GCM_TIMELINE") ? 1 : 0;
+    static long s_cap = 60000;
+    if (s_tl < 0) { const char* e = getenv("GCM_TIMELINE"); s_tl = e ? 1 : 0; if (e && atol(e) > 1) s_cap = atol(e); }   /* GCM_TIMELINE=<n righe> */
     if (!s_tl) return;
-    static int _n = 0; if (_n++ > 60000) return;
+    static long _n = 0; if (_n++ > s_cap) return;
     extern unsigned long long rsx_us_now(void);
     fprintf(stderr, "[tl] %llu %s %08X %08X\n", rsx_us_now() % 100000000ull, ev, a, b);
 }
