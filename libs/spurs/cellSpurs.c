@@ -1640,7 +1640,12 @@ static u8 spurs_wkl_maxcont(u32 ea, u32 wid)
  * lavoro (polls==0) viene ritentato dopo 50 us << (streak-1), tetto 800 us;
  * un kick (readyCount/signal) azzera l'attesa. Una lane che non trova nulla
  * dorme SPURS_LANE_IDLE_US (default 100). */
-static struct { unsigned spumask, next_sn; unsigned idle; unsigned long long last_empty_ns; } s_lsch[CELL_SPURS_MAX_WORKLOAD];
+/* idle_mask: gli spuNum che dall'ultimo quanto CON lavoro hanno gia' visto la
+ * lista vuota. Il job manager tiene una riga di avanzamento per SPU e il PPU
+ * (func_0074073C: ticket <= min delle 6 righe) aspetta che TUTTE le SPU
+ * abbiano visto la fine della lista: il backoff scatta solo quando ogni
+ * spuNum e' passato, e finche' non lo sono si preferiscono quelli mancanti. */
+static struct { unsigned spumask, next_sn, idle_mask; unsigned idle; unsigned long long last_empty_ns; } s_lsch[CELL_SPURS_MAX_WORKLOAD];
 static int spurs_lane_sched_on(void)
 {
     static int on = -1;
@@ -1676,12 +1681,14 @@ static DWORD WINAPI spurs_lane_sched_thread(LPVOID p)
             volatile u8* rdy = vm_base + ea + SPURS_WKL_READY1 + wid;
             u32 sig = vm_read32(ea + SPURS_WKL_SIGNAL1) >> 16;    /* be u16 @0x70 */
             int kicked = (*rdy != 0) || ((sig & (0x8000u >> wid)) != 0);
+            u8 maxcont = spurs_wkl_maxcont(ea, wid);
+            const unsigned full = (1u << maxcont) - 1u;
             unsigned idle = __atomic_load_n(&s_lsch[wid].idle, __ATOMIC_RELAXED);
-            if (!kicked && idle) {
+            unsigned imask = __atomic_load_n(&s_lsch[wid].idle_mask, __ATOMIC_RELAXED);
+            if (!kicked && idle && (imask & full) == full) {
                 unsigned long long wait = 50000ull << (idle - 1);
                 if (spurs_ns_now() - __atomic_load_n(&s_lsch[wid].last_empty_ns, __ATOMIC_RELAXED) < wait) continue;
             }
-            u8 maxcont = spurs_wkl_maxcont(ea, wid);
             /* spuNum: il primo bit libero sotto maxcont A ROTAZIONE (dal
              * successivo all'ultimo assegnato), preso con CAS. Prendere sempre
              * il piu' basso lasciava i quanti brevi (5 us) tutti allo spuNum 0:
@@ -1691,8 +1698,10 @@ static DWORD WINAPI spurs_lane_sched_thread(LPVOID p)
             unsigned m = __atomic_load_n(&s_lsch[wid].spumask, __ATOMIC_RELAXED), sn = maxcont;
             unsigned start = __atomic_load_n(&s_lsch[wid].next_sn, __ATOMIC_RELAXED) % maxcont;
             for (;;) {
-                unsigned i = 0;
-                for (; i < maxcont; i++) { sn = (start + i) % maxcont; if (!(m & (1u << sn))) break; }
+                /* prima gli spuNum liberi che non hanno ancora visto la lista vuota, poi gli altri */
+                unsigned avoid = ((imask & full) == full) ? 0 : imask, i = maxcont;
+                for (int pass = 0; pass < 2 && i >= maxcont; pass++, avoid = 0)
+                    for (i = 0; i < maxcont; i++) { sn = (start + i) % maxcont; if (!(m & (1u << sn)) && !(avoid & (1u << sn))) break; }
                 if (i >= maxcont) { sn = maxcont; break; }
                 if (__atomic_compare_exchange_n(&s_lsch[wid].spumask, &m, m | (1u << sn), 0,
                                                 __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST)) break;
@@ -1702,7 +1711,8 @@ static DWORD WINAPI spurs_lane_sched_thread(LPVOID p)
             __atomic_fetch_add(&s_wkl_running[wid], 1, __ATOMIC_SEQ_CST);
             WklPm* r = __atomic_load_n(&w->shutdown, __ATOMIC_SEQ_CST) ? NULL : spurs_resolve_pm(wid);
             if (r) {
-                if (kicked) __atomic_store_n(&s_lsch[wid].idle, 0, __ATOMIC_RELAXED);
+                if (kicked) { __atomic_store_n(&s_lsch[wid].idle, 0, __ATOMIC_RELAXED);
+                              __atomic_store_n(&s_lsch[wid].idle_mask, 0, __ATOMIC_RELAXED); }
                 if (*rdy) (*rdy)--;
                 if (sig & (0x8000u >> wid))
                     vm_write32(ea + SPURS_WKL_SIGNAL1,
@@ -1715,9 +1725,13 @@ static DWORD WINAPI spurs_lane_sched_thread(LPVOID p)
                 spu_run_policy_module(r->fn, r->image_id, pm, w->sizePm, arg, wid, ea, sn);
                 unsigned long long ns = spurs_ns_now() - t0;
                 if (g_spurs_pm_polls == 0) {
-                    __atomic_store_n(&s_lsch[wid].last_empty_ns, t0 + ns, __ATOMIC_RELAXED);
-                    if (idle < 5) __atomic_store_n(&s_lsch[wid].idle, idle + 1, __ATOMIC_RELAXED);
-                } else __atomic_store_n(&s_lsch[wid].idle, 0, __ATOMIC_RELAXED);
+                    unsigned nm = __atomic_or_fetch(&s_lsch[wid].idle_mask, 1u << sn, __ATOMIC_RELAXED);
+                    if ((nm & full) == full) {
+                        __atomic_store_n(&s_lsch[wid].last_empty_ns, t0 + ns, __ATOMIC_RELAXED);
+                        if (idle < 5) __atomic_store_n(&s_lsch[wid].idle, idle + 1, __ATOMIC_RELAXED);
+                    }
+                } else { __atomic_store_n(&s_lsch[wid].idle, 0, __ATOMIC_RELAXED);
+                         __atomic_store_n(&s_lsch[wid].idle_mask, 0, __ATOMIC_RELAXED); }
                 if (s_dt && (kicked || g_spurs_pm_polls) && (s_dt_wid < 0 || (long)wid == s_dt_wid))
                     fprintf(stderr, "[spurs-disp] lane=%u spu=%u wid=%u kicked=%d arg=0x%016llX polls=%u exited=%u %.0f us\n",
                             lane, sn, wid, kicked, (unsigned long long)arg, g_spurs_pm_polls, g_spurs_pm_exited, ns / 1e3);

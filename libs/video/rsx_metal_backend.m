@@ -215,6 +215,7 @@ static u8*     s_cbs;          /* blocchi di costanti del fotogramma */
 static u32     s_cb_count;
 static u32     s_cur_mask;     /* attributi da leggere per il draw in corso */
 static int     s_vp_full;      /* s_vpd esaurito durante il draw in corso */
+static int     s_fast_draw;    /* draw in corso sulla via veloce (s.38): niente MtlVertex */
 static int use_vp(void)
 {
     static int v = -1;
@@ -494,6 +495,93 @@ static void fetch_vp_vertex(const rsx_state* st, u32 vi)
         if (s_cur_mask & (1u << a)) { rsx_fetch_attrib(st, a, vi, &s_vpd[s_vpd_used]); s_vpd_used += 4; }
 }
 
+/* Piano di fetch per draw (s.38). `rsx_fetch_attrib` per vertice e per
+ * attributo rifaceva ogni volta la risoluzione dell'offset (IO table o VRAM),
+ * i controlli sull'array e il default dal registro costante: nel livello,
+ * ~1M vertici x 5-7 attributi a fotogramma, era il 39% del thread del walker
+ * (`sample`: rsx_fetch_attrib 22%, cellGcmResolveLocated 8%,
+ * fetch_vp_vertex 7%). Qui la parte per-attributo si calcola una volta per
+ * draw e per vertice resta l'indirizzo (base della pagina da 1 MB in cache,
+ * cosi' un array in memoria principale che attraversa una pagina della IO
+ * table resta giusto) e la conversione. Semantica identica a
+ * rsx_vertex_fetch.c (default = registro costante, frequency divider,
+ * bit 31 dell'offset = main). RSX_VFETCH_FAST=0 torna alla via lenta (A/B). */
+static inline float rd_bef_i(const u8* p) { u32 w; memcpy(&w, p, 4); w = __builtin_bswap32(w); float f; memcpy(&f, &w, 4); return f; }
+static inline float rd_half_i(const u8* p)
+{
+    u32 h = ((u32)p[0] << 8) | p[1], sgn = (h >> 15) & 1u, exp = (h >> 10) & 0x1Fu, man = h & 0x3FFu, f;
+    if (exp == 0)        f = sgn << 31;
+    else if (exp == 31)  f = (sgn << 31) | 0x7F800000u | (man << 13);
+    else                 f = (sgn << 31) | ((exp - 15u + 127u) << 23) | (man << 13);
+    float o; memcpy(&o, &f, 4); return o;
+}
+typedef struct { u32 off0, stride, n, type, freq, pg; u32 pgbase; int on, main_mem, modulo, idx; float k[4]; } VaPlan;
+static VaPlan s_vplan[16]; static u32 s_vplan_n; static const rsx_state* s_vplan_st;
+/* RSX_VFETCH_CHECK=1: ogni vertice anche per la via lenta, e si contano le differenze */
+static int vfetch_check(void) { static int on = -1; if (on < 0) on = getenv("RSX_VFETCH_CHECK") ? 1 : 0; return on; }
+static unsigned long s_vfc_n, s_vfc_bad;
+static int vfetch_fast(void) { static int on = -1; if (on < 0) { const char* e = getenv("RSX_VFETCH_FAST"); on = (e && *e == '0') ? 0 : 1; } return on; }
+static void vplan_build(const rsx_state* st, u32 mask)
+{
+    static int nofreq = -1; if (nofreq < 0) nofreq = getenv("VP_NOFREQ") ? 1 : 0;
+    s_vplan_n = 0; s_vplan_st = st;
+    for (int a = 0; a < 16; a++) {
+        if (!(mask & (1u << a))) continue;
+        VaPlan* P = &s_vplan[s_vplan_n++]; P->idx = a;
+        const rsx_vertex_attrib* va = &st->vertex_attribs[a];
+        memcpy(P->k, st->vertex_data4f[a], sizeof P->k);
+        P->on = (va->enabled && va->stride && vm_base) ? 1 : 0;
+        P->off0 = va->offset & 0x7FFFFFFFu; P->main_mem = (va->offset & 0x80000000u) ? 1 : 0;
+        P->stride = va->stride; P->type = va->type;
+        P->n = va->size ? va->size : 4; if (P->n > 4) P->n = 4;
+        P->freq = (va->frequency > 1 && !nofreq) ? va->frequency : 0;
+        P->modulo = (st->frequency_divider_op & (1u << a)) ? 1 : 0;
+        P->pg = 0xFFFFFFFFu; P->pgbase = 0;
+    }
+}
+static inline void fetch_vp_vertex_fast(u32 vi)
+{
+    float* out = &s_vpd[s_vpd_used];
+    s_vpd_used += 4 * s_vplan_n;
+    for (u32 i = 0; i < s_vplan_n; i++, out += 4) {
+        VaPlan* P = &s_vplan[i];
+        out[0] = P->k[0]; out[1] = P->k[1]; out[2] = P->k[2]; out[3] = P->k[3];
+        if (!P->on) continue;
+        u32 ei = vi;
+        if (P->freq) ei = P->modulo ? (vi % P->freq) : (vi / P->freq);
+        u32 off = P->off0 + ei * P->stride, pg = off >> 20;
+        if (pg != P->pg) { P->pg = pg; P->pgbase = cellGcmResolveLocated(!P->main_mem, pg << 20); }
+        const u8* p = vm_base + P->pgbase + (off & 0xFFFFFu);
+        u32 n = P->n;
+        switch (P->type) {
+        case 2: for (u32 k = 0; k < n; k++) out[k] = rd_bef_i(p + k * 4); break;
+        case 3: for (u32 k = 0; k < n; k++) out[k] = rd_half_i(p + k * 2); break;
+        case 4: for (u32 k = 0; k < n; k++) out[k] = p[k] / 255.0f; break;
+        case 1: for (u32 k = 0; k < n; k++) out[k] = (float)(s16)((p[k*2] << 8) | p[k*2+1]) / 32767.0f; break;
+        case 5: for (u32 k = 0; k < n; k++) out[k] = (float)(s16)((p[k*2] << 8) | p[k*2+1]); break;
+        case 7: for (u32 k = 0; k < n; k++) out[k] = (float)p[k]; break;
+        case 6: { const u32 v = ((u32)p[0] << 24) | ((u32)p[1] << 16) | ((u32)p[2] << 8) | p[3];
+                  out[0] = (float)((s32)(v << 21) >> 21) / 1023.0f;
+                  out[1] = (float)((s32)(v << 10) >> 21) / 1023.0f;
+                  out[2] = (float)((s32)v >> 22) / 511.0f; break; }
+        default: for (u32 k = 0; k < n; k++) out[k] = rd_bef_i(p + k * 4); break;
+        }
+    }
+    if (vfetch_check()) {
+        out -= 4 * s_vplan_n;
+        for (u32 i = 0; i < s_vplan_n; i++) {
+            float ref[4]; rsx_fetch_attrib(s_vplan_st, s_vplan[i].idx, vi, ref);
+            s_vfc_n++;
+            if (memcmp(ref, out + 4 * i, 16) != 0) {
+                s_vfc_bad++;
+                if (s_vfc_bad <= 8) fprintf(stderr, "[vfetch-check] attr%d vi=%u: veloce %g %g %g %g  lenta %g %g %g %g (type=%u n=%u off=%08X stride=%u)\n",
+                                            s_vplan[i].idx, vi, out[4*i], out[4*i+1], out[4*i+2], out[4*i+3], ref[0], ref[1], ref[2], ref[3],
+                                            s_vplan[i].type, s_vplan[i].n, s_vplan[i].off0 | (s_vplan[i].main_mem ? 0x80000000u : 0), s_vplan[i].stride); }
+        }
+        if ((s_vfc_n & 0xFFFFF) == 0) fprintf(stderr, "[vfetch-check] %lu fetch, %lu diversi\n", s_vfc_n, s_vfc_bad);
+    }
+}
+
 /* ---- primitive conversion -------------------------------------------------
  * Metal, like D3D12, has no quads, quad strips, triangle fans or polygons, so
  * those are expanded to triangle lists on the CPU while the vertices are being
@@ -535,11 +623,17 @@ static u32 emit_vertices(const rsx_state* st, u32 prim, u32 count,
                          IndexResolver resolve, void* ctx)
 {
     u32 wrote = 0;
+    /* Con il VP del guest (s_fast_draw) il vertice va SOLO nel flusso degli
+     * attributi: la MtlVertex (pos/col/tc, 3 fetch in piu' e 48 byte da
+     * copiare nel buffer a ogni fotogramma) serve solo alla via incorporata. */
     #define PUSH(seq) do {                                                     \
-        if (s_vert_count >= MTL_MAX_VERTS) return wrote;                       \
         u32 _vi = resolve(st, (seq), ctx);                                     \
-        fetch_vertex(st, _vi, &s_verts[s_vert_count++]);                       \
-        fetch_vp_vertex(st, _vi);                                              \
+        if (s_fast_draw) fetch_vp_vertex_fast(_vi);                            \
+        else {                                                                 \
+            if (s_vert_count >= MTL_MAX_VERTS) return wrote;                   \
+            fetch_vertex(st, _vi, &s_verts[s_vert_count++]);                   \
+            fetch_vp_vertex(st, _vi);                                          \
+        }                                                                      \
         wrote++;                                                               \
     } while (0)
 
@@ -567,6 +661,7 @@ static u32 resolve_linear(const rsx_state* st, u32 seq, void* ctx)
     (void)st; return *(u32*)ctx + seq;
 }
 
+static u32 s_idx_pg = 0xFFFFFFFFu, s_idx_pgbase;   /* cache della pagina degli indici, azzerata per draw */
 static u32 resolve_indexed(const rsx_state* st, u32 seq, void* ctx)
 {
     u32 base = *(u32*)ctx;
@@ -579,10 +674,12 @@ static u32 resolve_indexed(const rsx_state* st, u32 seq, void* ctx)
      * (read_guest_index). */
     int u16type = ((st->index_array_dma >> 4) & 0xFu) == 1;
     int local   = (st->index_array_dma & 0xFu) == 0;
-    u32 ea  = cellGcmResolveLocated(local, st->index_array_offset)
-            + (base + seq) * (u16type ? 2u : 4u);
+    /* s.38: base della pagina da 1 MB in cache per draw (la risoluzione per
+     * indice costava quanto il fetch); stessa aritmetica di cellGcmResolveLocated */
+    u32 off = st->index_array_offset + (base + seq) * (u16type ? 2u : 4u), pg = off >> 20;
+    if (pg != s_idx_pg) { s_idx_pg = pg; s_idx_pgbase = cellGcmResolveLocated(local, pg << 20); }
     if (!vm_base) return 0;
-    const u8* p = vm_base + ea;
+    const u8* p = vm_base + s_idx_pgbase + (off & 0xFFFFFu);
     return u16type ? (u32)((p[0] << 8) | p[1])
                    : (u32)((p[0] << 24) | (p[1] << 16) | (p[2] << 8) | p[3]);
 }
@@ -819,8 +916,16 @@ static void record_draw(const rsx_state* st, u32 prim, u32 base, u32 count,
 
     MtlDraw tmp; memset(&tmp, 0, sizeof tmp);
     vp_begin_draw(st, &tmp);
+    /* via veloce (s.38): solo se il flusso degli attributi basta per tutto il
+     * draw gia' espanso (x3 e' il tetto di fan/quad), cosi' non c'e' il caso
+     * "pieno a meta'" che ricade sulla via incorporata senza MtlVertex */
+    s_fast_draw = (tmp.vp >= 0 && vfetch_fast() &&
+                   s_vpd_used + (u64)count * 3u * 4u * (u32)__builtin_popcount(s_cur_mask) <= MTL_VP_FLOATS) ? 1 : 0;
+    if (s_fast_draw) vplan_build(st, s_cur_mask);
     u32 first_vert = s_vert_count;
+    s_idx_pg = 0xFFFFFFFFu;
     u32 wrote = emit_vertices(st, prim, count, resolve, &base);
+    s_fast_draw = 0;
     vp_end_draw(&tmp);
     if (wrote == 0) { s_dropped_draws++; return; }
 
@@ -2636,7 +2741,7 @@ static void rsx_metal_backend_present_impl(void)
                   if (os < 0) os = getenv("RSX_ONLY_SMALL") ? 1 : 0;
                   if (os) {
                       float mnx = 1e30f, mxx = -1e30f, mny = 1e30f, mxy = -1e30f;
-                      for (u32 v = d->base; v < d->base + d->count && v < s_vert_count; v++) {
+                      for (u32 v = d->base; d->vp < 0 /* s.38: i draw con VP non hanno MtlVertex */ && v < d->base + d->count && v < s_vert_count; v++) {
                           const float* P = s_verts[v].pos;
                           if (P[0] < mnx) mnx = P[0];
                           if (P[0] > mxx) mxx = P[0];
@@ -2742,7 +2847,7 @@ static void rsx_metal_backend_present_impl(void)
                   unsigned inside = 0;
                   for (u32 i = 0; i < s_draw_count; i++) {
                       const MtlDraw* d = &s_draws[i];
-                      for (u32 v = d->base; v < d->base + d->count && v < s_vert_count; v++) {
+                      for (u32 v = d->base; d->vp < 0 /* s.38: i draw con VP non hanno MtlVertex */ && v < d->base + d->count && v < s_vert_count; v++) {
                           const float* P = s_verts[v].pos;
                           float o[4];
                           for (int r = 0; r < 4; r++)
@@ -2763,7 +2868,7 @@ static void rsx_metal_backend_present_impl(void)
                   for (u32 i = 0; i < s_draw_count; i++) {
                       const MtlDraw* d = &s_draws[i];
                       float mnx = 1e30f, mxx = -1e30f, mny = 1e30f, mxy = -1e30f;
-                      for (u32 v = d->base; v < d->base + d->count && v < s_vert_count; v++) {
+                      for (u32 v = d->base; d->vp < 0 /* s.38: i draw con VP non hanno MtlVertex */ && v < d->base + d->count && v < s_vert_count; v++) {
                           const float* P = s_verts[v].pos;
                           if (P[0] < mnx) mnx = P[0];
                           if (P[0] > mxx) mxx = P[0];

@@ -125,12 +125,14 @@ un puntatore nullo letto dai propri dati, e la scena 3D non si vede ancora
 finestra (frecce, Spazio/X = CROSS, C = CERCHIO, Invio = START); `PAD_SCRIPT`
 per le corse senza nessuno. Dettagli in "Sessione 27".
 
-**Dalla sessione 38 il livello gira a 24-26,6 fps** (era 12,6 sulla stessa
+**Dalla sessione 38 il livello gira a 28 fps** (era 12,6 sulla stessa
 corsa di riferimento): il nostro kernel SPURS faceva fork-join per ogni
 quanto (sveglia 5 lane, aspetta la piu' lenta, un workload alla volta); ora
 ogni lane sceglie da sola il workload, come le SPU vere
-(`SPURS_LANE_SCHED=1` in `run.sh`). Il collo e' passato al walker RSX (copia
-dei vertici per draw e memmove del present). Dettagli in "Sessione 38".
+(`SPURS_LANE_SCHED=1` in `run.sh`) -> 24-26,6 fps. Poi il fetch dei vertici
+del backend Metal con un piano per draw (equivalenza provata su 3,8
+miliardi di fetch) -> 28. Le lane sono all'87%, vicine alla parita' con le
+SPU vere; il titolo e' un gioco a 30 fps. Dettagli in "Sessione 38".
 
 **Dalla sessione 37 il livello gira a 13-14,5 fps** (era 10,7-11,9 sulla
 stessa finestra di orologio): `cellGcmSetWaitFlip` bloccava il PPU fino al
@@ -487,7 +489,7 @@ risultati in memoria principale.** Non era mai successo in nessuna sessione.
 Riproducibile: **tre corse su tre**, identiche -- 14 comandi, un overlay
 residente, zero microstep, cinque stall e due interrupt per corsa.
 
-## Sessione 38 — lane SPU indipendenti: il kernel SPURS non fa piu' fork-join; 12,6 -> 24-26,6 fps
+## Sessione 38 — lane SPU indipendenti (12,6 -> 24-26,6 fps) e fetch dei vertici con piano per draw (-> 28 fps)
 
 **Il collo era il modo in cui il nostro kernel SPURS distribuiva i quanti.**
 Con `SPURS_LANE_STAT=1` nel livello (finestra da 2 s a 150 s, binario s.37,
@@ -548,16 +550,54 @@ copiati sulla CPU a ogni draw), 15% in `rsx_metal_backend_present`
 erano 12). Le 8 lane non aiutano (25,5 fps): il prossimo collo e' il walker
 stesso, cioe' il costo per draw del backend Metal, non piu' le SPU.
 
+**Poi il walker: fetch dei vertici con un piano per draw -> 28,2-28,4 fps.**
+`rsx_metal_backend.m`: per i draw con VP del guest, `vplan_build` calcola
+una volta per draw base/stride/tipo/frequenza/default di ogni attributo
+della maschera e `fetch_vp_vertex_fast` fa per vertice solo indirizzo
+(base della pagina da 1 MB in cache, cosi' la IO table resta giusta) e
+conversione; niente piu' `MtlVertex` (pos/col/tc: 3 fetch in piu' e 48 MB
+di `newBufferWithBytes` a fotogramma) per quei draw; `resolve_indexed` con
+la pagina degli indici in cache per draw. Provata l'equivalenza:
+`RSX_VFETCH_CHECK=1` rifa' ogni fetch con la via lenta e confronta i byte:
+**3,8 miliardi di fetch in 120 s, 0 differenze** (le divisioni restano
+divisioni: `x*(1/255.f)` dava 1 ULP di differenza in 3% dei casi).
+`RSX_VFETCH_FAST=0` per l'A/B. Ticker: da 70% occupato (39% nel fetch) a
+53% (18%). Immagine giusta (`/tmp/s38_vf_110.png` = stessa scena).
+
+**Idle per spuNum (`idle_mask`).** Il PPU aspetta un job con
+`func_0074073C` = ticket <= min delle 6 righe di avanzamento per SPU della
+lista (61% del main thread in quel poll): ogni spuNum deve vedere la fine
+della lista. Il backoff del workload ora scatta solo quando TUTTI gli
+spuNum hanno visto la lista vuota, e finche' non lo sono si scelgono per
+primi quelli mancanti. Misurato neutro (28,2 contro 28,4), tenuto perche'
+e' la semantica giusta.
+
+**Dove va il tempo ORA:** lane al 87% (wid 12: 129.000 quanti in 2 s da 52
+us = 120 ms di lane per fotogramma, gli altri wid ~35 ms; 155 ms per
+fotogramma contro i ~165 ms di budget SPU della PS3 a 30 fps: siamo vicini
+alla parita' con il ferro), ticker 53%, PPU main per il 61% nel poll dei
+ticket. `SPURS_LANES=8` PEGGIORA (22,5 fps: 10 thread pesanti su 10 P-core,
+qualcuno finisce sugli E-core). Il titolo chiede `SetFlipMode(1)` = vsync:
+sul ferro gira a 30 fps, quindi 28 e' di fatto il ritmo del gioco. Per
+salire ancora serve che il codice SPU liftato sia PIU' VELOCE di una SPU
+vera (cache dei registri con analisi di flusso, u128 in ordine SPU).
+
+Chiuso: `RING_GUARD_LANES` 5 e' giusto -- con `GCM_RING_TRACE=1` le lane
+dell'anello sono 0-4 (12.000 check/release l'una in 75 s), lo spuNum 5 non
+e' una lane dell'anello (il job prende la lane dai propri dati, non dallo
+spuNum).
+
 ### Fronte aperto (dopo la sessione 38)
 
-1. Il walker: `draw_clause_flush` -> `record_draw`/`fetch_vp_vertex` (~18 ms
-   per fotogramma a 2.000 draw = 9 us/draw) e il memmove del present (~6 ms).
-   Guardare cosa copia `newBufferWithBytes` a ogni fotogramma e se i vertici
-   in modalita' immediata/array possono andare in un buffer condiviso senza
-   la copia per draw.
-2. Il park-watchdog da 7,5 s al caricamento del livello con le lane nuove.
-3. Perche' chiudere il flip costa ~1 fps (s.37, punto 2); giocare oltre il
-   checkpoint; `RING_GUARD_LANES` 5.
+1. Velocita' del codice SPU liftato (unica leva rimasta per i fps): cache
+   dei registri con analisi vivi/sporchi, u128 in ordine SPU (`shufb` senza
+   rev32), costo per quanto (`SPURS_PM_FRESH`: memset 16 KB + immagine).
+2. Il present: `newBufferWithBytes` del flusso degli attributi (~80 MB a
+   fotogramma, 6% del ticker): anello di 4 buffer `NoCopy` sulla memoria
+   nostra (MTL_MAX_INFLIGHT 3).
+3. Il park-watchdog da 7,5 s al caricamento del livello con le lane nuove.
+4. Perche' chiudere il flip costa ~1 fps (s.37, punto 2); giocare oltre il
+   checkpoint con la tastiera.
 
 ## Sessione 37 — cellGcmSetWaitFlip non blocca piu' il PPU: 10,7-11,9 -> 13-14,5 fps; via in linea degli accessi PPU (neutra)
 
