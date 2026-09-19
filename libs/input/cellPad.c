@@ -564,7 +564,14 @@ skip_inject: ;
                  sscanf(e, "%d,%d,%d,%d", &a,&b,&c,&d);
                  s_v[0]=(unsigned char)a; s_v[1]=(unsigned char)b;
                  s_v[2]=(unsigned char)c; s_v[3]=(unsigned char)d; } }
-      if (s_st) { hs->analog_lx = s_v[0]; hs->analog_ly = s_v[1];
+      /* PAD_STICK_FROM=<sec>: gli stick fissi solo da quel secondo in poi (prima
+       * restano al centro: nel menu lo stick sposterebbe la selezione). */
+      { static double s_from = -1.0; static unsigned long long s_t0s = 0;
+        if (s_from < 0) { const char* e = getenv("PAD_STICK_FROM"); s_from = e ? atof(e) : 0.0; }
+        if (s_st && s_from > 0) { extern unsigned long long ps3_ms_now(void);
+            unsigned long long now = ps3_ms_now(); if (!s_t0s) s_t0s = now;
+            if ((double)(now - s_t0s) / 1000.0 < s_from) s_st = 2; else if (s_st == 2) s_st = 1; } }
+      if (s_st == 1) { hs->analog_lx = s_v[0]; hs->analog_ly = s_v[1];
                   hs->analog_rx = s_v[2]; hs->analog_ry = s_v[3];
                   hs->connected = 1; }
       /* PAD_SWEEP=<seconds per step>: walk the sticks through a fixed set of
