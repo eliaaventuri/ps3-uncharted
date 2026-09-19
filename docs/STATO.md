@@ -584,6 +584,27 @@ girare in `vm_read32` (poll su 0x2000A910: aspetta i job); walker RSX busy
   il PM (spurs_policy) e' ancora a blocchi base e fa 25 M hop/s, (d) i 41-46
   ms di PPU da solo per fotogramma e gli 8,5 ms di present.
 
+**Lo stallo intermittente e' la MORTE di Drake (trovato nella corsa di
+stabilita' stab6, 240 s, 6 lane + merge).** A 130 s i fotogrammi si fermano
+a f#2950 e il log dice `Informing Npcs of player event: 'kPlayerDied'`,
+`CameraControlExplosionDeath`, `579_DeathStinger.xvag`: senza tasti (dopo i
+28 s di `LBP_AUTOPRESS_UNTIL`) Drake sta fermo e i pirati lo uccidono, in un
+tempo che varia da corsa a corsa (nelle 4 corse stall1-4 non e' successo in
+240 s). Dopo la morte il gioco continua (NPC, prefetch, e ripete
+`RemoveWorkload(wid=12)` + `AddWorkload(wid=12)`: ricrea il workload della
+geometria) ma il walker resta parcheggiato per sempre su
+`[parkgen] park a 2060D300` = il buffer di comandi per fotogramma a EA
+0x20600000 (IO 0x0A500000), FUORI dagli anelli delle lane (0x20800000+),
+esattamente come lo 0x2062F660 della s.33: quel park lo patcha un job che
+non gira piu'. Ipotesi da verificare (s.35): la nostra HLE di
+`cellSpursRemoveWorkload` butta via i job in coda invece di aspettarli (sul
+ferro il gioco aspetta che il workload sia scarico prima di rimuoverlo), o
+il gioco resetta la FIFO alla morte e il nostro walker non lo vede. Per
+riprodurlo: corsa da 240+ s senza tasti e aspettare `kPlayerDied`; oppure
+un `PAD_SCRIPT` che lo faccia morire subito. Con lo stallo spiegato, il
+fotogramma "slavato" di c62 (effetto danno) e lo stallo sono la stessa
+storia: Drake che viene colpito.
+
 ### Fronte aperto (dopo la sessione 34)
 
 1. Tonalita' contro RPCS3: serve uno scatto RPCS3 in stato pulito (senza
@@ -594,8 +615,10 @@ girare in `vm_read32` (poll su 0x2000A910: aspetta i job); walker RSX busy
    in ordine: cache dei registri nel lifter SPU; helper caldi; il PM a
    blocchi base (25 M hop/s); i 41-46 ms di PPU da solo e gli 8,5 ms di
    present per fotogramma.
-3. Stallo dopo f#2700: non riprodotto in 7 corse con WSTAT. Se ricompare,
-   catturare "ultimo ... da N ms" del `GCM_WSTAT`.
+3. Stallo dopo la morte di Drake (v. sopra): il walker resta parcheggiato
+   sul buffer per fotogramma 0x20600000 dopo `RemoveWorkload(wid=12)`.
+   Verificare la HLE di RemoveWorkload (aspetta i job in coda?) e cosa fa il
+   PPU con la FIFO alla morte (`GCM_RECDBG=1`, `GCM_WSTAT=1`).
 4. IFE/LOOP nel decompilatore FP; `RSX_DUMP_COUNT>1`; VP/FP per coppia.
 5. Virgola mobile SPU: `spu_fi` pass-through; se un job di animazione/fisica
    "esplode", cercare li'.
