@@ -584,6 +584,13 @@ sullo stesso orologio di `[ring]`). Il quadro:
   flag, contatore di spin di vm_read32 non piu' thread-local: **da 5,5-6 a
   7,2 fps** (RSX_FRAMESTAT=50, tre finestre da 50 fotogrammi: 7,3/7,2/7,2).
   `SPURS_KERN_SLEEP_US=50` vale +0,2, `GCM_PARK_POLL_US=200` 0.
+  `GCM_WAITFLIP_MS=24` (il PPU corre avanti prima): 7,5-8,3 fps ma il
+  fotogramma e' GUASTO (ombre piatte blu, mare senza riflessi: il PPU
+  riscrive risorse che il walker sta ancora leggendo, come in s.28) —
+  i 64 ms restano. Il PM rientra ~20 volte per blocco: il job manager
+  WwsJob si sincronizza con la lista dei job scritta dal PPU con liste DMA
+  stall-and-notify (`[mfc-list] STALL ... loadJobState`), quindi il ritmo
+  dei job e' il ritmo con cui il PPU li produce nei suoi ~110 ms di lavoro.
 Conclusione: per salire ancora bisogna far girare piu' in fretta i job SPU
 (costo per istruzione del codice liftato: helper u128 per valore, salto del
 trampolino per blocco con due accessi thread-local, `spu_ls_read128` con
