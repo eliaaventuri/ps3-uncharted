@@ -594,7 +594,12 @@ def find_end(start, insns_by_addr, sorted_starts, code_end):
     return min(next_start, code_end)
 
 
-def detect_functions(buf, base_override=None, verbose=True, raw=False):
+def detect_functions(buf, base_override=None, verbose=True, raw=False,
+                     merge_blocks=False, seeds_out=None):
+    """merge_blocks (s.34): solo entry, simboli, bersagli di brsl/brasl e tabelle
+    di puntatori a funzione diventano funzioni; tutti gli altri semi (bersagli
+    di salto, ritorni via link register, jump table, duff...) vanno in
+    seeds_out["labels"] e il lifter li tratta come etichette interne."""
     if raw:
         # A raw local-store image: a SPURS job binary, which the title loads
         # from its own data files as a flat code+data blob rather than as an
@@ -631,9 +636,14 @@ def detect_functions(buf, base_override=None, verbose=True, raw=False):
             seed_starts.add(s["addr"])
             if s["size"] > 0:
                 sized_funcs.append((s["addr"], s["addr"] + s["size"]))
+    label_seeds = set()
+    brsl_targets = collect_brsl_targets(insns)
     for t in collect_branch_targets(insns):
         if code_start <= t < code_end:
-            seed_starts.add(t)
+            if merge_blocks and t not in brsl_targets:
+                label_seeds.add(t)
+            else:
+                seed_starts.add(t)
     # Link-register resume addresses (`il`/`ila $r0, <code>` + a plain branch to
     # a stub that returns via `bi $r0`). Require the target to be 4-byte aligned
     # AND to decode as an instruction, so a scratch use of $r0 that happens to
@@ -648,15 +658,27 @@ def detect_functions(buf, base_override=None, verbose=True, raw=False):
               | collect_duff_targets(insns, code_start, code_end)
               | fptr_targets):
         if code_start <= t < code_end and (t & 3) == 0 and t in insns_by_addr:
-            seed_starts.add(t)
+            if merge_blocks and t not in fptr_targets:
+                label_seeds.add(t)
+            else:
+                seed_starts.add(t)
+    if seeds_out is not None:
+        seeds_out["labels"] = label_seeds - seed_starts
     if fptr_targets and verbose:
         print(f"  {len(fptr_targets)} data function-pointer-table target(s): "
               f"{', '.join(f'0x{a:X}' for a in sorted(fptr_targets))}")
 
     # Always cover the entry of the text segment itself (some images have no
     # entry point but a function at va 0).
-    if not seed_starts:
+    if not seed_starts or merge_blocks:
+        # merge_blocks: l'inizio dell'immagine e' l'ingresso del job (LS base):
+        # senza questo seme il codice prima del primo brsl restava scoperto
+        # (modulo 212 di Uncharted: nulla da 0x4000 a 0x52D0).
         seed_starts.add(code_start)
+    if merge_blocks:
+        label_seeds -= seed_starts
+        if seeds_out is not None:
+            seeds_out["labels"] = set(label_seeds)
 
     sorted_starts = sorted(seed_starts)
     sized_by_start = {s: e for (s, e) in sized_funcs}
@@ -666,6 +688,11 @@ def detect_functions(buf, base_override=None, verbose=True, raw=False):
     for start in sorted_starts:
         if start in sized_by_start:
             end = sized_by_start[start]
+        elif merge_blocks:
+            # fino alla funzione successiva: dentro ci sono cicli, ritorni
+            # anticipati e code dopo un `br`, che qui sono etichette
+            i = sorted_starts.index(start) + 1
+            end = sorted_starts[i] if i < len(sorted_starts) else code_end
         else:
             end = find_end(start, insns_by_addr, sorted_starts, code_end)
         if end > start:

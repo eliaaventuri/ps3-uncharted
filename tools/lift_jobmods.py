@@ -56,6 +56,8 @@ def main():
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--jobmods", default=JOBMODS, help="cartella con i moduli .bin")
+    ap.add_argument("--merge-blocks", action="store_true",
+                    help="passa --merge-blocks a spu_lifter.py (funzioni vere, etichette interne, s.34)")
     ap.add_argument("--fallthrough-tailcall", action="store_true",
                     help="passa --fallthrough-tailcall a spu_lifter.py (caduta in avanti = tail call, s.34)")
     ap.add_argument("--lifted", default=OUTDIR, help="cartella di destinazione del C liftato")
@@ -116,6 +118,8 @@ def main():
             cmd += ["--extra-funcs", ",".join(hex(x) for x in sorted(extras))]
         if a.fallthrough_tailcall:
             cmd += ["--fallthrough-tailcall"]
+        if a.merge_blocks:
+            cmd += ["--merge-blocks"]
         r = subprocess.run(cmd, capture_output=True, text=True)
         if r.returncode != 0:
             print(f"  FAIL {name}\n{r.stderr}", file=sys.stderr)

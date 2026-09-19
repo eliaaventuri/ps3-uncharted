@@ -548,18 +548,52 @@ girare in `vm_read32` (poll su 0x2000A910: aspetta i job); walker RSX busy
   contro 7,6/7,8/7,4 nelle stesse finestre: **entro il rumore**. L'hop non
   era il costo; il costo e' il corpo del codice liftato (registri in
   memoria a ogni blocco, blocchi da ~15 istruzioni).
-- Il PPU liftato e' compilato a -O1 (`build.sh`, ora `PPU_OPT=-O2 ./build.sh`
-  lo cambia; gli oggetti -O1 sono in `obj/o1_backup/`): prova in corso.
+- PPU liftato a -O2 (`PPU_OPT=-O2 ./build.sh`, 6 minuti con 13 clang++ in
+  parallelo; gli oggetti -O1 sono in `obj/o1_backup/`): +0,2-0,3 fps
+  (8,2/8,4/8,3/8,0/7,6 contro 8,2/8,1/8,3/7,7/7,2). Tenuto.
+- **`--merge-blocks` nel lifter SPU (fatto, acceso per i moduli di job).**
+  Prima OGNI bersaglio di salto (anche `brnz` di un ciclo) apriva una
+  "funzione" liftata: il job 215 era 240 funzioni = blocchi base, e il C non
+  vedeva mai un ciclo. Ora funzioni = entry dell'immagine (LS base, sempre)
+  + simboli + bersagli di brsl/brasl + tabelle di puntatori; tutto il resto
+  (bersagli di salto, ritorni via link register, jump table, gli
+  `--extra-funcs` dentro una funzione, l'indirizzo dopo ogni brsl/bisl) sono
+  ETICHETTE: `goto` dentro la funzione, registrate nella tabella con la
+  funzione che le contiene, e ogni funzione con etichette ha in testa
+  `switch (ctx->pc) { case <etichetta>: goto ... }` per gli ingressi da
+  trampolino/`bi`/ritorno a depth 0. Gli archi all'indietro passano da
+  `SPU_BACKEDGE`: se c'e' un interrupt in sospeso o il lockstep e' acceso
+  vanno dal trampolino come prima, altrimenti `goto`. I brsl impostano
+  `ctx->pc` prima della chiamata annidata. Modulo 215: 240 -> 153 funzioni.
+  Errore trovato e corretto al primo giro: senza il seme dell'inizio
+  immagine il codice fra LS 0x4000 e il primo brsl (modulo 212: fino a
+  0x52D0, con l'ingresso 0x4218 raggiunto da `br`) restava senza funzione ->
+  `BRANCH-TO-0 unresolved pc=0x04218` e il PM finiva nei propri dati
+  (`stopd @0x15B4`), gioco fermo prima del livello. Verifica: la traccia dei
+  dispatch di un job (`SPU_JOBTRACE=1 SPU_JOBTRACE_OVL=227 SPU_JOBTRACE_ONE=1`,
+  3000 voci) e' IDENTICA fra i due lift. Misura: hop da 11.500 a 8.100 per
+  ms di lane (quelli rimasti sono del PM, non merged: 0x2A68/0x2448/0x2C50),
+  fps +0,2-0,3 (8,5/8,5/8,5/8,1/7,7 contro 8,2/8,4/8,3/8,0/7,6); ma il tempo
+  nei corpi liftati NON cala (`sample`: jobmod 2637 contro 2302 campioni):
+  il costo e' per istruzione (gpr in memoria, helper u128), non i confini.
+- **Tutto insieme (merge + -O2 + `SPURS_FORCE_SPUS=6`, ora default in
+  `run.sh`): 8,6/8,8/8,7/8,8/8,2/8,5/8,6/8,3 fps contro 8,2/8,1/8,3/7,7/7,2/
+  7,6/7,8/7,4 = +12%.** Per andare oltre: (a) cache dei registri nel lifter
+  (variabili locali per i gpr con scrittura in ctx solo a chiamate/canali/
+  trasferimenti: lavoro lungo), (b) helper caldi (shufb/rotqby/float), (c)
+  il PM (spurs_policy) e' ancora a blocchi base e fa 25 M hop/s, (d) i 41-46
+  ms di PPU da solo per fotogramma e gli 8,5 ms di present.
 
 ### Fronte aperto (dopo la sessione 34)
 
 1. Tonalita' contro RPCS3: serve uno scatto RPCS3 in stato pulito (senza
    l'effetto danno) alla stessa inquadratura; il nostro e' `scratchpad`
    c1-c4 (media 130/121/108). L'icona della pistola nell'HUD manca da noi.
-2. Velocita' (7,2-7,9 fps): il collo e' l'emulazione dei job SPU
-   (~11 ms/blocco) e la latenza del dispatch del PM. Prossimo passo: `sample`
-   di 4 s nel livello e classifica dei simboli SPU (helper u128, trampolino,
-   `spu_ls_read128`), poi un solo intervento misurato alla volta.
+2. Velocita' (ora 8,2-8,8 fps nel livello): le lane SPU restano il collo
+   nella fase di walk (fotogramma ~ 80 ms + 224 ms di lane / N lane). Leve
+   in ordine: cache dei registri nel lifter SPU; helper caldi; il PM a
+   blocchi base (25 M hop/s); i 41-46 ms di PPU da solo e gli 8,5 ms di
+   present per fotogramma.
 3. Stallo dopo f#2700: non riprodotto in 7 corse con WSTAT. Se ricompare,
    catturare "ultimo ... da N ms" del `GCM_WSTAT`.
 4. IFE/LOOP nel decompilatore FP; `RSX_DUMP_COUNT>1`; VP/FP per coppia.

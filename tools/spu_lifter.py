@@ -126,6 +126,21 @@ u128 spu_rdch(spu_context* ctx, uint32_t channel);
 uint32_t spu_rchcnt(spu_context* ctx, uint32_t channel);
 void spu_wrch(spu_context* ctx, uint32_t channel, u128 value);
 
+/* --merge-blocks (s.34): i bersagli dei salti sono ETICHETTE dentro funzioni
+ * vere, non funzioni a se'. Un ciclo resta un ciclo C. Sull'arco all'indietro
+ * si guarda se c'e' un interrupt in sospeso o il lockstep acceso: in quel caso
+ * si passa dal trampolino come prima (che prende l'interrupt / fa il tick),
+ * altrimenti `goto`. La funzione rientrata dal trampolino ha in testa uno
+ * switch su ctx->pc che porta all'etichetta. */
+extern volatile int g_yz_lockstep_on;
+static inline int spu_backedge_pending(const spu_context* ctx)
+{
+    return (ctx->int_enable && (ctx->event_status & ctx->event_mask)) || g_yz_lockstep_on != 0;
+}
+#define SPU_BACKEDGE(ctx, tgt, fn, lbl) do { \
+        if (__builtin_expect(spu_backedge_pending(ctx), 0)) { (ctx)->pc = (tgt); g_spu_trampoline_fn = fn; return; } \
+        goto lbl; } while (0)
+
 /* Execution trace (only emitted when the lifter was invoked with --trace). */
 void spu_trace_init(const char* path);
 void spu_trace_pc(spu_context* ctx, uint32_t pc);
@@ -208,6 +223,8 @@ class LiftedFunction:
     end_addr: int = 0
     body_lines: list[str] = field(default_factory=list)
     calls: list[int] = field(default_factory=list)
+    cur_addr: int = 0     # istruzione in traduzione (--merge-blocks: archi all'indietro)
+    labels: list = field(default_factory=list)   # --merge-blocks: ingressi interni registrati
 
 
 # Mnemonics whose last operand is a branch target address (0x...).
@@ -491,6 +508,15 @@ class SPULifter:
         # compute_link_returns(). Emitted as `return;` so they compose with the
         # brsl->C-call nesting instead of branching to an unregistered PC.
         self.link_return: set = set()
+        # --merge-blocks: etichette (bersagli di salto, ritorni, voci di jump
+        # table) per funzione e proprietario di ogni etichetta.
+        self.merge_blocks: bool = False
+        self.labels_by_func: dict = {}    # start -> set(addr)
+        self.label_owner: dict = {}       # addr -> start della funzione che la contiene
+
+    def _owner(self, tgt: int) -> int:
+        """La funzione liftata da chiamare per arrivare a tgt (tgt stessa se e' un inizio)."""
+        return self.label_owner.get(tgt, tgt)
 
     # ------------------------------------------------------------------ #
     def lift_function(self, insns: list[SPUInstruction],
@@ -505,6 +531,18 @@ class SPULifter:
             tgt = self._branch_target(insn)
             if tgt is not None and start <= tgt < end:
                 internal.add(tgt)
+        if self.merge_blocks:
+            internal |= {a for a in self.labels_by_func.get(start, ()) if start < a < end}
+            entries = sorted(a for a in internal if a != start)
+            if entries:
+                # ingresso da un salto (trampolino, bi, ritorno a depth 0) a
+                # un'etichetta: ctx->pc dice dove; l'inizio o un pc estraneo
+                # cadono nel corpo dall'alto.
+                func.body_lines.append("    switch ((uint32_t)ctx->pc & SPU_LS_MASK) {")
+                for a in entries:
+                    func.body_lines.append(f"    case 0x{a:X}u: goto loc_{a:08X};")
+                func.body_lines.append("    default: break; }")
+            func.labels = entries
 
         last_insn = None
         for insn in insns:
@@ -512,6 +550,7 @@ class SPULifter:
                 continue
             if insn.addr in internal:
                 func.body_lines.append(f"loc_{insn.addr:08X}:")
+            func.cur_addr = insn.addr
             c = self._translate(insn, func)
             if c:
                 if self.trace:
@@ -887,9 +926,10 @@ class SPULifter:
                 # ret_link = l'indirizzo di ritorno di QUESTA chiamata: SPU_DRAIN
                 # lo usa per riconoscere un `bi $rN` (rN != r0) che e' il ritorno
                 # e non un salto calcolato. Salvato/ripristinato per annidamento.
+                setpc = f"ctx->pc = 0x{tgt:X}u; " if self.merge_blocks else ""
                 return (f"{link} {{ int32_t _si = (int32_t)ctx->image_id; "
                         f"uint32_t _rl = ctx->ret_link; ctx->ret_link = 0x{addr + 4:X}u; "
-                        f"ctx->host_depth++; {self.prefix}spu_func_{tgt:08X}(ctx); "
+                        f"ctx->host_depth++; {setpc}{self.prefix}spu_func_{self._owner(tgt):08X}(ctx); "
                         f"SPU_DRAIN(ctx); ctx->host_depth--; ctx->ret_link = _rl; "
                         f"spu_img_restore(ctx, _si); }}")
             return f"{link} /* TODO spu: brsl unresolved target */;"
@@ -900,12 +940,14 @@ class SPULifter:
                 return (f'/* TODO spu: {mn} {insn.operands} */ '
                         f'spu_unsupported(0x{insn.addr:X}, "{mn}");')
             if func.start_addr <= tgt < func.end_addr:
+                if self.merge_blocks and tgt <= insn.addr:
+                    return f"if ({cond}) SPU_BACKEDGE(ctx, 0x{tgt:X}u, {func.name}, loc_{tgt:08X});"
                 return f"if ({cond}) goto loc_{tgt:08X};"
             self.branch_targets.add(tgt)
             # Cross-function conditional branch = conditional tail: hand the
             # target to the trampoline and unwind (enclosing SPU_DRAIN re-enters).
             return (f"if ({cond}) {{ ctx->pc = 0x{tgt:X}; "
-                    f"g_spu_trampoline_fn = {self.prefix}spu_func_{tgt:08X}; return; }}")
+                    f"g_spu_trampoline_fn = {self.prefix}spu_func_{self._owner(tgt):08X}; return; }}")
         # Interrupt enable/disable bits on the bi family (bie/bid, irete/iretd,
         # bisle(d)...): bit 0x40000 = E (enable), 0x80000 = D (disable), taking
         # effect when the branch is TAKEN. The WWS jobmanager's poll loop runs
@@ -1011,12 +1053,14 @@ class SPULifter:
         if tgt is None:
             return "/* TODO spu: unresolved branch */;"
         if func.start_addr <= tgt < func.end_addr:
+            if self.merge_blocks and tgt <= func.cur_addr:
+                return f"SPU_BACKEDGE(ctx, 0x{tgt:X}u, {func.name}, loc_{tgt:08X});"
             return f"goto loc_{tgt:08X};"
         self.branch_targets.add(tgt)
         # Cross-function unconditional tail: hand the target to the trampoline
         # and unwind so the enclosing SPU_DRAIN re-enters (no host-stack growth).
         return (f"{{ ctx->pc = 0x{tgt:X}; "
-                f"g_spu_trampoline_fn = {self.prefix}spu_func_{tgt:08X}; return; }}")
+                f"g_spu_trampoline_fn = {self.prefix}spu_func_{self._owner(tgt):08X}; return; }}")
 
     # ------------------------------------------------------------------ #
     def emit_header(self) -> str:
@@ -1052,6 +1096,8 @@ class SPULifter:
         # on a registered mid-function entry (if one was emitted) or halts
         # cleanly with a "PC X not registered" diagnostic.
         defined = {f.start_addr for f in self.functions}
+        for f in self.functions:
+            defined |= set(f.labels)
         externs = sorted((self.call_targets | self.branch_targets) - defined)
         if externs:
             lines.append("/* Indirect-dispatch stubs for cross-function targets the")
@@ -1069,6 +1115,10 @@ class SPULifter:
         lines.append("static const spu_func_entry spu_function_table[] = {")
         for f in self.functions:
             lines.append(f'    {{ 0x{f.start_addr:08X}u, {f.name}, "{f.name}" }},')
+            # --merge-blocks: ogni etichetta si risolve alla funzione che la
+            # contiene (che poi salta all'etichetta con lo switch d'ingresso).
+            for a in f.labels:
+                lines.append(f'    {{ 0x{a:08X}u, {f.name}, "{f.name}" }},')
         lines.append("    { 0, NULL, NULL }")
         lines.append("};")
         lines.append("")
@@ -1103,6 +1153,12 @@ def main() -> None:
                         "targets + STT_FUNC symbols). When set, .text is "
                         "read from this ELF and the positional <input> arg "
                         "is ignored.")
+    p.add_argument("--merge-blocks", action="store_true",
+                   help="Funzioni liftate = funzioni vere (entry, simboli, bersagli "
+                        "di brsl/brasl, tabelle di puntatori); tutti gli altri "
+                        "bersagli di salto sono etichette interne (switch "
+                        "d'ingresso su ctx->pc, registrate nella tabella). I cicli "
+                        "restano cicli C. Richiede --auto-functions.")
     p.add_argument("--fallthrough-tailcall", action="store_true",
                    help="La caduta in avanti nella funzione liftata successiva "
                         "e' una tail call diretta (musttail) invece di un hop "
@@ -1145,11 +1201,14 @@ def main() -> None:
         from find_spu_functions import detect_functions, parse_elf, pick_text
         with open(args.auto_functions, "rb") as f:
             elf_buf = f.read()
-        funcs, (text_off, base, size) = detect_functions(elf_buf)
+        seeds_out = {}
+        funcs, (text_off, base, size) = detect_functions(
+            elf_buf, merge_blocks=bool(args.merge_blocks), seeds_out=seeds_out)
         data = elf_buf[text_off:text_off + size]
         if args.base != 0:
             base = args.base  # caller override
         bounds = funcs
+        label_seeds = set(seeds_out.get("labels", ()))
     else:
         with open(args.input, "rb") as f:
             data = f.read()
@@ -1166,6 +1225,9 @@ def main() -> None:
         else:
             # No boundary info: treat the whole image as one function.
             bounds = [(base, base + len(data))]
+        label_seeds = set()
+    if args.merge_blocks and not args.auto_functions:
+        sys.exit("--merge-blocks richiede --auto-functions")
 
     # Add extra function entry points (indirect-branch targets auto-detect misses)
     # by splitting whichever bound contains each address.
@@ -1176,7 +1238,9 @@ def main() -> None:
             newb = []
             split = False
             for (s, e) in bset:
-                if s < a < e:
+                if s < a < e and args.merge_blocks:
+                    label_seeds.add(a); newb.append((s, e)); split = True   # etichetta, non funzione
+                elif s < a < e:
                     newb.append((s, a)); newb.append((a, e)); split = True
                 else:
                     newb.append((s, e))
@@ -1234,6 +1298,45 @@ def main() -> None:
               f"{', '.join(f'0x{a:X}' for a in sorted(lifter.link_return))}")
     lifter.func_starts = {s for s, e in bounds}  # for fall-through tail-call chaining
     lifter.fallthrough_tailcall = bool(args.fallthrough_tailcall)
+    lifter.merge_blocks = bool(args.merge_blocks)
+    if args.merge_blocks:
+        # Etichette: i semi non promossi a funzione, gli extra dentro una
+        # funzione, e l'indirizzo di ritorno di ogni brsl/bisl (un `bi $r0` a
+        # depth 0 -- dopo un restack -- lo dispatcha per pc).
+        for ins in insns:
+            if ins.mnemonic in ("brsl", "brasl", "bisl", "bisled", "bislee", "bisledd"):
+                label_seeds.add(ins.addr + 4)
+        starts = sorted(s for s, e in bounds)
+        ends = {s: e for s, e in bounds}
+        for a in label_seeds:
+            # la funzione che la contiene: l'ultimo inizio <= a
+            lo, hi = 0, len(starts)
+            while lo < hi:
+                mid = (lo + hi) // 2
+                if starts[mid] <= a: lo = mid + 1
+                else: hi = mid
+            if lo == 0: continue
+            st = starts[lo - 1]
+            if st < a < ends[st]:
+                lifter.labels_by_func.setdefault(st, set()).add(a)
+                lifter.label_owner[a] = st
+        # anche i bersagli diretti di salto interni a una funzione (proprietario
+        # per i salti che arrivano da un'altra funzione)
+        for ins in insns:
+            t = SPULifter._branch_target(ins)
+            if t is None: continue
+            lo, hi = 0, len(starts)
+            while lo < hi:
+                mid = (lo + hi) // 2
+                if starts[mid] <= t: lo = mid + 1
+                else: hi = mid
+            if lo == 0: continue
+            st = starts[lo - 1]
+            if st < t < ends[st]:
+                lifter.labels_by_func.setdefault(st, set()).add(t)
+                lifter.label_owner[t] = st
+        sys.stderr.write("[spu_lifter] merge-blocks: %d funzioni, %d etichette\n" %
+                         (len(bounds), len(lifter.label_owner)))
     for s, e in bounds:
         lifter.lift_function(insns, s, e)
 
