@@ -476,6 +476,23 @@ corse da 200 s senza stallo, 1 morte (f3) seguita dal ricaricamento del
 checkpoint e da altri 80 s di gioco a 8-9 fps. Backup del lift e degli
 oggetti precedenti: `uncharted-data/recomp.bak_s35`, `obj/o2_s35_backup/`.
 
+**ShutdownWorkload/WaitForWorkloadShutdown veri (fronte 3 della s.35,
+fatto).** Erano no-op: `RemoveWorkload(12)` tirava via il workload mentre
+il thread kernel aveva ancora un quanto del PM in volo (lane che finivano
+l'ultimo giro), e il PPU riciclava la job list sotto un job in corsa
+(death4 in s.35: assert `stopd @0x0423C` "slot della job list non
+vuoto", 1 corsa su 12). Ora in `libs/spurs/cellSpurs.c`:
+`ShutdownWorkload` alza `s_workloads[wid].shutdown`; il thread kernel
+segna `s_wkl_running[wid]` prima di far partire le lane e non fa partire
+quanti nuovi se `shutdown` e' alzato (protocollo di Dekker con gli
+`__atomic` seq_cst); `WaitForWorkloadShutdown` e `RemoveWorkload`
+aspettano che `s_wkl_running` torni a 0 (tetto `SPURS_SHUTDOWN_WAIT_MS`,
+default 500, con avviso "ancora in volo": mai un blocco); `AddWorkload`
+azzera il flag. Misurato su 3 corse da 200 s (sd1-3): l'attesa scatta di
+rado (<1000 su ~2.200 Shutdown per corsa) e dura 0,08 ms in media, mai
+il tetto; fps 8,0/7,9/8,0 (f#2300-2500), 0 stalli, 1 morte (sd3) con
+ricaricamento del checkpoint.
+
 ## Sessione 35 — lo stallo alla morte di Drake era il wid 3 (lista a UNA SPU) girato su 6 lane
 
 **Trovato e corretto: 3 morti su 3 (fix16, fix18 x2) seguite dal ricaricamento

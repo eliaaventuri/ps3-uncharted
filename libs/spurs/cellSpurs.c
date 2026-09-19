@@ -56,6 +56,7 @@ typedef struct {
     u32         minContention;
     u32         maxContention;
     u32         readyCount;
+    int         shutdown;      /* cellSpursShutdownWorkload: niente altri quanti */
 } SpursWorkload;
 
 typedef struct {
@@ -71,6 +72,11 @@ typedef struct {
 /* Global workload table (per-SPURS instance in a real system, simplified) */
 static SpursWorkload s_workloads[CELL_SPURS_MAX_WORKLOAD];
 static SpursTask     s_tasks[CELL_SPURS_MAX_TASK];
+/* Quanto del PM in volo su un thread kernel (1 fra la partenza delle lane e il
+ * loro join). Letto da cellSpursWaitForWorkloadShutdown/RemoveWorkload con
+ * gli __atomic (protocollo di Dekker: chi chiude alza `shutdown` e poi legge
+ * qui; il kernel alza qui e poi rilegge `shutdown`). */
+static int s_wkl_running[CELL_SPURS_MAX_WORKLOAD];
 static u32           s_next_task_id = 0;
 
 /* ---------------------------------------------------------------------------
@@ -1128,6 +1134,7 @@ s32 cellSpursAddWorkload(CellSpurs* spurs, CellSpursWorkloadId* wid,
             s_workloads[i].minContention = minContention;
             s_workloads[i].maxContention = maxContention;
             s_workloads[i].readyCount = 0;
+            s_workloads[i].shutdown = 0;
 
             if (priority_h)
                 memcpy(s_workloads[i].priority, priority_h, CELL_SPURS_MAX_SPU);
@@ -1339,12 +1346,49 @@ s32 cellSpursWorkloadAttributeSetName(u64 attr_ea, u64 nameClass_ea, u64 nameIns
     return CELL_OK;
 }
 
+/* Chiude il workload e aspetta il quanto del PM in volo (sessione 36).
+ * Prima ShutdownWorkload/WaitForWorkloadShutdown erano no-op e RemoveWorkload
+ * tirava via il workload mentre le lane finivano ancora l'ultimo giro: il PPU
+ * riciclava la job list (ResetList + AddWorkload) sotto un job in corsa, che
+ * scriveva il suo header nella lista nuova -- assert `stopd @0x0423C` del job
+ * 217 "slot della job list non vuoto" (death4, s.35). Il titolo lo fa a OGNI
+ * fotogramma per il wid 12, quindi l'attesa deve restare corta: tetto
+ * SPURS_SHUTDOWN_WAIT_MS (default 500) con avviso, mai un blocco. */
+static unsigned long long spurs_ns_now(void);
+static void spurs_wkl_shutdown_wait(u32 wid, const char* who)
+{
+    __atomic_store_n(&s_workloads[wid].shutdown, 1, __ATOMIC_SEQ_CST);
+    if (!__atomic_load_n(&s_wkl_running[wid], __ATOMIC_SEQ_CST)) return;
+    static long s_cap = -1;
+    if (s_cap < 0) { const char* e = getenv("SPURS_SHUTDOWN_WAIT_MS"); s_cap = e ? atol(e) : 500; }
+    unsigned long long t0 = spurs_ns_now();
+    while (__atomic_load_n(&s_wkl_running[wid], __ATOMIC_SEQ_CST)) {
+        if ((long)((spurs_ns_now() - t0) / 1000000ull) >= s_cap) {
+            static int _n = 0;
+            if (_n++ < 8 || (_n % 100) == 0)
+                fprintf(stderr, "[cellSpurs] %s(wid=%u): quanto del PM ancora in volo dopo %ld ms, proseguo (#%d)\n",
+                        who, wid, s_cap, _n);
+            return;
+        }
+#ifdef _WIN32
+        SwitchToThread();
+#else
+        { struct timespec ts = { 0, 50000L }; nanosleep(&ts, NULL); }
+#endif
+    }
+    { static unsigned long long s_tot; static unsigned s_n; s_tot += spurs_ns_now() - t0;
+      if (++s_n <= 4 || (s_n % 1000) == 0)
+          fprintf(stderr, "[cellSpurs] %s(wid=%u): aspettato il quanto #%u (media %.2f ms)\n",
+                  who, wid, s_n, (double)s_tot / s_n / 1e6); }
+}
+
 s32 cellSpursRemoveWorkload(CellSpurs* spurs, CellSpursWorkloadId wid)
 {
     if (!spurs) return CELL_SPURS_CORE_ERROR_NULL_POINTER;
     if (wid >= CELL_SPURS_MAX_WORKLOAD) return CELL_SPURS_CORE_ERROR_INVAL;
     if (!s_workloads[wid].in_use) return CELL_SPURS_CORE_ERROR_SRCH;
 
+    spurs_wkl_shutdown_wait(wid, "RemoveWorkload");
     s_workloads[wid].in_use = 0;
     { extern void spurs_pm_forget(u32); spurs_pm_forget(wid); }   /* LS fresco al prossimo Add */
     printf("[cellSpurs] RemoveWorkload(wid=%u)\n", wid);
@@ -1793,6 +1837,13 @@ static DWORD WINAPI spurs_kernel_thread(LPVOID p)
               static int s_fs_all = -1;   /* SPURS_FORCE_SPUS_ALL=1: come prima della s.35 (A/B) */
               if (s_fs_all < 0) { const char* e = getenv("SPURS_FORCE_SPUS_ALL"); s_fs_all = (e && *e && *e != '0') ? 1 : 0; }
               if (s_fs > 0 && (maxcont > 1 || s_fs_all)) maxcont = (u8)(s_fs > 6 ? 6 : s_fs); }
+            /* Sessione 36: niente quanti nuovi dopo ShutdownWorkload, e chi
+             * aspetta lo shutdown vede il quanto in volo (s_wkl_running). */
+            __atomic_store_n(&s_wkl_running[wid], 1, __ATOMIC_SEQ_CST);
+            if (__atomic_load_n(&s_workloads[wid].shutdown, __ATOMIC_SEQ_CST)) {
+                __atomic_store_n(&s_wkl_running[wid], 0, __ATOMIC_SEQ_CST);
+                continue;
+            }
             *(vm_base + ea + SPURS_WKL_CURCONT + wid) = maxcont;
             {
                 static int s_lstat = -1; if (s_lstat < 0) s_lstat = getenv("SPURS_LANE_STAT") ? 1 : 0;
@@ -1839,6 +1890,7 @@ static DWORD WINAPI spurs_kernel_thread(LPVOID p)
                 }
             }
             *(vm_base + ea + SPURS_WKL_CURCONT + wid) = 0;
+            __atomic_store_n(&s_wkl_running[wid], 0, __ATOMIC_SEQ_CST);
             /* SPURS_DISPATCH_TRACE=1: una riga per ogni corsa del PM che era
              * stata chiesta (kick) o che ha trovato lavoro (polls>0). Serve a
              * dire QUALE wid gira quando il PPU arma un lavoro e nessuno lo
@@ -3033,6 +3085,8 @@ s32 cellSpursShutdownWorkload(u64 spurs_ea, u32 wid)
 {
     static int _n = 0;
     if (_n++ < 8 || (_n % 500) == 0) printf("[cellSpurs] ShutdownWorkload(wid=%u) #%d\n", wid, _n);
+    if (wid < CELL_SPURS_MAX_WORKLOAD && s_workloads[wid].in_use)
+        __atomic_store_n(&s_workloads[wid].shutdown, 1, __ATOMIC_SEQ_CST);
     return CELL_OK;
 }
 
@@ -3040,5 +3094,7 @@ s32 cellSpursWaitForWorkloadShutdown(u64 spurs_ea, u32 wid)
 {
     static int _n = 0;
     if (_n++ < 8 || (_n % 500) == 0) printf("[cellSpurs] WaitForWorkloadShutdown(wid=%u) #%d\n", wid, _n);
+    if (wid < CELL_SPURS_MAX_WORKLOAD && s_workloads[wid].in_use)
+        spurs_wkl_shutdown_wait(wid, "WaitForWorkloadShutdown");
     return CELL_OK;
 }
