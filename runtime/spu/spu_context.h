@@ -804,6 +804,12 @@ void (*spu_take_interrupt(spu_context* ctx,
  * passaggi contati sono zero. Per quei blocchi serve un altro aggancio. */
 static inline void spu_pcwatch(spu_context* ctx)
 {
+    /* Via veloce (s.33): un solo flag per tutte le diagnostiche del salto.
+     * Questo hook gira a OGNI salto del trampolino (milioni al secondo) e i
+     * suoi 5 controlli lazy valevano il 5% del tempo delle lane. */
+    static int s_any = -1;
+    if (s_any < 0) s_any = (getenv("SPU_PROBE_PC") || getenv("SPU_PCWATCH") || getenv("SPU_HOPHIST")) ? 1 : 0;
+    if (__builtin_expect(!s_any, 1)) return;
     /* SPU_PROBE_PC=<hex LS>[,<img>] + SPU_PROBE_REGS=<r,r,...> (s.32): ai primi
      * SPU_PROBE_N (20) salti del trampolino a quel pc stampa i registri
      * elencati (4 parole, hex e float): gli ingressi di un kernel liftato

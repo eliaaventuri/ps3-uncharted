@@ -270,26 +270,68 @@ static inline uint32_t spu__d2f(double v) {
  * float dell'host coincide con la SPU a meno dell'arrotondamento (la SPU
  * tronca, qui al piu' vicino: come nelle 32 sessioni precedenti). Tutti gli
  * altri casi (zero, denormali, estesi, overflow) passano dalla via esatta. */
-#define SPU__NORM(w) ((((w) + 0x00800000u) & 0x7F800000u) > 0x00800000u)   /* esponente in 1..254 */
-#define SPU__FLOAT2(NAME, EXPR) \
-static inline u128 NAME(u128 a, u128 b) { u128 r; for(int i=0;i<4;i++) { uint32_t wa=a._u32[i], wb=b._u32[i]; \
-    if (SPU__NORM(wa) && SPU__NORM(wb)) { float x, y; memcpy(&x,&wa,4); memcpy(&y,&wb,4); float f = (EXPR); uint32_t w; memcpy(&w,&f,4); \
-        if (SPU__NORM(w)) { r._u32[i]=w; continue; } } \
-    r._u32[i]=spu__d2f(spu__f2d(wa) OP2_##NAME spu__f2d(wb)); } return r; }
+/* zero e denormali valgono zero (il segno resta); esponente 255 = "esteso" */
+#define SPU__FLUSH(w) (((w) & 0x7F800000u) ? (w) : ((w) & 0x80000000u))
+#define SPU__EXT(w)   (((w) & 0x7F800000u) == 0x7F800000u)
 #define OP2_spu_fa +
 #define OP2_spu_fs -
 #define OP2_spu_fm *
-SPU__FLOAT2(spu_fa, x + y)
-SPU__FLOAT2(spu_fs, x - y)
-SPU__FLOAT2(spu_fm, x * y)
 #define SPU__FLOAT3(NAME, EXPR, DEXPR) \
-static inline u128 NAME(u128 a, u128 b, u128 c) { u128 r; for(int i=0;i<4;i++) { uint32_t wa=a._u32[i], wb=b._u32[i], wc=c._u32[i]; \
-    if (SPU__NORM(wa) && SPU__NORM(wb) && SPU__NORM(wc)) { float x, y, z; memcpy(&x,&wa,4); memcpy(&y,&wb,4); memcpy(&z,&wc,4); float f = (EXPR); uint32_t w; memcpy(&w,&f,4); \
-        if (SPU__NORM(w)) { r._u32[i]=w; continue; } } \
+static __attribute__((noinline)) u128 NAME##_slow(u128 a, u128 b, u128 c) { u128 r; for(int i=0;i<4;i++) { uint32_t wa=SPU__FLUSH(a._u32[i]), wb=SPU__FLUSH(b._u32[i]), wc=SPU__FLUSH(c._u32[i]); \
+    if (!SPU__EXT(wa) && !SPU__EXT(wb) && !SPU__EXT(wc)) { float x, y, z; memcpy(&x,&wa,4); memcpy(&y,&wb,4); memcpy(&z,&wc,4); float f = (EXPR); uint32_t w; memcpy(&w,&f,4); w = SPU__FLUSH(w); \
+        if (!SPU__EXT(w)) { r._u32[i]=w; continue; } } \
     double x=spu__f2d(wa), y=spu__f2d(wb), z=spu__f2d(wc); r._u32[i]=spu__d2f(DEXPR); } return r; }
 SPU__FLOAT3(spu_fma,  fmaf(x, y, z),   x * y + z)
 SPU__FLOAT3(spu_fms,  fmaf(x, y, -z),  x * y - z)
 SPU__FLOAT3(spu_fnms, fmaf(-x, y, z),  z - x * y)
+#if defined(__aarch64__) && defined(__ARM_NEON)
+/* NEON: le 4 corsie insieme; se TUTTI gli ingressi e il risultato sono
+ * normali (esponente 1..254) basta l'istruzione del ferro, altrimenti la via
+ * esatta. spu_fma era la funzione piu' calda di tutto il port (`sample`). */
+static inline uint32x4_t spu__flush4(uint32x4_t w) {   /* esponente 0 -> +-0 */
+    uint32x4_t isz = vceqq_u32(vandq_u32(w, vdupq_n_u32(0x7F800000u)), vdupq_n_u32(0));
+    return vbicq_u32(w, vandq_u32(isz, vdupq_n_u32(0x007FFFFFu))); }
+static inline int spu__noext4(uint32x4_t w) {          /* nessuna corsia con esponente 255 */
+    return vmaxvq_u32(vceqq_u32(vandq_u32(w, vdupq_n_u32(0x7F800000u)), vdupq_n_u32(0x7F800000u))) == 0; }
+#define SPU__FLOAT3_NEON(NAME, NEONEXPR) \
+static inline __attribute__((always_inline)) u128 NAME(u128 a, u128 b, u128 c) { \
+    uint32x4_t wa = spu__flush4(vld1q_u32(a._u32)), wb = spu__flush4(vld1q_u32(b._u32)), wc = spu__flush4(vld1q_u32(c._u32)); \
+    if (__builtin_expect(spu__noext4(wa) && spu__noext4(wb) && spu__noext4(wc), 1)) { \
+        float32x4_t x = vreinterpretq_f32_u32(wa), y = vreinterpretq_f32_u32(wb), z = vreinterpretq_f32_u32(wc); \
+        uint32x4_t wr = spu__flush4(vreinterpretq_u32_f32(NEONEXPR)); \
+        if (__builtin_expect(spu__noext4(wr), 1)) { u128 r; vst1q_u32(r._u32, wr); return r; } } \
+    return NAME##_slow(a, b, c); }
+SPU__FLOAT3_NEON(spu_fma,  vfmaq_f32(z, x, y))
+SPU__FLOAT3_NEON(spu_fms,  vfmaq_f32(vnegq_f32(z), x, y))
+SPU__FLOAT3_NEON(spu_fnms, vfmsq_f32(z, x, y))
+#define SPU__FLOAT2_NEON(NAME, NEONEXPR) \
+static inline __attribute__((always_inline)) u128 NAME(u128 a, u128 b) { \
+    uint32x4_t wa = spu__flush4(vld1q_u32(a._u32)), wb = spu__flush4(vld1q_u32(b._u32)); \
+    if (__builtin_expect(spu__noext4(wa) && spu__noext4(wb), 1)) { \
+        float32x4_t x = vreinterpretq_f32_u32(wa), y = vreinterpretq_f32_u32(wb); \
+        uint32x4_t wr = spu__flush4(vreinterpretq_u32_f32(NEONEXPR)); \
+        if (__builtin_expect(spu__noext4(wr), 1)) { u128 r; vst1q_u32(r._u32, wr); return r; } } \
+    return NAME##_slow(a, b); }
+#define SPU__FLOAT2_NAME(NAME) NAME##_slow
+#else
+#define SPU__FLOAT2_NAME(NAME) NAME
+#define spu_fma  spu_fma_slow
+#define spu_fms  spu_fms_slow
+#define spu_fnms spu_fnms_slow
+#endif
+#define SPU__FLOAT2S(NAME, EXPR) \
+static inline u128 SPU__FLOAT2_NAME(NAME)(u128 a, u128 b) { u128 r; for(int i=0;i<4;i++) { uint32_t wa=SPU__FLUSH(a._u32[i]), wb=SPU__FLUSH(b._u32[i]); \
+    if (!SPU__EXT(wa) && !SPU__EXT(wb)) { float x, y; memcpy(&x,&wa,4); memcpy(&y,&wb,4); float f = (EXPR); uint32_t w; memcpy(&w,&f,4); w = SPU__FLUSH(w); \
+        if (!SPU__EXT(w)) { r._u32[i]=w; continue; } } \
+    r._u32[i]=spu__d2f(spu__f2d(wa) OP2_##NAME spu__f2d(wb)); } return r; }
+SPU__FLOAT2S(spu_fa, x + y)
+SPU__FLOAT2S(spu_fs, x - y)
+SPU__FLOAT2S(spu_fm, x * y)
+#if defined(__aarch64__) && defined(__ARM_NEON)
+SPU__FLOAT2_NEON(spu_fa, vaddq_f32(x, y))
+SPU__FLOAT2_NEON(spu_fs, vsubq_f32(x, y))
+SPU__FLOAT2_NEON(spu_fm, vmulq_f32(x, y))
+#endif
 
 /* Float<->int conversions with scale (RI8). CBEA: cflts/cfltu multiply by
  * 2^(173-I8), csflt/cuflt by 2^(I8-155) (rpcs3: scale[173-i8] / scale[i8-155]

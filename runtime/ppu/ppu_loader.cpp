@@ -775,8 +775,11 @@ static int vm_fast_init(void)
     const char* off = getenv("PS3_VM_FAST"); if (off && *off == '0') return 0;
     return 1;
 }
+/* Non thread-local apposta: e' solo un'euristica (pompa i gestori dopo 4096
+ * letture ripetute) e un accesso TLS per lettura (_tlv_get_addr) costava piu'
+ * della lettura stessa. Una corsa fra thread al peggio pompa un po' prima. */
 struct vm_spin_tls { uint32_t last, n; };
-static PPU_THREAD_LOCAL vm_spin_tls g_vm_spin;
+static vm_spin_tls g_vm_spin;
 uint8_t  vm_read8 (uint64_t a) { if (__builtin_expect(g_vm_fast > 0, 1)) { const uint32_t ua = (uint32_t)a; return vm_oob(ua, 1) ? 0 : vm_base[ua]; }
     if (g_vm_fast < 0) g_vm_fast = vm_fast_init();
     if (vm_oob((uint32_t)a,1)) return 0; vm_hotmap((uint32_t)a,1);

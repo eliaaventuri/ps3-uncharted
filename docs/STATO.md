@@ -578,7 +578,13 @@ sullo stesso orologio di `[ring]`). Il quadro:
 - Gli helper float della SPU con la semantica del Cell costavano il 30% dei
   fotogrammi nella prima versione; ora hanno la via veloce (ingressi e
   risultato normali -> float dell'host) e costano come prima.
-Conclusione: per salire di fps bisogna far girare piu' in fretta i job SPU
+- Fatto dopo la misura: helper float SPU in NEON (4 corsie, via veloce se
+  nessuna corsia ha esponente 255, zero/denormali azzerati; `always_inline`,
+  via lenta fuori linea), hook del trampolino (`spu_pcwatch`) con un solo
+  flag, contatore di spin di vm_read32 non piu' thread-local: **da 5,5-6 a
+  7,2 fps** (RSX_FRAMESTAT=50, tre finestre da 50 fotogrammi: 7,3/7,2/7,2).
+  `SPURS_KERN_SLEEP_US=50` vale +0,2, `GCM_PARK_POLL_US=200` 0.
+Conclusione: per salire ancora bisogna far girare piu' in fretta i job SPU
 (costo per istruzione del codice liftato: helper u128 per valore, salto del
 trampolino per blocco con due accessi thread-local, `spu_ls_read128` con
 controlli) e ridurre la latenza di dispatch del PM (6.118 corse per ~330
@@ -594,7 +600,7 @@ job: ~20 passate a vuoto per job). E' un lavoro lungo, non una correzione.
    `spu_fi` resta un pass-through dell'estimate (Newton-Raphson non fatto).
 3. IFE/LOOP nel decompilatore FP; `RSX_DUMP_COUNT>1`; VP/FP compilati per
    coppia.
-4. Velocita' (5,5-6 fps): v. sopra, il collo e' l'emulazione dei job SPU e la
+4. Velocita' (7,2 fps): v. sopra, il collo e' l'emulazione dei job SPU e la
    latenza del dispatch, non il PPU ne' la RSX.
 
 ## Sessione 32 — il fantasma di Drake era la WPOS: i materiali leggevano i buffer di luce con x raddoppiata
