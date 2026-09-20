@@ -61,7 +61,7 @@ tools/check_ppu_scaffold.py  ratchet del boot
 tools/spu_disasm.py, ppu_disasm.py  disassemblatori
 tools/gen_spu_neon_tables.py  genera runtime/spu/spu_neon_tables.h
 scratchpad/winid.swift       id della finestra del port per screencapture -l (CGWindowList .optionAll)
-scratchpad/misura/           fps.sh/fpsmed.sh (fps da RSX_FRAMESTAT), tl*.py (timeline GCM_TIMELINE), runshots.sh, prof2.sh (s.37)
+scratchpad/misura/           fps.sh/fpsmed.sh (fps da RSX_FRAMESTAT), tl*.py (timeline GCM_TIMELINE), present.py (durata del present per fascia di draw), runshots.sh/shots2.sh (screenshot a tempo), classify.py (difetti dagli screenshot), ringan.py (sorpassi nell'anello SPU da GCM_RING_TRACE), prof2.sh (s.37)
 tools/lldb_guest_bp.py       breakpoint lldb sui func_XXXX del port vivo (r3-r5, f1, catena)
 tools/stallcatch.sh          corsa Uncharted che campiona il processo se il caricamento si ferma
 tests/                       torture e conformance del runtime

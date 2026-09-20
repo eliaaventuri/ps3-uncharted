@@ -93,6 +93,10 @@ static u32 s_current_display_buffer_id = 0;
  * presenting on a raw flip-count change raced the drain and showed empty or
  * mixed batches (wave: black flashes, layout flicker). */
 static volatile int s_flip_pending = 0;
+/* GCM_FLIP_GPU_WAIT_US (s.39): quanto il flip aspetta che la GPU finisca il
+ * fotogramma con i report delle occlusion query (default 8000). */
+static unsigned gcm_flip_gpu_wait_us(void)
+{ static long v = -1; if (v < 0) { const char* e = getenv("GCM_FLIP_GPU_WAIT_US"); v = e ? atol(e) : 8000; } return (unsigned)v; }
 /* Il flip viene dalla parola 0xFEAD nella FIFO (il walker ci e' arrivato,
  * quindi ha gia' consumato tutto il fotogramma) o dall'import
  * cellGcmSetFlip chiamato dal PPU (la FIFO puo' essere ancora piena). */
@@ -619,6 +623,16 @@ static atomic_int s_gcm_pending = 0;
 #define GCM_PENDING_SET(bits)  atomic_fetch_or(&s_gcm_pending, (bits))
 #define GCM_PENDING_TAKE()     atomic_exchange(&s_gcm_pending, 0)
 #endif
+/* s.39: flip chiuso in ritardo dalla GPU (v. cellGcmSetFlipCommand): il
+ * gestore e' dovuto e lo si conta qui; il backend chiama cellGcm_gpu_idle a
+ * GPU finita e la pompa lo consegna. */
+#ifndef _WIN32
+static atomic_int s_flip_late_due, s_flip_owed;
+void cellGcm_gpu_idle(void)
+{
+    if (atomic_exchange(&s_flip_late_due, 0)) { atomic_fetch_add(&s_flip_owed, 1); gcm_tl("flip-done-gpu", 0, 0); }
+}
+#endif
 
 /* Called by the vblank ticker thread. NO guest code -- advance the vblank count
  * and mark a vblank+flip tick pending for the main thread to deliver. */
@@ -663,7 +677,11 @@ void ppu_gcm_pump(void)
 #endif
     if (in) return;
     long p = (long)GCM_PENDING_TAKE();
+#ifndef _WIN32
+    if (!p && !atomic_load(&s_flip_owed)) return;
+#else
     if (!p) return;
+#endif
     in = 1;
     if ((p & 1) && s_vblank_handler_opd && g_ps3_guest_caller) {
         ydkj_restore_handler_opd(s_vblank_handler_opd, s_vblank_handler_code);
@@ -671,7 +689,11 @@ void ppu_gcm_pump(void)
                            0, 0, 0, 0, 0, 0, 0);
     }
     if (p & 2) s_flip_status = CELL_GCM_FLIP_STATUS_DONE;
-    if (p & 6) {   /* 4: solo il gestore (flip chiuso in cellGcmSetFlipCommand, s.37) */
+    int calls = (p & 6) ? 1 : 0;   /* 4: solo il gestore (flip chiuso in cellGcmSetFlipCommand, s.37) */
+#ifndef _WIN32
+    calls += atomic_exchange(&s_flip_owed, 0);   /* flip chiusi a GPU finita (s.39) */
+#endif
+    for (; calls > 0; calls--) {
         if (s_flip_handler_opd && g_ps3_guest_caller) {
             ydkj_restore_handler_opd(s_flip_handler_opd, s_flip_handler_code);
             g_ps3_guest_caller(s_flip_handler_opd, 1, 0, 0, 0, 0, 0, 0, 0);
@@ -721,7 +743,7 @@ void cellGcmTickFlip(void)
                   /* ...e che la GPU abbia finito il fotogramma presentato: i
                    * report delle occlusion query (GET_REPORT) vengono scritti
                    * a GPU finita e il job 215 li legge subito dopo il flip. */
-                  { extern int rsx_metal_backend_gpu_wait(unsigned); if (!rsx_metal_backend_gpu_wait(8000)) return; }
+                  { extern int rsx_metal_backend_gpu_wait(unsigned); if (!rsx_metal_backend_gpu_wait(gcm_flip_gpu_wait_us())) return; }
 #endif
                 } }
     gcm_tl("flip-done", 0, 0);
@@ -2583,12 +2605,34 @@ s32 cellGcmSetFlipCommand(u32 bufferId)
      * attesa della GPU del tick (i report delle occlusion query). */
     { static int s_late = -1; if (s_late < 0) { const char* e = getenv("GCM_FLIP_LATE"); s_late = (e && *e == '0') ? 0 : 1; }   /* GCM_FLIP_LATE=0: solo per l'A/B */
     if (s_late && s_flip_reached && s_flip_status == CELL_GCM_FLIP_STATUS_WAITING) {
+        int gpu_done = 1;
 #ifdef __APPLE__
-        { extern int rsx_metal_backend_gpu_wait(unsigned); rsx_metal_backend_gpu_wait(8000); }
+        /* s.39: il flip N puo' dirsi fatto SOLO quando la GPU ha finito il
+         * fotogramma N, perche' il job 215 legge subito dopo i report delle
+         * occlusion query (bounding box del ponte, del mare, del cielo): con
+         * il tetto di 8 ms e la GPU in ritardo (11% dei flip, max 27 ms) il
+         * titolo leggeva 0 = occluso e la geometria grande spariva (7
+         * screenshot su 10 con ponte/mare/cielo mancanti, poligoni giganti,
+         * esposizione a bianco). Se la GPU non ha finito, il gestore resta
+         * dovuto (s_flip_late_due) e lo sblocca il completed handler del
+         * backend (cellGcm_gpu_idle) alla prossima pompa: niente attesa lunga
+         * sul PPU (200 ms fissi: stallo "reference value 4009" in 1 corsa su 2). */
+        { extern int rsx_metal_backend_gpu_wait(unsigned);
+          unsigned long long t0 = get_timestamp_ns();
+          atomic_store(&s_flip_late_due, 1);
+          int ok = rsx_metal_backend_gpu_wait(gcm_flip_gpu_wait_us());
+          /* se il completed handler e' passato nel frattempo ha gia' preso il dovuto */
+          gpu_done = ok && atomic_exchange(&s_flip_late_due, 0);
+          if (ok && !gpu_done) gpu_done = -1;   /* preso dal handler: gestore gia' in coda (s_flip_owed) */
+          { static unsigned long n, over8, tot_us, late; static unsigned max_us; unsigned us = (unsigned)((get_timestamp_ns() - t0) / 1000);
+            n++; tot_us += us; if (us > 8000) over8++; if (us > max_us) max_us = us; if (!ok) late++;
+            if ((n % 1000) == 0) { fprintf(stderr, "[flip-late] attesa GPU: %lu flip, media %lu us, max %u us, oltre 8 ms: %lu, rimandati al completed handler: %lu\n", n, tot_us / n, max_us, over8, late); max_us = 0; } } }
 #endif
-        gcm_tl("flip-done-late", 0, 0);
-        s_flip_status = CELL_GCM_FLIP_STATUS_DONE;
-        GCM_PENDING_SET(4);
+        if (gpu_done == 1) {
+            gcm_tl("flip-done-late", 0, 0);
+            s_flip_status = CELL_GCM_FLIP_STATUS_DONE;
+            GCM_PENDING_SET(4);
+        } else if (gpu_done == 0) gcm_tl("flip-late-due", 0, 0);
         /* Gestore subito, non alla prossima pompa: siamo su un thread PPU
          * dentro un import, lo stesso contesto della pompa. Se il titolo
          * aspetta il proprio contatore dei flip (avanzato dal gestore), la

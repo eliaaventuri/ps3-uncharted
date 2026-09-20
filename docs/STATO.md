@@ -1,6 +1,6 @@
 # Stato del progetto
 
-Ultimo aggiornamento: **19 settembre 2026** — sessione 32.
+Ultimo aggiornamento: **20 settembre 2026** — sessione 39.
 
 ## Dove siamo
 
@@ -124,6 +124,17 @@ un puntatore nullo letto dai propri dati, e la scena 3D non si vede ancora
 (nero: i buchi dei draw nei buffer SPU restano NOP). Tastiera = pad 0 nella
 finestra (frecce, Spazio/X = CROSS, C = CERCHIO, Invio = START); `PAD_SCRIPT`
 per le corse senza nessuno. Dettagli in "Sessione 27".
+
+**Dalla sessione 39 la geometria grande non sparisce piu' a fotogrammi
+alterni.** Il flip si diceva concluso al massimo 8 ms dopo la richiesta anche
+se la GPU non aveva finito il fotogramma: il job di culling del titolo leggeva
+i report delle occlusion query ancora a zero e tagliava ponte, mare e cielo
+(7 screenshot su 10 con la scena mezza vuota, poligoni giganti, esposizione a
+bianco; era cosi' da almeno la s.37, nessuno aveva guardato abbastanza
+fotogrammi). Ora il gestore del flip resta "dovuto" finche' il completed
+handler della GPU non lo sblocca: 27 screenshot puliti su 28. Il present non
+copia piu' gli attributi (anello NoCopy): 4,2 -> 2,0 ms. Dettagli in
+"Sessione 39".
 
 **Dalla sessione 38 il livello gira a 27-28 fps** (era 12,6 sulla stessa
 corsa di riferimento): il nostro kernel SPURS faceva fork-join per ogni
@@ -488,6 +499,99 @@ La lista dei comandi ora viene percorsa fino in fondo — sei coppie
 risultati in memoria principale.** Non era mai successo in nessuna sessione.
 Riproducibile: **tre corse su tre**, identiche -- 14 comandi, un overlay
 residente, zero microstep, cinque stall e due interrupt per corsa.
+
+## Sessione 39 — il flip aspetta la GPU: la scena non sparisce piu'; present senza copia (4,2 -> 2,0 ms)
+
+**Misura nuova: la mediana dei fps (fpsmed.sh, 100-190 s) dipende dallo
+stato del gioco, non solo dal binario.** Stesso binario s.38, quattro corse:
+22,9 / 24,6 / 27,4 / 23,1 fps mediani; i draw per fotogramma nella finestra
+erano 2.560 / 2.470 / 1.940 / 2.580 (fin1/fin2 della s.38: 2.120 / 1.890 a
+27 fps). ~1.900 draw = 27 fps, ~2.500 = 23: la finestra a orologio copre
+contenuti diversi (dove sta Drake, quanti nemici). Per le modifiche al
+present la misura giusta e' la durata del present per fascia di draw
+(`scratchpad/misura/present.py <log> [t0 t1]`, eventi `present-in/out` di
+`GCM_TIMELINE`); per i difetti visivi gli screenshot ogni 5 s
+(`shots2.sh <s> <log> <pfx> <da> <passo> [VAR=..]`) classificati da
+`classify.py` (frazione di pixel color "ombra" (48-63,48-63,64-79), neri,
+bianchi: DIFETTO sopra 45/40/40%).
+
+**1. Present senza copia (`rsx_metal_backend.m`, `ring_alloc`,
+`vpd_next_slot`).** Il flusso degli attributi (`s_vpd`, ~80 MB a fotogramma)
+e i blocchi di costanti (`s_cbs`, fino a 20 MB) stanno in un anello di
+`MTL_MAX_INFLIGHT+1` = 4 slot `newBufferWithBytesNoCopy` su memoria `mmap`
+(pagine toccate solo se usate; 8 slot massimi, `RSX_VPD_RING=<n>` per la
+prova, `=0` torna alla copia); il present lega lo slot e a fine fotogramma
+si passa al successivo: con al massimo 3 fotogrammi in volo lo slot nuovo e'
+libero. Present per fascia di draw (mediana, ms): copia 3,84 / 4,16 / 4,80
+(1.500-2.000 / 2.000-2.500 / 2.500-3.000 draw), solo vpd 1,97 / 2,65 / 3,00,
+vpd+cbs **1,90 / 2,02 / 3,26**. Prima di fidarmi ho creduto per sei corse
+che l'anello producesse poligoni giganti (v. punto 2): erano gia' li' senza
+anello. Diagnostiche restate: `RSX_VPD_CHECK=1` (ogni draw legge solo i
+vertici che ha scritto: 0 violazioni), `RSX_GARBAGE=1` (posizioni NaN/enormi
+o bbox > 20000 per draw: da raffinare, ~12 draw per fotogramma sono VP che
+non hanno la posizione nell'attributo 0, non spazzatura).
+
+**2. Il difetto vero: il flip chiuso prima che la GPU avesse finito.** Tre
+screenshot su tre puliti senza anello, poi il quarto: 7 su 10 con ponte,
+mare e cielo SPARITI (resta lo sfondo grigio-blu, casse e personaggi
+normali), o tutto bianco (l'esposizione automatica che rincorre un
+fotogramma vuoto), o un poligono gigante. Provato e scartato: anello a 8
+slot, coda azzerata dopo i dati usati, memoria allocata da Metal, ritardo
+artificiale di 2,5 ms nel present, impronta dello slot al commit e al
+completamento (0 differenze su 3.500 fotogrammi: nessuno scrive mentre la
+GPU legge), anello senza rotazione, `mmap` puro: il difetto restava in
+tutte, e alla fine anche in una corsa SENZA anello (2 fotogrammi su 3).
+La traccia dell'anello dei job SPU (`GCM_RING_TRACE=1`, analisi
+`scratchpad/misura/ringan.py`) e' pulita: 5 lane, 50.000 blocchi, gap
+massimo 0,93 giri, nessun sorpasso, nessuna valvola. Quello che sparisce e'
+la geometria grande con le bounding box = le occlusion query: il job 215
+legge i report del fotogramma N subito dopo il flip N; in
+`cellGcmSetFlipCommand` (flip-done-late, s.37) il flip N si chiudeva dopo
+un'attesa della GPU di AL MASSIMO 8 ms e i report (scritti dal completed
+handler del command buffer) arrivavano dopo: il titolo leggeva 0 = occluso.
+Misurato: attesa media 2,6 ms, massimo 27 ms, oltre 8 ms nell'11% dei flip.
+Prova con il tetto a 200 ms: 10 su 10 puliti -- ma bloccare il PPU fino a
+27 ms ha dato "Rendering is stuck on reference value 4009" in 1 corsa su 2.
+
+**Fix (`cellGcmSys.c`):** il flip in ritardo aspetta la GPU fino a
+`GCM_FLIP_GPU_WAIT_US` (8000) come prima; se non ha finito, il gestore resta
+DOVUTO (`s_flip_late_due`) e lo consegna `cellGcm_gpu_idle()`, chiamato dal
+completed handler del backend quando i fotogrammi con report in volo tornano
+a zero (`s_flip_owed`, consegnato dalla pompa alla prossima chiamata HLE o
+spin, in aggiunta ai bit 2/4). Niente attesa lunga sul PPU, niente flip
+perso, ordine del ferro (flip fatto => report scritti). Con
+`GCM_TIMELINE`: eventi `flip-late-due` e `flip-done-gpu`. Statistica ogni
+1000 flip: `[flip-late] attesa GPU: ... rimandati al completed handler: n`
+(172 su 6.000 in una corsa). Risultato: **13 su 14 e poi 14 su 14
+screenshot puliti** (28,5 fps mediani nella corsa). Il tick del flip
+(cellGcmTickFlip) aspettava gia' la GPU e riprovava al tick dopo: giusto,
+invariato.
+
+**3. Resta un difetto raro: un triangolo gigante scuro** (1 screenshot su
+28: `/tmp/s39_fix1_140.png`, cielo e mare intatti, un triangolo color ombra
+sul quarto in basso a destra). Non e' il culling; e' un draw con un vertice
+sbagliato, probabilmente nel passaggio delle ombre o dei volumi di luce.
+Da cercare con `RSX_GARBAGE` raffinato (posizione dall'input del VP, non
+attributo 0) e screenshot fitti; il candidato storico e' l'anello dei
+blocchi mesh (s.32), ma la traccia dice di no.
+
+**Altro:** l'audio arriva al mixer (il titolo scrive PCM negli 8 blocchi
+della porta 0, `AUDIO_PEAK=1` mostra l'anello pieno) e il dispositivo SDL e'
+aperto: se non si sente, il problema e' a valle. Il `[park-watchdog]` da
+7-11 s al caricamento del livello c'e' dalla s.37 in meta' delle corse
+(io 0A400000/0A500000), i fotogrammi continuano, poi il livello parte:
+benigno finche' non compare nel livello. Il processo tiene 13 GB di
+texture Metal (`vmmap`: 164 x 32 MB + 5.847 x 1 MB, IOAccelerator 13,2 GB
+residenti; cache=20.000 voci nel framestat): la cache delle texture non
+libera abbastanza -- da guardare se la memoria diventa un problema.
+
+### Fronte aperto (dopo la sessione 39)
+
+1. Il triangolo gigante raro (punto 3).
+2. La cache delle texture a 13 GB.
+3. Velocita' del codice SPU liftato (unica leva rimasta per i fps): cache
+   dei registri con analisi vivi/sporchi, u128 in ordine SPU.
+4. Giocare oltre il checkpoint con la tastiera (Elia); audio: si sente?
 
 ## Sessione 38 — lane SPU indipendenti (12,6 -> 24-26,6 fps) e fetch dei vertici con piano per draw (-> 28 fps)
 

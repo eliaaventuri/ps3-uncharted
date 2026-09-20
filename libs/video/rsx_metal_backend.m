@@ -32,6 +32,7 @@
 #include "cellGcmSys.h"          /* cellGcmResolveLocated */
 #include <stdio.h>
 #include <stdlib.h>
+#include <sys/mman.h>
 #include <math.h>
 
 /* ------------------------------------------------------------------------- */
@@ -239,6 +240,36 @@ static id<MTLLibrary> s_shader_lib;
  * finished frame -- there the stall is the point. */
 #define MTL_MAX_INFLIGHT 3
 static dispatch_semaphore_t s_inflight;
+/* s.39: il flusso degli attributi (s_vpd, ~80 MB a fotogramma nel livello) e
+ * i blocchi di costanti (s_cbs) vivono in un anello di MTL_MAX_INFLIGHT+1 buffer NoCopy sulla memoria nostra:
+ * il walker scrive direttamente dove la GPU leggera' e il present non copia
+ * piu' (newBufferWithBytes = memmove, 6% del ticker). Con al massimo
+ * MTL_MAX_INFLIGHT fotogrammi in volo, lo slot successivo e' sempre libero.
+ * RSX_VPD_RING=0 torna alla copia. */
+#define MTL_VPD_RING 8                            /* slot massimi; in uso MTL_MAX_INFLIGHT+1 (RSX_VPD_RING=<n> per la prova) */
+static id<MTLBuffer> s_vpd_ring[MTL_VPD_RING];
+static id<MTLBuffer> s_cbs_ring[MTL_VPD_RING];   /* blocchi di costanti: fino a ~20 MB a fotogramma */
+static u32           s_vpd_slot, s_vpd_slots = MTL_MAX_INFLIGHT + 1;
+/* Alloca gli slot dell'anello (mmap: pagine toccate solo se usate) e torna la
+ * memoria del primo; NULL (e ring[0] = nil) se Metal non li accetta. */
+static void* ring_alloc(id<MTLBuffer> __strong* ring, size_t bytes)
+{
+    bytes = (bytes + 16383u) & ~(size_t)16383u;
+    for (u32 i = 0; i < s_vpd_slots; i++) {
+        void* mem = mmap(NULL, bytes, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANON, -1, 0);
+        if (mem == MAP_FAILED) { ring[0] = nil; return NULL; }
+        ring[i] = [s_dev newBufferWithBytesNoCopy:mem length:bytes options:MTLResourceStorageModeShared deallocator:nil];
+        if (!ring[i]) { ring[0] = nil; return NULL; }
+    }
+    return [ring[0] contents];
+}
+static void vpd_next_slot(void)
+{
+    if (!s_vpd_ring[0]) return;
+    s_vpd_slot = (s_vpd_slot + 1) % s_vpd_slots;
+    s_vpd = (float*)[s_vpd_ring[s_vpd_slot] contents];
+    s_cbs = (u8*)[s_cbs_ring[s_vpd_slot] contents];
+}
 
 /* PSO cache. Keyed on the blend state, which is all the built-in shader path
  * varies; a guest-shader key (vp/fp ucode hash) joins it when that lands. */
@@ -958,6 +989,21 @@ static void record_draw(const rsx_state* st, u32 prim, u32 base, u32 count,
           for (u32 v = 0; v < wrote; v++) { const float* f = bf + (size_t)v * na * 4; for (int k = 0; k < 3; k++) if (!(f[k] == f[k]) || fabsf(f[k]) > 1e6f) { nb++; break; } }
           fprintf(stderr, "[va-watch] f#%lu draw#%u va=%08X ea=%08X n=%u spazzatura=%u fp=%08X surf=%08X\n", s_frame_no, s_draw_count - 1, st->vertex_attribs[0].offset,
                   (st->vertex_attribs[0].offset & 0x80000000u) ? cellGcmResolveLocated(0, st->vertex_attribs[0].offset & 0x7FFFFFFFu) : cellGcmResolveLocated(1, st->vertex_attribs[0].offset), wrote, nb, d->fp_hash, st->surface_color_offset[0]); } }
+    /* RSX_GARBAGE=1 (s.39): draw con VP la cui posizione (attributo 0) ha NaN,
+     * valori enormi o un bbox > 20000 unita' -- i "poligoni giganti". Una riga
+     * per draw (tetto 200) con EA dell'array: da incrociare con le DMA SPU. */
+    { static int s_gb = -1; if (s_gb < 0) s_gb = getenv("RSX_GARBAGE") ? 1 : 0;
+      if (s_gb && d->vp >= 0 && wrote && (s_vps[d->vp].mask & 1u)) {
+          const float* bf = s_vpd + tmp.vbase / 4; u32 na = tmp.vstride / 16; u32 nb = 0; float mn[3] = {1e30f,1e30f,1e30f}, mx[3] = {-1e30f,-1e30f,-1e30f};
+          for (u32 v = 0; v < wrote; v++) { const float* f = bf + (size_t)v * na * 4; int ok = 1;
+              for (int k = 0; k < 3; k++) { if (!(f[k] == f[k]) || fabsf(f[k]) > 1e6f) ok = 0; else { if (f[k] < mn[k]) mn[k] = f[k]; if (f[k] > mx[k]) mx[k] = f[k]; } }
+              if (!ok) nb++; }
+          float ext = 0; for (int k = 0; k < 3; k++) if (mx[k] - mn[k] > ext) ext = mx[k] - mn[k];
+          if (nb || ext > 20000.f) { static int _n = 0; if (_n++ < 200)
+              fprintf(stderr, "[garbage] f#%lu draw#%u n=%u spazzatura=%u bbox=%.0f va0=%08X ea=%08X stride=%u vp=%08X fp=%08X surf=%08X prim=%u\n",
+                      s_frame_no, s_draw_count - 1, wrote, nb, ext, st->vertex_attribs[0].offset,
+                      (st->vertex_attribs[0].offset & 0x80000000u) ? cellGcmResolveLocated(0, st->vertex_attribs[0].offset & 0x7FFFFFFFu) : cellGcmResolveLocated(1, st->vertex_attribs[0].offset),
+                      st->vertex_attribs[0].stride, s_vps[d->vp].hash, d->fp_addr, d->surf, prim); } } }
     draw_shadow_setup(d, st);
     for (u32 t = 0; t < RSX_MAX_TEXTURES; t++) {
         d->tex[t] = (st->textures[t].control0 & 0x80000000u) ? tex_with_remap(s_tex[t].tex, st->textures[t].control1) : nil;
@@ -2344,9 +2390,16 @@ int rsx_metal_backend_init(u32 width, u32 height, const char* title)
             fprintf(stderr, "[RSX metal] vertex staging alloc failed\n");
             return -1;
         }
-        s_vpd = (float*)malloc(sizeof(float) * MTL_VP_FLOATS);
+        { const char* e = getenv("RSX_VPD_RING");
+          if (e && atoi(e) > 1 && atoi(e) <= MTL_VPD_RING) s_vpd_slots = (u32)atoi(e);
+          if (!e || atoi(e)) {
+            s_vpd = (float*)ring_alloc(s_vpd_ring, sizeof(float) * MTL_VP_FLOATS);
+            s_cbs = s_vpd ? (u8*)ring_alloc(s_cbs_ring, (size_t)MTL_CB_BYTES * MTL_CB_MAX) : NULL;
+            if (!s_cbs) { fprintf(stderr, "[RSX metal] anello NoCopy non disponibile: copia per fotogramma\n"); s_vpd_ring[0] = nil; s_vpd = NULL; }
+          } }
+        if (!s_vpd) s_vpd = (float*)malloc(sizeof(float) * MTL_VP_FLOATS);
         s_fpc = (u8*)malloc(MTL_FPC_BYTES);
-        s_cbs = (u8*)malloc((size_t)MTL_CB_BYTES * MTL_CB_MAX);
+        if (!s_cbs) s_cbs = (u8*)malloc((size_t)MTL_CB_BYTES * MTL_CB_MAX);
         if (!s_vpd || !s_cbs) {
             fprintf(stderr, "[RSX metal] vp staging alloc failed\n");
             return -1;
@@ -2578,12 +2631,26 @@ static void rsx_metal_backend_present_impl(void)
             vb = [s_dev newBufferWithBytes:s_verts
                                     length:sizeof(MtlVertex) * s_vert_count
                                    options:MTLResourceStorageModeShared];
+        /* RSX_VPD_CHECK=1 (s.39): ogni draw con VP deve leggere SOLO i vertici
+         * che ha scritto in s_vpd (fine <= inizio del draw successivo e <=
+         * s_vpd_used): con l'anello NoCopy una lettura oltre trova i dati di
+         * 4 fotogrammi prima, non piu' gli zeri di un buffer appena copiato. */
+        { static int s_vc = -1; if (s_vc < 0) s_vc = getenv("RSX_VPD_CHECK") ? 1 : 0;
+          if (s_vc) { static unsigned s_vn; u32 prev_end = 0;
+            for (u32 i = 0; i < s_draw_count; i++) { const MtlDraw* d = &s_draws[i]; if (d->vp < 0) continue;
+                u64 end = (u64)d->vbase + (u64)d->count * d->vstride;
+                if ((end > (u64)s_vpd_used * 4 || d->vbase < prev_end) && s_vn++ < 20)
+                    fprintf(stderr, "[vpd-check] f#%lu draw#%u vp=%d fp=%08X topo=%u count=%u stride=%u vbase=%u fine=%llu prev_fine=%u usati=%u\n",
+                            s_frame_no, i, d->vp, d->fp_hash, (unsigned)d->topology, d->count, d->vstride, d->vbase, (unsigned long long)end, prev_end, s_vpd_used * 4);
+                if (end > prev_end) prev_end = (u32)end; } } }
         id<MTLBuffer> vpb = nil, cbb = nil;
         if (s_draw_count > 0 && s_vpd_used > 0)
-            vpb = [s_dev newBufferWithBytes:s_vpd length:sizeof(float) * s_vpd_used
+            vpb = s_vpd_ring[0] ? s_vpd_ring[s_vpd_slot]
+                : [s_dev newBufferWithBytes:s_vpd length:sizeof(float) * s_vpd_used
                                     options:MTLResourceStorageModeShared];
         if (s_draw_count > 0 && s_cb_count > 0)
-            cbb = [s_dev newBufferWithBytes:s_cbs length:(NSUInteger)MTL_CB_BYTES * s_cb_count
+            cbb = s_vpd_ring[0] ? s_cbs_ring[s_vpd_slot]
+                : [s_dev newBufferWithBytes:s_cbs length:(NSUInteger)MTL_CB_BYTES * s_cb_count
                                     options:MTLResourceStorageModeShared];
         id<MTLBuffer> fpcb = nil;
         if (s_draw_count > 0 && s_fpc_used > 0 && s_fpc)
@@ -3090,7 +3157,7 @@ static void rsx_metal_backend_present_impl(void)
                   MtlReport* reps = (MtlReport*)malloc(sizeof(MtlReport) * s_report_count);
                   memcpy(reps, s_reports, sizeof(MtlReport) * s_report_count);
                   reports_publish(vis, reps, s_report_count); }
-              s_draw_count = 0; s_vert_count = 0; s_vpd_used = 0; s_cb_count = 0; s_fpc_used = 0;
+              s_draw_count = 0; s_vert_count = 0; s_vpd_used = 0; s_cb_count = 0; s_fpc_used = 0; vpd_next_slot();
               if (s_tex_graveyard.count) [s_tex_graveyard removeAllObjects];
               s_report_count = 0; s_report_start = 0;
               return;
@@ -3119,7 +3186,7 @@ static void rsx_metal_backend_present_impl(void)
             [cb addCompletedHandler:^(id<MTLCommandBuffer> _u) {
                 if (_u.error) { static int _e = 0; if (_e++ < 8) fprintf(stderr, "[RSX metal] command buffer FALLITO: %s\n", [[_u.error localizedDescription] UTF8String]); }
                 reports_publish(visb, reps, nrep);
-                atomic_fetch_sub(&s_gpu_pending, 1);
+                if (atomic_fetch_sub(&s_gpu_pending, 1) == 1) { extern void cellGcm_gpu_idle(void); cellGcm_gpu_idle(); }   /* flip dovuto (s.39) */
             }];
         }
         s_report_count = 0; s_report_start = 0;
@@ -3146,7 +3213,7 @@ static void rsx_metal_backend_present_impl(void)
         }
         s_draw_count = 0;
         s_vert_count = 0;
-        s_vpd_used = 0;
+        s_vpd_used = 0; vpd_next_slot();
         s_cb_count = 0; s_fpc_used = 0;
         texcache_sweep();
         if (s_tex_graveyard.count) [s_tex_graveyard removeAllObjects];
