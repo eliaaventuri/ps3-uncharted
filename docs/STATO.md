@@ -125,6 +125,17 @@ un puntatore nullo letto dai propri dati, e la scena 3D non si vede ancora
 finestra (frecce, Spazio/X = CROSS, C = CERCHIO, Invio = START); `PAD_SCRIPT`
 per le corse senza nessuno. Dettagli in "Sessione 27".
 
+**Dalla sessione 40 le texture compresse restano compresse.** Le BC1/2/3
+(DXT) venivano decodificate in RGBA8 sul thread del walker: al caricamento
+del livello la cache saliva a 12,7 GB di texture Metal (footprint di picco
+14-15 GB), in gioco 250 MB. Ora vanno alla GPU come blocchi BC: picco 2,0 GB
+di texture (footprint 3,3 GB), 50 MB in gioco, caricamento del livello ~8 s
+piu' corto, immagine identica. Le corse "cattive" (poligoni giganti, cielo
+e mare spariti) NON dipendono da questo: compaiono con e senza BC quando il
+gioco entra nell'incontro `dive-boat-encounter-first-wave` (13/29 e 17/29
+screenshot difettosi contro 0-3/29 nelle corse in cui Drake resta fuori
+dall'incontro). E' il fronte aperto. Dettagli in "Sessione 40".
+
 **Dalla sessione 39 la geometria grande non sparisce piu' a fotogrammi
 alterni.** Il flip si diceva concluso al massimo 8 ms dopo la richiesta anche
 se la GPU non aveva finito il fotogramma: il job di culling del titolo leggeva
@@ -499,6 +510,80 @@ La lista dei comandi ora viene percorsa fino in fondo — sei coppie
 risultati in memoria principale.** Non era mai successo in nessuna sessione.
 Riproducibile: **tre corse su tre**, identiche -- 14 comandi, un overlay
 residente, zero microstep, cinque stall e due interrupt per corsa.
+
+## Sessione 40 — texture BC caricate compresse (picco 14 -> 3,3 GB); i difetti grossi dipendono dallo stato del gioco
+
+**1. Le texture BC1/2/3 vanno alla GPU compresse (`rsx_metal_backend.m`,
+`bc_native`).** Prima ogni DXT veniva decodificata in RGBA8 dal walker
+(`rsx_texture_decode_bc`): x8 di memoria per le DXT1, x4 per le DXT5, e
+la decodifica sul thread che registra i draw. I blocchi DXT in memoria
+guest sono gia' nel layout della GPU (il decoder li leggeva cosi' com'e',
+senza scambio di byte; RPCS3 li copia come u64) e le GPU Apple li
+supportano (`supportsBCTextureCompression`). Ora `replaceRegion` direttamente
+dalla memoria guest con `MTLPixelFormatBC{1,2,3}_RGBA`, `bytesPerRow` =
+`tl.row_bytes`; le viste con remap ereditano il formato. `RSX_TEX_BC=0`
+torna alla decodifica (automatico con `RSX_TEX_SAVE`/`RSX_TEX_DBG`, che
+leggono i texel). Contabilita' nuova nel framestat: `bc=` (texture caricate
+compresse), `texMB=` (somma degli `allocatedSize` delle texture vive nella
+cache, `texcache_release` la scala alle tre evizioni).
+
+Misura (`scratchpad/misura/memshots.sh 200 <log> <pfx> 100 10 185`, vmmap
+a 185 s; 3 corse per variante):
+
+| | decodifica (RSX_TEX_BC=0) | BC nativo |
+|---|---|---|
+| texMB di picco (caricamento, f#2450-2850) | 8.096 -> 12.674 | 679 -> 2.014 |
+| texMB in gioco (f#4850+) | 250-270 | 49-51 |
+| footprint fisico di picco (vmmap) | 14,1 / 15,0 / 14,5 GB | 3,3 / 3,3 / 3,3 GB |
+| footprint a 185 s | 2,0 GB | 1,7 GB |
+| IOAccelerator (graphics) residente a 185 s | 365 MB | 142 MB |
+| decodifiche al caricamento (f#2050-2850) | 6.700 (1.200 Mpx) | 412 (6 Mpx), 17.500 bc |
+| f#2450 -> f#2850 (caricamento) | 19,2 s | 16,7 s |
+| fps mediani 100-190 s (3 corse) | 27,8 / 24,4 / 27,5 | 25,9 / 23,3 / 28,5 |
+
+I fps dipendono dal contenuto (s.39), non dal binario: le corse a 23-24
+sono quelle dell'incontro (v. punto 2). Il picco a 12,7 GB era il
+caricamento del livello: il titolo compatta il proprio heap texture
+(NV0039) e la stessa texture compare a offset diversi; le voci vecchie
+restano 600 fotogrammi (sweep) e nel frattempo ognuna e' RGBA8 piena.
+Screenshot BC contro decodifica confrontati a pieno formato: identici
+(casse, ruggine, ponte, HUD).
+
+**2. Le corse "cattive" non c'entrano con le texture.** Con 29 screenshot
+per corsa (ogni 5 s da 60 s; `classify2.py` aggiunge `alto` = frazione di
+pixel color sfondo nel quarto alto del fotogramma, DIFETTO sopra 25%: il
+cielo sparito si vede li' anche quando il totale resta sotto il 45%):
+base 1/11, base2 13/29, base3 3/29 (nero/bianco = morte di Drake); bc
+4/11, bc2 17/29, bc3 0/29. I difetti sono due, sempre insieme nella stessa
+corsa: poligoni giganti color ombra o neri che coprono mezzo schermo, e
+cielo/mare/ponte spariti (resta lo sfondo grigio-blu con le casse). Le
+corse cattive sono quelle in cui il gioco entra nell'incontro
+(`GameTaskSubnodePlay(): Playing task 'dive-boat-encounter-first-wave'`,
+stati di copertura `s_cover-low-*`, 3.600 draw/fotogramma di picco): la
+sola differenza nei log. NON e' il tetto dei draw (0 `dropped`), non sono
+command buffer falliti, i `[flip-late]` sono uguali (406-414 oltre 8 ms su
+7-8.000 flip, 263 rimandati al completed handler). Il "triangolo gigante
+raro" della s.39 e' questo stesso difetto: raro solo perche' la corsa di
+riferimento di solito non entra nell'incontro. Candidati: i pacchetti
+CALLati delle regioni 0x0A400000/0x0A500000 (parkgen, s.31) o l'anello dei
+blocchi mesh (s.32) consumati con contenuto vecchio quando i job SPU sono
+piu' carichi; `[parkgen] ... non e' un park` (prima parola 3F800000 =
+float) compare in tutte le corse. Per riprodurlo serve una corsa che entri
+nell'incontro (PAD_SCRIPT che faccia avanzare Drake) e `RSX_GARBAGE`
+raffinato con la posizione dall'input del VP.
+
+**Altro:** `graphify-out/` (544 file tracciati, output generato) risulta
+cancellata dal disco in questa sessione senza che nessun comando nostro
+l'abbia toccata; non committata la cancellazione.
+
+### Fronte aperto (dopo la sessione 40)
+
+1. Le corse cattive nell'incontro: poligoni giganti + geometria grande
+   sparita (punto 2). Prima cosa: riprodurre a comando (PAD_SCRIPT), poi
+   `RSX_GARBAGE` per capire quali draw hanno i vertici sbagliati.
+2. Velocita' del codice SPU liftato (cache dei registri con analisi
+   vivi/sporchi, u128 in ordine SPU).
+3. Giocare oltre il checkpoint con la tastiera (Elia); audio: si sente?
 
 ## Sessione 39 — il flip aspetta la GPU: la scena non sparisce piu'; present senza copia (4,2 -> 2,0 ms)
 

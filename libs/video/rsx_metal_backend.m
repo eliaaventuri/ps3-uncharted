@@ -1592,7 +1592,16 @@ static NSMutableArray* s_tex_graveyard;
 static MtlTexEntry s_texcache[MTL_TEXCACHE];
 static u32 s_texhash[MTL_TEXHASH];   /* indice+1 nella cache, 0 = vuoto (open addressing, sonda lineare) */
 static unsigned long s_tex_decodes, s_tex_decode_px;   /* per RSX_FRAMESTAT */
+static unsigned long s_tex_bc_native;   /* texture BC caricate compresse (s.40), per RSX_FRAMESTAT */
+static unsigned long s_tex_bytes;       /* byte Metal delle texture vive nella cache (allocatedSize), s.40 */
 static u32 s_texcache_n;
+static void texcache_release(id<MTLTexture> t)   /* via dalla cache: conto e cimitero */
+{
+    if (!t) return;
+    unsigned long b = (unsigned long)[t allocatedSize];
+    s_tex_bytes = s_tex_bytes >= b ? s_tex_bytes - b : 0;
+    remap_drop_base(t); graveyard_add(t);
+}
 
 static u32 texhash_slot(u32 offset, u32 format, u32 image_rect)
 {
@@ -1634,7 +1643,7 @@ static void texcache_add(u32 offset, u32 format, u32 image_rect, id<MTLTexture> 
             for (u32 i = 0; i < s_texcache_n; i++)
                 if (s_texcache[i].last_use < s_frame_no && s_texcache[i].last_use < best && !tex_held_by_unit(s_texcache[i].tex)) { best = s_texcache[i].last_use; e = &s_texcache[i]; }
             if (!e) return;
-            remap_drop_base(e->tex); graveyard_add(e->tex);   /* viva fino a fine fotogramma (s.30) */
+            texcache_release(e->tex);   /* viva fino a fine fotogramma (s.30) */
             e->tex = nil; texhash_rebuild();
         }
     }
@@ -1727,8 +1736,7 @@ static void texcache_sweep(void)
             /* il percorso "already resident" non aggiorna last_use: una texture
              * ferma in una unita' NON va tolta (l'unita' la rilascerebbe al
              * prossimo bind, con i draw del fotogramma che la puntano, s.30) */
-            remap_drop_base(s_texcache[i].tex);   /* anche le viste con remap di questa texture */
-            graveyard_add(s_texcache[i].tex);
+            texcache_release(s_texcache[i].tex);   /* anche le viste con remap di questa texture */
             s_texcache[i].tex = nil; evicted = 1;
         }
     if (evicted) texhash_rebuild();
@@ -1877,16 +1885,30 @@ static void mtl_bind_texture(void* ud, u32 unit, const rsx_texture_state* tex)
       if (ce) { stale = ce; static unsigned long s_nst = 0; s_nst++;
                 if (s_nst <= 8 || (s_nst % 1000) == 0) fprintf(stderr, "[RSX metal] texture %ux%u fmt=0x%02X @%08X cambiata in memoria: ridecodifica (#%lu)\n", width, height, fmt, tex->offset, s_nst); } }
 
-    const u32 pitch = width * (hdr16 ? hdrb : 4u);
-    u8* staging = (u8*)malloc((size_t)pitch * height * nfaces);
-    if (!staging) return;
+    /* BC1/2/3 caricate COMPRESSE (s.40): i blocchi DXT in memoria guest sono
+     * gia' nel layout che la GPU legge (rsx_texture_decode_bc li legge cosi'
+     * com'e', nessuno scambio di byte) e le GPU Apple li supportano. Una
+     * 2048x2048 DXT1 decodificata in RGBA8 costava 16 MB al posto di 2: il
+     * processo teneva 13 GB di texture Metal (s.39). Niente staging ne'
+     * decodifica sul thread del walker. RSX_TEX_BC=0 torna alla decodifica
+     * (serve anche a RSX_TEX_SAVE/RSX_TEX_DBG, che leggono i texel). */
+    static int s_bc = -1;
+    if (s_bc < 0) { const char* e = getenv("RSX_TEX_BC");
+                    s_bc = (e && *e == '0') ? 0 : ([s_dev supportsBCTextureCompression] ? 1 : 0);
+                    if (getenv("RSX_TEX_SAVE") || getenv("RSX_TEX_DBG")) s_bc = 0; }
+    const int bc_native = s_bc && tl.compressed && !hdr16 && width >= 4 && height >= 4;
+    const u32 pitch = bc_native ? tl.row_bytes : width * (hdr16 ? hdrb : 4u);
+    const u32 img_bytes = bc_native ? tl.face_bytes : pitch * height;
+    u8* staging = bc_native ? NULL : (u8*)malloc((size_t)pitch * height * nfaces);
+    if (!bc_native && !staging) return;
     /* Un formato compresso va DECOMPRESSO: la texture Metal qui e' RGBA8, e
      * rsx_texture_decode() per i formati a blocchi copia i blocchi cosi' come
      * sono (che e' giusto per chi carica BC nativo, come D3D12). Copiandoli in
      * una RGBA8 si otteneva rumore rosso/verde/blu -- misurato: un riquadro di
      * 128x32 pixel di sale e pepe colorato al posto dell'HUD. */
-    s_tex_decodes++; s_tex_decode_px += (unsigned long)width * height * nfaces;
-    for (u32 f = 0; f < nfaces; f++) {
+    if (bc_native) s_tex_bc_native++;
+    else { s_tex_decodes++; s_tex_decode_px += (unsigned long)width * height * nfaces; }
+    for (u32 f = 0; f < nfaces && !bc_native; f++) {
         u8* dst = staging + (size_t)f * pitch * height;
         const u8* src = vm_base + ea + (size_t)f * face_stride;
         if (hdr16) {
@@ -1908,7 +1930,8 @@ static void mtl_bind_texture(void* ud, u32 unit, const rsx_texture_state* tex)
             fprintf(stderr, "[RSX metal] texture fp32 %ux%u @%08X f#%lu:", width, height, tex->offset, s_frame_no);
             for (u32 q = 0; q < width * height; q++) fprintf(stderr, " (%g %g %g %g)", fv[q*4], fv[q*4+1], fv[q*4+2], fv[q*4+3]);
             fprintf(stderr, "\n"); } }
-    const MTLPixelFormat hostpf = hdrb == 16 ? MTLPixelFormatRGBA32Float : hdr16 ? MTLPixelFormatRGBA16Float : MTLPixelFormatRGBA8Unorm;
+    const MTLPixelFormat hostpf = bc_native ? (tl.fmt == RSX_TEXFMT_BC1 ? MTLPixelFormatBC1_RGBA : tl.fmt == RSX_TEXFMT_BC2 ? MTLPixelFormatBC2_RGBA : MTLPixelFormatBC3_RGBA)
+                                : hdrb == 16 ? MTLPixelFormatRGBA32Float : hdr16 ? MTLPixelFormatRGBA16Float : MTLPixelFormatRGBA8Unorm;
 
     MTLTextureDescriptor* td = cube
         ? [MTLTextureDescriptor textureCubeDescriptorWithPixelFormat:hostpf
@@ -1921,13 +1944,15 @@ static void mtl_bind_texture(void* ud, u32 unit, const rsx_texture_state* tex)
     if (mt) {
         for (u32 f = 0; f < nfaces; f++)
             [mt replaceRegion:MTLRegionMake2D(0, 0, width, height)
-                  mipmapLevel:0 slice:f withBytes:staging + (size_t)f * pitch * height
-                  bytesPerRow:pitch bytesPerImage:(NSUInteger)pitch * height];
+                  mipmapLevel:0 slice:f
+                    withBytes:bc_native ? (const void*)(vm_base + ea + (size_t)f * face_stride) : staging + (size_t)f * img_bytes
+                  bytesPerRow:pitch bytesPerImage:img_bytes];
+        s_tex_bytes += (unsigned long)[mt allocatedSize];
         u->tex = mt;
         u->offset = tex->offset; u->format = tex->format;
         u->image_rect = tex->image_rect;
         if (stale) {   /* la vecchia resta viva fino a fine fotogramma; le viste con remap la puntano: via */
-            remap_drop_base(stale->tex); graveyard_add(stale->tex);
+            texcache_release(stale->tex);
             stale->tex = mt; stale->fp = fpr; stale->last_use = s_frame_no; }
         else texcache_add(tex->offset, tex->format & ~0xF0000u, tex->image_rect, mt, fpr);
         { static int _tn = 0; static int _cn = 0; if (_tn++ < 64 || (cube && _cn++ < 32))
@@ -1953,7 +1978,7 @@ static void mtl_bind_texture(void* ud, u32 unit, const rsx_texture_state* tex)
                         const char* ew = getenv("RSX_TEX_SAVE_WH"); if (ew) sscanf(ew, "%ux%u/%x", &ts_w, &ts_h, &ts_f); }   /* "<w>x<h>[/<fmt hex>]" */
           static int tn = 0;
           static long ts_from = -2; if (ts_from == -2) { const char* e = getenv("RSX_TEX_SAVE_FROM"); ts_from = e ? atol(e) : 0; }   /* solo dal fotogramma dato (s.33) */
-          if (ts && !hdr16 && tn < ts_max && (long)s_frame_no >= ts_from && (ts_off < 0 || (long)(tex->offset & 0x7FFFFFFFu) == ts_off) && (!ts_w || (width == ts_w && height == ts_h && (!ts_f || fmt == ts_f)))) {
+          if (ts && staging && !hdr16 && tn < ts_max && (long)s_frame_no >= ts_from && (ts_off < 0 || (long)(tex->offset & 0x7FFFFFFFu) == ts_off) && (!ts_w || (width == ts_w && height == ts_h && (!ts_f || fmt == ts_f)))) {
               char tp[96]; snprintf(tp, sizeof tp, "/tmp/rsx_tex%d_%08X.ppm", tn++, tex->offset);
               fprintf(stderr, "[RSX metal] texture salvata: %s (fotogramma #%lu, impronta %08X%s)\n", tp, s_frame_no, fpr, stale ? ", ridecodifica" : "");
               FILE* tf = fopen(tp, "wb");
@@ -1974,7 +1999,7 @@ static void mtl_bind_texture(void* ud, u32 unit, const rsx_texture_state* tex)
               } } }
         { static int td2 = -1;
           if (td2 < 0) td2 = getenv("RSX_TEX_DBG") ? 1 : 0;
-          if (td2 && !hdr16) {
+          if (td2 && staging && !hdr16) {
               unsigned long nz = 0, na = 0;
               const size_t n = (size_t)width * height;
               for (size_t i = 0; i < n; i++) {
@@ -2571,8 +2596,8 @@ static void rsx_metal_backend_present_impl(void)
           s_acc += s_draw_count; if (s_draw_count) s_nz++;
           if (s_fs > 0 && (s_frame_no % (unsigned long)s_fs) == 0) {
               extern unsigned long long ps3_ms_now(void);
-              fprintf(stderr, "[RSX metal] fotogramma #%lu: negli ultimi %d presentati %lu draw in %lu fotogrammi non vuoti, t=%llums decodifiche=%lu (%lu Mpx) cache=%u fp=%u vp=%u fpc=%uKB\n",
-                      s_frame_no, s_fs, s_acc, s_nz, ps3_ms_now(), s_tex_decodes, s_tex_decode_px >> 20, s_texcache_n, s_fp_count, s_vp_count, s_fpc_used >> 10);
+              fprintf(stderr, "[RSX metal] fotogramma #%lu: negli ultimi %d presentati %lu draw in %lu fotogrammi non vuoti, t=%llums decodifiche=%lu (%lu Mpx) bc=%lu cache=%u texMB=%lu fp=%u vp=%u fpc=%uKB\n",
+                      s_frame_no, s_fs, s_acc, s_nz, ps3_ms_now(), s_tex_decodes, s_tex_decode_px >> 20, s_tex_bc_native, s_texcache_n, s_tex_bytes >> 20, s_fp_count, s_vp_count, s_fpc_used >> 10);
               s_tex_decodes = 0; s_tex_decode_px = 0; s_acc = 0; s_nz = 0; } }
         /* RSX_DRAWLIST=<n>: l'elenco dei draw del fotogramma n (o di ogni
          * fotogramma con piu' di 5 draw quando n = 0 e' il primo tale):
