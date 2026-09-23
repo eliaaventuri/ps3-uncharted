@@ -5260,3 +5260,11 @@ PS3_HLE_INJECT_BASE=0x50000000 PS3_VFS_ROOT=/tmp/uc_iso \
 
 La tabella NID è **per-port**: `ppu_hle_register_all()` nel runtime è weak e
 vuota, e senza `tools/gen_hle_nids.py --all` ogni import resta non risolto.
+
+## Pulizia uncharted-data (23/09/2026)
+
+Cartella `uncharted-data` 40 GB -> 1,0 GB. Cancellati: 930 `run_*.log` (37,5 GB,
+s27-s39), `iterate.log`, `shot.log`, `uncharted.s37`, `recomp.bak`,
+`recomp.bak_s35`, `recomp.bak_s36`, e in `obj/`: `o1_backup`, `o2_s35_backup`,
+`o2_s36_backup`, `spu_s35_backup`, `spu_s36_neon`. I backup citati sopra (s35/s36)
+non esistono piu': per tornare indietro si rifa' il lift da git.
