@@ -388,6 +388,20 @@ static inline int mfc_do_transfer(spu_context* spu, uint32_t lsa, uint64_t ea,
                   if (e1 > worst) worst = e1; if (e1 > 0.15f) bad++; if (r0 == 0 && r1 == 0 && r2 == 0) ident++; }
               _n++;
               fprintf(stderr, "[palette] ovl %d GET ea=%08X size=0x%X lsa=%05X: %u matrici, %u non ortonormali (peggiore %.3f), %u nulle\n", spu->resident_ovl, (uint32_t)ea, size, lsa, nb, bad, worst, ident); } } }
+    /* SPU_PUT_VAL=<hex>[:<mask>] (s.41): i PUT che portano in memoria principale una
+     * parola (allineata a 4) uguale al valore sotto la maschera -- chi produce un
+     * valore che poi si trova solo nel command buffer. */
+    { static long s_v = -2; static uint32_t s_m = 0xFFFFFFFFu;
+      if (s_v == -2) { const char* e = getenv("SPU_PUT_VAL"); s_v = (e && *e) ? (long)strtoul(e, 0, 16) : -1;
+                       const char* c = e ? strchr(e, ':') : 0; if (c) s_m = (uint32_t)strtoul(c + 1, 0, 16); }
+      if (s_v >= 0 && (mfc_is_put(cmd) || (mfc_is_get(cmd) && (uint64_t)(uint32_t)ea + size <= 0xC0000000ull)) && size >= 4) { static int _n = 0;
+          const uint8_t* q = mfc_is_put(cmd) ? &spu->ls[lsa & SPU_LS_MASK] : vm_base + (uint32_t)ea;
+          for (uint32_t k = 0; k + 4 <= size && _n < 200; k += 2) {
+              uint32_t w = ((uint32_t)q[k] << 24) | ((uint32_t)q[k+1] << 16) | ((uint32_t)q[k+2] << 8) | q[k+3];
+              if ((w & s_m) == ((uint32_t)s_v & s_m)) { _n++;
+                  fprintf(stderr, "[putval] %s img=%d ovl=%d pc=0x%05X lr=0x%05X lsa=0x%05X ea=0x%08X (+0x%X) = %08X\n",
+                          mfc_is_put(cmd) ? "PUT" : "GET", spu->image_id, spu->resident_ovl, (uint32_t)spu->pc & SPU_LS_MASK,
+                          spu->gpr[0]._u32[0] & SPU_LS_MASK, lsa, (uint32_t)ea, k, w); } } } }
     /* SPU_DMA_EAWIN=<lo>:<hi> -- ogni trasferimento la cui finestra di memoria
      * principale tocca [lo,hi). Serve quando la domanda non e' "cosa fa questa
      * immagine" ma "qualcuno arriva mai fin qui": il job manager di WwsJob

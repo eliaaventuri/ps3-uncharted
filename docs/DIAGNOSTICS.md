@@ -946,6 +946,8 @@ not changed while a title runs.
 - **`RSX_VA_RECHECK`** — RSX_VA_RECHECK: il blocco intero (float3 BE, passo dal formato) riletto al present */
   `libs/video/rsx_metal_backend.m:729`
 - **`RSX_VA_WATCH`** — RSX_VA_WATCH=<hex>: ogni draw il cui attributo 0 sta a quell'offset: quanti vertici (float3) sono spazzatura al momento della copia (s.31, da incrociare con SPU_DMA_EAWIN sullo stesso blocco). */
+- **`RSX_VAODD`** — RSX_VAODD=<n> (s.40/41): i primi n offset di attributo non allineati a 4, con `@fifo <EA>` e i 12 metodi precedenti; `RSX_VAODD_FROM=<fotogramma>`; `RSX_VAODD_SCAN=1` aggiunge i byte a VRAM+(offset&0x0FFFFFFF) e al giro in memoria principale e 40 parole della FIFO attorno.
+- **`SPU_PUT_VAL`** — SPU_PUT_VAL=<hex>[:<mask>] (s.41, spu_dma.h): PUT e GET delle SPU che trasportano quella parola (passo 2 byte), con immagine, overlay, pc, lr ed EA. Ha trovato il job 215 come produttore degli offset 0x6ADFFFFF.
   `libs/video/rsx_metal_backend.m:850`
 - **`RSX_VIEWPORT`** — viewport del guest (v. draw_viewport_setup); RSX_VIEWPORT=0 torna a quella dell'intera superficie */
   `libs/video/rsx_metal_backend.m:2670`

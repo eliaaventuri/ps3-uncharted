@@ -1619,6 +1619,12 @@ static u8 spurs_wkl_maxcont(u32 ea, u32 wid)
     if (s_fs == -2) { const char* e = getenv("SPURS_FORCE_SPUS"); s_fs = e ? atoi(e) : -1; }
     if (s_fs_all < 0) { const char* e = getenv("SPURS_FORCE_SPUS_ALL"); s_fs_all = (e && *e && *e != '0') ? 1 : 0; }
     if (s_fs > 0 && (maxcont > 1 || s_fs_all)) maxcont = (u8)(s_fs > 6 ? 6 : s_fs);
+    /* Mai oltre le SPU dell'istanza (s.41): Uncharted inizializza SPURS con 5
+     * SPU e il job della geometria (ovl 215) legge per spuNum la propria corsia
+     * del mesh output ring (5 x 0x199980 da 0x20800000). Con spuNum 5 la corsia
+     * non esiste: semaforo 0xFF0, posizione -1, offset dei vertici 0x6ADFFFFF
+     * ("indirizzo - 1" della s.40) -- i poligoni giganti e il cielo sparito. */
+    { u8 ns = *(vm_base + ea + SPURS_NSPUS); if (ns >= 1 && maxcont > ns) maxcont = ns; }
     return maxcont;
 }
 

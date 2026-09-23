@@ -1,6 +1,6 @@
 # Stato del progetto
 
-Ultimo aggiornamento: **20 settembre 2026** — sessione 39.
+Ultimo aggiornamento: **23 settembre 2026** — sessione 41.
 
 ## Dove siamo
 
@@ -179,6 +179,12 @@ troncamento) con la via veloce dei float che guarda solo il risultato, e
 barriere di memoria (`sync/lwsync/eieio/isync` erano no-op) e
 `ShutdownWorkload`/`WaitForWorkloadShutdown` aspettano davvero il quanto
 del PM in volo. Dettagli in "Sessione 36".
+
+**Dalla sessione 41 niente piu' vertici spazzatura** (poligoni giganti, cielo
+sparito nell'incontro): il port faceva girare il job della geometria su 6
+SPU, ma Uncharted inizializza SPURS con 5; sulla sesta il job cercava una
+corsia del mesh output ring che non esiste. Ora il runtime non supera mai le
+SPU dell'istanza: `garb=` 16.158 -> 0. Dettagli in "Sessione 41".
 
 **Dalla sessione 35 Drake puo' morire e il gioco riparte dal checkpoint.**
 Lo stallo intermittente dopo la morte (e quando Drake parlava) era il
@@ -513,6 +519,63 @@ La lista dei comandi ora viene percorsa fino in fondo — sei coppie
 risultati in memoria principale.** Non era mai successo in nessuna sessione.
 Riproducibile: **tre corse su tre**, identiche -- 14 comandi, un overlay
 residente, zero microstep, cinque stall e due interrupt per corsa.
+
+## Sessione 41 — i vertici spazzatura erano la sesta SPU: spuNum oltre le SPU dell'istanza
+
+**La causa.** Il mistero della s.40 (offset dei vertici "indirizzo - 1",
+0x6B05C29F, e dati 0xCDCD) si scioglie leggendo il pacchetto intero attorno
+al comando (`RSX_VAODD_SCAN=1`, ora stampa 40 parole della FIFO): nei
+blocchi cattivi `SET_SEMAPHORE_OFFSET` (0x1D6C) vale **0xFF0** invece di
+0x480+16*corsia, il label (0x1D74) vale 0x000005FF/0x20FF/... (posizioni
+relative, non EA 0x20Exxxxx) e l'offset dell'attributo 0 e' 0x6AE00000 +
+label del blocco prima (partenza 0x6ADFFFFF = posizione -1). Cioe' il job
+della geometria (ovl 215) lavora su una corsia inesistente. Le corsie sono
+5 (8 MB / 5 = 0x199980, gia' visto in s.32) perche' Uncharted crea SPURS con
+**5 SPU**; `SPURS_FORCE_SPUS=6` (run.sh, dalla s.34) dava ai workload
+multi-SPU anche spuNum 5. Anche gli stride dispari (59/31/47) e il valore
+del menu 0x6A5FFFFF vengono da li'.
+
+Come ci si e' arrivati (per non rifarlo): `YDKJ_VWATCH` sul valore = 0
+scritture PPU; `RSX_VAODD` con `@fifo` = il comando sta nella memoria dei
+job SPU (0x2050xxxx-0x2060xxxx); `SPU_PUT_VAL=<hex>[:mask]` (nuovo,
+`spu_dma.h`: PUT e GET che portano quel valore, passo 2 byte) = lo scrive
+l'ovl 215 senza averlo mai letto (il colpo dell'immagine 1 = edge zlib
+inflate era una coincidenza); ovl 215 = interprete di record da 16
+mezze parole (tabella dei gestori a LS 0x15230), niente costanti utili nel
+disassemblato; `SPU_INTERP_OVL=215,0` da' lo stesso valore (non e' il
+lifter). Nota: l'immagine 1 (inflate) scrive direttamente in VRAM
+0xCA/0xCB (pacchetti caricati in memoria locale).
+
+**Il rimedio** (`cellSpurs.c`, `spurs_wkl_maxcont`): la contention non
+supera mai `nSpus` dell'istanza (byte +0x76), qualunque sia
+`SPURS_FORCE_SPUS`. Le 6 lane restano: la sesta prende gli altri workload.
+
+**Misure** (200 s, screenshot ogni 5 s da 60 s, `classify2.py`):
+
+| | prima (6 SPU) | dopo |
+|---|---|---|
+| `garb=` in tutta la corsa, scenario incontro | 16.158 (dopo f#3400) | 0 |
+| `garb=` scenario di riferimento | 100-200 / 50 fotogrammi (s.40) | 0 |
+| screenshot difettosi, incontro | 7/29 (3 ombra/cielo, 4 nero/bianco) | 6/29, tutti bianco/nero = danno/morte del gioco |
+| screenshot difettosi, riferimento | 3/29 (s.40) | 2/29, bianco (danno) |
+| fps mediani 100-190 s, incontro | 26,7 | 21,1 |
+| fps mediani 100-190 s, riferimento | 28,6 (s.40) | 24,4 |
+
+**Il prezzo: -15/20% di fps.** La sesta lane "gratis" della s.34 era in
+parte lavoro buttato (blocchi scritti su una corsia fantasma). Ora il job
+della geometria ha 5 lane come sul ferro; per recuperare serve la velocita'
+del codice SPU liftato (fronte 2).
+
+**Diagnostiche nuove:** `SPU_PUT_VAL=<hex>[:<mask>]` (PUT/GET SPU che
+trasportano una parola, allineata a 2); `RSX_VAODD` stampa `@fifo <EA>`;
+`RSX_VAODD_FROM=<fotogramma>`; `RSX_VAODD_SCAN=1` (byte a VRAM+offset&28bit
+e al giro in memoria principale, piu' 40 parole della FIFO attorno).
+
+### Fronte aperto (dopo la sessione 41)
+
+1. Velocita' del codice SPU liftato (il job della geometria su 5 lane e' il
+   collo: 21-24 fps).
+2. Giocare oltre il checkpoint con la tastiera (Elia); audio: si sente?
 
 ## Sessione 40 — texture BC caricate compresse (picco 14 -> 3,3 GB); i difetti grossi dipendono dallo stato del gioco
 

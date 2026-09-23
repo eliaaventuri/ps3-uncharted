@@ -660,10 +660,20 @@ int rsx_process_method(rsx_state* state, u32 method, u32 data)
          * (float impossibili: i draw con i vertici spazzatura li hanno tutti),
          * con i metodi che li precedono nel flusso */
         { static int s_vo = -2; if (s_vo == -2) { const char* e = getenv("RSX_VAODD"); s_vo = e ? atoi(e) : 0; }
-          if (s_vo > 0 && (data & 3u)) { s_vo--; extern unsigned rsx_backend_frame_no(void);
-              fprintf(stderr, "[vaodd] f#%u attr%u offset=%08X; prima:", rsx_backend_frame_no(), (method - 0x1680) >> 2, data);
+          static long s_vf = -1; if (s_vf < 0) { const char* e = getenv("RSX_VAODD_FROM"); s_vf = e ? atol(e) : 0; }
+          extern unsigned rsx_backend_frame_no(void);
+          if (s_vo > 0 && (data & 3u) && (long)rsx_backend_frame_no() >= s_vf) { s_vo--;
+              fprintf(stderr, "[vaodd] f#%u attr%u offset=%08X @fifo %08X; prima:", rsx_backend_frame_no(), (method - 0x1680) >> 2, data, g_rsx_cur_dea);
               for (u32 k = 1; k <= 12; k++) { u32 i = (s_mr_i - k) & 15u; fprintf(stderr, " %04X=%08X", s_mr_m[i], s_mr_d[i]); }
-              fputc('\n', stderr); } }
+              fputc('\n', stderr);
+              /* RSX_VAODD_SCAN=1: i byte alle due letture possibili dell offset */
+              if (getenv("RSX_VAODD_SCAN")) { extern uint8_t* vm_base; /* s.41: VRAM (maschera 28 bit) contro il giro in memoria principale */
+                  const u32 ea2[2] = { 0xC0000000u + (data & 0x0FFFFFFFu), 0xC0000000u + data };
+                  for (int c = 0; c < 2; c++) { fprintf(stderr, "[vaodd]   @%08X:", ea2[c]);
+                      for (u32 k = 0; k < 48; k++) fprintf(stderr, "%s%02X", (k & 3) ? "" : " ", vm_base[(u32)(ea2[c] + k)]);
+                      fputc('\n', stderr); }
+                  fprintf(stderr, "[vaodd]   fifo:"); for (u32 k = 0; k < 40; k++) { u32 w; memcpy(&w, vm_base + g_rsx_cur_dea - 0x20 + k * 4, 4); fprintf(stderr, " %08X", __builtin_bswap32(w)); }
+                  fputc('\n', stderr); } } }
         return process_vertex_attrib_method(state, method, data);
     }
 
