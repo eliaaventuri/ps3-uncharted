@@ -125,6 +125,11 @@ un puntatore nullo letto dai propri dati, e la scena 3D non si vede ancora
 finestra (frecce, Spazio/X = CROSS, C = CERCHIO, Invio = START); `PAD_SCRIPT`
 per le corse senza nessuno. Dettagli in "Sessione 27".
 
+**Dalla sessione 43 l'audio non gracchia piu'**: pubblicavamo la posizione
+di lettura come contatore invece che come slot dell'anello (0-7) e il
+sintetizzatore del gioco scriveva sopra blocchi non ancora suonati (22% dei
+confini fra blocchi con un click -> 0,1%). Dettagli in "Sessione 43".
+
 **Dalla sessione 40 le texture compresse restano compresse.** Le BC1/2/3
 (DXT) venivano decodificate in RGBA8 sul thread del walker: al caricamento
 del livello la cache saliva a 12,7 GB di texture Metal (footprint di picco
@@ -519,6 +524,61 @@ La lista dei comandi ora viene percorsa fino in fondo — sei coppie
 risultati in memoria principale.** Non era mai successo in nessuna sessione.
 Riproducibile: **tre corse su tre**, identiche -- 14 comandi, un overlay
 residente, zero microstep, cinque stall e due interrupt per corsa.
+
+## Sessione 43 — l'audio gracchiava: l'indice di lettura era un contatore, non lo slot dell'anello
+
+**Misure prima** (`AUDIO_RATE=1`, `AUDIO_RAW=<file>`, nuove, solo POSIX):
+il mixer va al ritmo giusto (187,4 blocchi/s contro 187,5; coda SDL
+stabile 21-32 ms: l'ipotesi "il mixer corre piu' veloce del ferro" e'
+SCARTATA), tutti i blocchi hanno segnale (RMS ~0,1), ma il 22% dei confini
+fra blocchi da 256 campioni ha un salto (>5x la variazione interna) contro
+il 2% su confini finti a meta' blocco: ~40 click al secondo, spettrogramma
+a righe verticali. Nessun blocco muto: non e' un underrun.
+
+**Causa.** Il thread `syn_tick_timer_thread` (entry OPD 0x7C91D8 ->
+`func_0071ECF8`, `sys_timer_usleep(1e6/rate)`, rate 0x3C=60 Hz in gioco,
+0xF0 a vuoto) chiama `func_0071E9B8`: legge l'indice a `readIndexAddr`
+(`ld` da *0x108DC884, salvato in *0x10171CB8) e produce blocchi finche'
+il proprio slot 0..7 (*0x108DC8E0, azzerato a 8) non e' UGUALE a
+quell'indice. Noi pubblicavamo `read_index` che cresce all'infinito:
+dopo 8 blocchi l'uguaglianza non si verifica piu' e il synth scriveva a
+ogni tick tutti i blocchi che riusciva, sopra quelli non ancora suonati.
+RPCS3 (`cellAudio.cpp`: `indices[..] = port.cur_pos`, `position()` e'
+`% num_blocks`) pubblica lo slot. Fix: `read_index % nBlock` in
+`libs/audio/cellAudio.c` (vale anche per Windows: e' la semantica del
+firmware; il watchdog di LBP confronta solo che cambi).
+
+**Dopo:** salti ai confini 0,1% = controllo 0,1%; piattezza spettrale
+0,29 -> 0,15. WAV prima/dopo in scratchpad della sessione (non nel repo).
+Fotogrammi a 200 s: 4.013 (crash), 6.867, 7.923, 6.771 (s.42: 6.750-7.200);
+a 160 s 5.209-5.942.
+
+**Correzione allo stato della s.42:** `SCREAM: in DoGrain but handler's
+SH.Sound member is NULL!` NON compare al boot in tutte le corse (al boot
+c'e' solo il banner `SCREAM PS3 (c)2005`): in 48 log compare solo nelle
+corse del crash. Il crash e' sul thread del synth: DoGrain
+(`func_00714F28`) trova `handler+4 == 0`, stampa con `func_0070A2E0` che
+poi chiama un hook indiretto (*(*(r2-0x7388))) -> host 0x0. Sul ferro
+dopo la stampa c'e' un `b .` (0x7150A4): il thread si appenderebbe.
+Frequenza: 1/28 corse in s.42, 1/10 dopo il fix (s43_fs1..10): non
+significativo, ma da tenere d'occhio -- il fix cambia il ritmo del synth
+(~3 blocchi per tick invece di "tutti quelli possibili").
+
+**L'altro fallimento raro della s.42** (`stuck on reference value`, corsa
+s42_b3_1): l'assert del policy module WwsJob a 0x15B0 e' il primo della
+banca di `stopd`, raggiunto da `brz $r5,0x15B0` a 0x33FC: il magic
+0xC0DEC0DE a [base del job + 0x20] non c'e' -- la base del codice del job
+letta da LS 0x1330 vale 0 (scritta a 0x23FC da `r10 = roti r31,10`). Un
+job partito senza codice caricato. Solo una corsa, niente riproduzione.
+
+### Fronte aperto (dopo la sessione 43)
+
+1. Crash DoGrain (SH.Sound NULL sul thread del synth): corsa fra lo stop
+   di un suono e il tick? Lock SCREAM = `func_00720B68`/`func_00720B20`
+   (trylock via `func_007416B0`). Servono piu' corse per la frequenza.
+2. Contesa `resv_lock`, fallimenti rari della s.42, codice SPU liftato.
+3. Elia: ascoltare l'audio in gioco (ora senza click?) e giocare oltre il
+   checkpoint.
 
 ## Sessione 42 — il costo fisso del runtime SPU: ~26 -> ~28 fps
 

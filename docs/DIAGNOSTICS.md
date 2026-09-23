@@ -108,6 +108,8 @@ not changed while a title runs.
 ## `AUDIO`
 
 - **`AUDIO_PEAK`** — AUDIO_PEAK diag: which blocks of this port's WHOLE ring hold data, vs which block the read cursor is on -- distinguishes "writer never writes" from "writer and reader cycle out of phase". */
+- **`AUDIO_RATE`** — (POSIX) ogni ~10 s: blocchi mixati al secondo (ferro: 187,5), profondita' della coda SDL, blocchi non muti, picco e RMS del mix.
+- **`AUDIO_RAW=<file>`** — (POSIX) scrive il mix in uscita, float32 stereo 48 kHz grezzo, per ascoltarlo o analizzarlo.
   `libs/audio/cellAudio.c:416`  _(+1 more sites)_
 
 ## `BLENDDBG`

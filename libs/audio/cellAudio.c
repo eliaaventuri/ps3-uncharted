@@ -97,6 +97,7 @@ extern uint32_t sys_event_queue_create_direct(uint64_t key, int32_t size);
 #else
   #include <pthread.h>
   #include <unistd.h>
+  #include <time.h>
   typedef pthread_t thread_t;
   typedef pthread_mutex_t mutex_t;
   #define mutex_init(m)    pthread_mutex_init(m, NULL)
@@ -468,8 +469,13 @@ static void audio_mix_one_block(void)
          * [0..3] -- the half the game never looks at -- so it saw a frozen index
          * and tripped "LIBAUDIO DROPOUT - POSITION NO LONGER INCREMENTING". */
         port->read_index++;
+        /* Il firmware pubblica il BLOCCO corrente dell'anello (0..nBlock-1),
+         * non un contatore: RPCS3 `indices[..] = port.position(1)`, che e'
+         * `% num_blocks`. Il synth di Uncharted confronta il proprio slot 0..7
+         * con questo valore; con il contatore non combaciavano mai e scriveva
+         * blocchi a caso nell'anello (22% dei confini fra blocchi con un click). */
         if (port->read_idx_addr)
-            vm_write64((u32)port->read_idx_addr, port->read_index);
+            vm_write64((u32)port->read_idx_addr, port->read_index % nblock);
     }
 
     mutex_unlock(&s_audio_mutex);
@@ -547,6 +553,30 @@ static void* audio_mix_thread_func(void* arg)
         audio_notify_event_queues();
 
         u32 queued = audio_backend_queued_samples();
+        /* AUDIO_RATE=1: blocchi mixati al secondo contro i 187,5 del ferro
+         * (48000/256) e profondita' della coda SDL, ogni ~10 s. */
+        { static int _ar = -1; if (_ar < 0) _ar = getenv("AUDIO_RATE") ? 1 : 0;
+          if (_ar) { static unsigned _n, _nz; static float _pk; static double _e;
+            static struct timespec _t0;
+            struct timespec _t; clock_gettime(CLOCK_MONOTONIC, &_t);
+            if (_n == 0) _t0 = _t;
+            { float bpk = 0.0f;
+              for (u32 i = 0; i < CELL_AUDIO_BLOCK_SAMPLES * 2; i++) {
+                  float a = fabsf(s_mix_buffer[i]); if (a > bpk) bpk = a;
+                  _e += (double)s_mix_buffer[i] * s_mix_buffer[i]; }
+              if (bpk > _pk) _pk = bpk; if (bpk > 0.001f) _nz++; }
+            if (++_n % 1875 == 0) {
+                double dt = (_t.tv_sec - _t0.tv_sec) + (_t.tv_nsec - _t0.tv_nsec) / 1e9;
+                fprintf(stderr, "[audio-rate] blocchi=%u %.1f/s coda=%u campioni (%.0f ms) "
+                        "non-muti=%u/1875 picco=%.3f rms=%.4f\n",
+                        _n, _n / dt, queued, queued * 1000.0 / CELL_AUDIO_SAMPLE_RATE,
+                        _nz, _pk, sqrt(_e / (1875.0 * CELL_AUDIO_BLOCK_SAMPLES * 2)));
+                _nz = 0; _pk = 0.0f; _e = 0.0;
+            } } }
+        /* AUDIO_RAW=<file>: il mix in uscita, float32 stereo 48 kHz grezzo. */
+        { static FILE* _rf; static int _ri = -1;
+          if (_ri < 0) { const char* p = getenv("AUDIO_RAW"); _rf = p ? fopen(p, "wb") : NULL; _ri = 1; }
+          if (_rf) fwrite(s_mix_buffer, sizeof(float), CELL_AUDIO_BLOCK_SAMPLES * 2, _rf); }
         if (queued > CELL_AUDIO_BLOCK_SAMPLES * 4) {
             usleep(5000);
         } else {
