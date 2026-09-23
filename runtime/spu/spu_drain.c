@@ -364,3 +364,60 @@ int spu_retlink_enabled(void)
     return s;
 }
 
+
+/* Via veloce del drain (s.42, v. SPU_DRAIN in spu_context.h). Il ciclo
+ * completo resta in SPU_DRAIN_FULL e si usa con qualunque variabile che
+ * accenda una sonda del ciclo, con il lockstep o con SPU_TAILRET=1. */
+int g_spu_drain_mode = 0;
+
+static int spu_drain_mode_init(void)
+{
+    static const char* const vars[] = { "SPU_DRAIN_FULL", "SPU_EXITTRACE", "SPU_STEPTRACE",
+        "SPURS_PM_WATCHDOG", "LBP_JOBDRAIN", "SPU_NO_LS0_END", "SPU_PROBE_PC", "SPU_PCWATCH",
+        "SPU_HOPHIST", "SPU_HOST_DEPTH_MAX", NULL };
+    for (int i = 0; vars[i]; i++) if (getenv(vars[i])) return 2;
+    const char* e = getenv("YZ_SPU_LOCKSTEP");
+    if (e && *e && *e != '0') return 2;
+    return spu_tailret_enabled() ? 2 : 1;
+}
+
+void spu_drain_slow(spu_context* ctx)
+{
+    if (!g_spu_drain_mode) {
+        int m = spu_drain_mode_init();
+        static int _n = 0;
+        if (_n++ == 0) fprintf(stderr, "[spu-drain] ciclo %s\n", m == 1 ? "veloce" : "completo (diagnostica)");
+        g_spu_drain_mode = m;
+    }
+    SPU_DRAIN_FULL(ctx);
+}
+
+/* Lo stesso ciclo di SPU_DRAIN_FULL senza le sonde: ritorno esatto
+ * (SPU_RETLINK), fine del job a LS 0 e anello del flow del PM come nella via
+ * veloce di spu_task_launch_check, interrupt. */
+void spu_drain_fast(spu_context* ctx)
+{
+    const int retlink = spu_retlink_enabled();
+    void (*tf)(spu_context*);
+    while ((tf = g_spu_trampoline_fn) != 0) {
+        ctx->hops++;
+        int irq = (ctx->int_enable && (ctx->event_status & ctx->event_mask)) ? 1 : 0;
+        if (!irq && retlink && ctx->host_depth > 0 && ctx->ret_link &&
+            ((uint32_t)ctx->pc & SPU_LS_MASK) == ctx->ret_link) {
+            g_spu_trampoline_fn = 0;
+            return;
+        }
+        g_spu_trampoline_fn = 0;
+        ctx->steps++;
+        if (__builtin_expect((ctx->pc & SPU_LS_MASK) == 0 && ctx->steps > 1 && !ctx->policy_mode && ctx->image_id > 0, 0)) {
+            static int _n = 0;
+            if (_n++ < 8)
+                fprintf(stderr, "[spurs-job] img=%d branched to LS 0 -- job complete\n", ctx->image_id);
+            spu_halt(ctx);
+        } else if (g_pm_flow_ctx == (void*)ctx && g_pm_flow_n < 8192)
+            g_pm_flow_buf[g_pm_flow_n++] = ctx->pc;
+        if (irq)
+            tf = spu_take_interrupt(ctx, tf);
+        tf(ctx);
+    }
+}

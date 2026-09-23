@@ -1,6 +1,6 @@
 # Stato del progetto
 
-Ultimo aggiornamento: **23 settembre 2026** — sessione 41.
+Ultimo aggiornamento: **23 settembre 2026** — sessione 42.
 
 ## Dove siamo
 
@@ -519,6 +519,81 @@ La lista dei comandi ora viene percorsa fino in fondo — sei coppie
 risultati in memoria principale.** Non era mai successo in nessuna sessione.
 Riproducibile: **tre corse su tre**, identiche -- 14 comandi, un overlay
 residente, zero microstep, cinque stall e due interrupt per corsa.
+
+## Sessione 42 — il costo fisso del runtime SPU: ~26 -> ~28 fps
+
+**Dove andava il tempo delle lane** (`sample` a 100 s, livello di
+riferimento, 6 lane al 85% occupate, 19.000 campioni attivi su 10 s):
+codice dei job liftati 48%, canali/DMA 24%, trampolino e dispatch 17%,
+policy module 6%. Cioe' il 40% del lavoro delle lane era runtime, non
+codice del gioco. Strumenti nuovi in
+`scratchpad/misura/`: `selfunder.py <sample> <antenato>` (tempo self sotto
+un simbolo, attese separate), `incl.py` (inclusivo), `callers.py`.
+
+**Modifiche** (tutte equivalenti nella semantica, riviste riga per riga):
+1. `SPU_DRAIN` (spu_context.h) -> via veloce `spu_drain_fast` (spu_drain.c):
+   le sei chiamate fuori linea per salto (sonde, lockstep, guardia di
+   profondita', retlink/tailret) sostituite dagli stessi controlli in
+   linea. Il ciclo completo resta (`SPU_DRAIN_FULL`), scelto da solo con
+   qualunque variabile di sonda, lockstep o SPU_TAILRET=1.
+   `SPU_DRAIN_FULL=1` per l'A/B. Il log dice `[spu-drain] ciclo veloce`.
+2. `spu_indirect_branch`: via veloce (lookup + musttail) prima delle dieci
+   sonde; `SPU_IB_FULL=1` per l'A/B. Guadagno misurato ~1% (fotogrammi a
+   130 s 4.912 contro 4.875, 4+4 corse).
+3. `spu_irq_regs_maybe_restore` chiamata solo se `irq_save_valid`.
+4. `mfc_submit` (spu_dma.h): i contatori del watchdog "DMA identiche" per
+   thread invece che globali (sei lane scrivevano la stessa riga di cache
+   a ogni DMA).
+5. `spu_overlay_note_get`: uscita subito per GET < 512 byte quando non ci
+   sono sorgenti a EA (Uncharted: solo firme, 29).
+6. `resv_lock` (atomici GETLLAR/PUTLLC): test-and-test-and-set con `yield`,
+   attesa fuori linea in `resv_lock_spin`. Il profilo dopo i punti 1-5 dava
+   `resv_lock_spin` a 1.058 campioni su 17.000: contesa vera fra le lane
+   (il PM di WwsJob fa atomici sulle stesse righe del kernel SPURS).
+
+**Misure** (200 s, `fpsmed.sh` 100-190 s, `fotogrammi` = ultimo
+RSX_FRAMESTAT a 200 s):
+
+| binario | fps mediani | fotogrammi a 200 s |
+|---|---|---|
+| ciclo completo (SPU_DRAIN_FULL=1) | 25,2 / 25,7 | 6.450 / 6.350 |
+| solo punto 1 | 27,0 / 26,4 / 27,2 / 25,7 / 25,0 / 26,4 | 6.400-6.650 |
+| punti 1-6 | 26,5 / 29,6 / 29,1 / 25,1 / 27,0 / 29,7 | 6.750-7.200 |
+
+Le mediane ballano +-2 fps col contenuto (lo sapevamo dalla s.39); i
+fotogrammi a 200 s sono piu' stabili: +9% dal ciclo completo ai punti 1-6.
+`garb=0` in tutte le corse.
+
+**Fallimenti da tenere d'occhio (APERTO).** Con i punti 2-6 tre corse su
+20 sono finite male, con tre sintomi diversi e tutti fra 70 e 105 s:
+- SIGSEGV del PPU a host 0x0 in `func_00714F28+0xCF4`, subito dopo il
+  secondo `SCREAM: in DoGrain but handler's SH.Sound member is NULL!` (il
+  primo compare in TUTTE le corse al boot e non fa danni);
+- `Rendering is stuck on reference value 3816` con `[spu-assert] img=2
+  stopd @0x015B0` e 12 `[stale-call]`, durante il caricamento di temple-0a;
+- fotogrammi fermi a #3300 senza nessun messaggio (SPU vive, task in
+  WAIT_SIGNAL).
+Con il solo punto 1: 0 su 6 (+2 col ciclo completo). La bisezione sul
+punto 2 (8 corse da 130 s, 4 con e 4 senza) e' tutta pulita, e le ultime
+4+4 corse da 200 s sono tutte pulite. 3/20 contro 0/8 non basta per dare
+la colpa: ipotesi di lavoro = corse gia' presenti nel port che un gioco piu'
+veloce incontra piu' spesso (stato di gioco diverso allo stesso istante).
+Se ricompaiono: `SPU_IB_FULL=1` e un binario senza il punto 6 sono le due
+leve di A/B.
+
+**Cosa resta nel profilo delle lane** (dopo 1-5): job liftati ~50%,
+`resv_lock_spin` 6% (prima del punto 6), `spu_drain_fast` 5%, DMA
+(mfc_do_transfer + memmove) 6%, `mach_absolute_time` da `SPU_RdDec` 1,6%
+(`SPU_DEC_CACHE=1` c'e' ma non e' misurato qui).
+
+### Fronte aperto (dopo la sessione 42)
+
+1. Misurare la contesa rimasta su `resv_lock` dopo il TTAS (profilo); se
+   resta, lock per riga (hash dell'EA) con il lock globale solo per il PPU.
+2. I tre fallimenti rari qui sopra.
+3. Il codice liftato stesso (meta' delle lane): cache dei registri con
+   analisi di flusso (s.36: la versione ingenua perde).
+4. Giocare oltre il checkpoint con la tastiera (Elia); audio: si sente?
 
 ## Sessione 41 — i vertici spazzatura erano la sesta SPU: spuNum oltre le SPU dell'istanza
 

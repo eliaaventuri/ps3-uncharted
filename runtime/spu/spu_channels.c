@@ -331,9 +331,24 @@ static void resv_lock(void)   { while (_InterlockedExchange(&g_resv_lock, 1)) { 
 static void resv_unlock(void) { _InterlockedExchange(&g_resv_lock, 0); }
 #else
 #include <stdatomic.h>
-static atomic_flag g_resv_lock = ATOMIC_FLAG_INIT;
-static void resv_lock(void)   { while (atomic_flag_test_and_set_explicit(&g_resv_lock, memory_order_acquire)) { } }
-static void resv_unlock(void) { atomic_flag_clear_explicit(&g_resv_lock, memory_order_release); }
+static _Atomic int g_resv_lock = 0;
+/* s.42: l'attesa fuori linea (nei profili la contesa si vede come
+ * resv_lock_spin invece di sparire dentro spu_wrch: 1.058 campioni su 17.000
+ * delle lane) e test-and-test-and-set: chi aspetta LEGGE la riga finche' non
+ * e' libera, invece di scriverla a ogni giro strappandola a chi tiene il lock
+ * (sei lane sulle stesse righe del kernel SPURS). */
+__attribute__((noinline)) static void resv_lock_spin(void)
+{
+    do {
+        while (atomic_load_explicit(&g_resv_lock, memory_order_relaxed)) {
+#if defined(__aarch64__)
+            __asm__ __volatile__("yield");
+#endif
+        }
+    } while (atomic_exchange_explicit(&g_resv_lock, 1, memory_order_acquire));
+}
+static void resv_lock(void)   { if (atomic_exchange_explicit(&g_resv_lock, 1, memory_order_acquire)) resv_lock_spin(); }
+static void resv_unlock(void) { atomic_store_explicit(&g_resv_lock, 0, memory_order_release); }
 #endif
 
 /* The PPU-side HLE of a lock-free queue does its read-modify-write on the SAME
@@ -1049,10 +1064,12 @@ typedef struct { uint32_t src_ea; int image_id; uint8_t sig[16]; int has_sig; } 
 #define SPU_OVL_SRC_MAX 128
 static spu_ovl_src s_ovl_src[SPU_OVL_SRC_MAX];
 static int s_ovl_src_count = 0;
+static int s_ovl_ea_count = 0;   /* s.42: voci a EA (le altre sono a firma, solo GET >= 512 byte) */
 
 void spu_overlay_register_source(uint32_t content_ea, int image_id)
 {
     if (s_ovl_src_count < SPU_OVL_SRC_MAX) {
+        s_ovl_ea_count++;
         s_ovl_src[s_ovl_src_count].src_ea = content_ea;
         s_ovl_src[s_ovl_src_count].image_id = image_id;
         s_ovl_src[s_ovl_src_count].has_sig = 0;
@@ -1079,6 +1096,8 @@ void spu_overlay_register_sig(const uint8_t sig[16], int image_id)
  * chunks (overlay bodies are >= 0x500 bytes). */
 void spu_overlay_note_get(spu_context* ctx, uint32_t ea, const uint8_t* ls, uint32_t size)
 {
+    /* s.42: gira a ogni GET; una GET piccola non puo' essere un modulo a firma */
+    if (size < 512 && !s_ovl_ea_count) return;
     for (int i = 0; i < s_ovl_src_count; i++) {
         const spu_ovl_src* o = &s_ovl_src[i];
         int hit = o->has_sig ? (size >= 512 && memcmp(ls, o->sig, 16) == 0)
@@ -1445,7 +1464,7 @@ void spu_indirect_branch(spu_context* ctx)
      * enforce the preserve-all-registers hardware contract here -- the first
      * interrupts-enabled dispatch at the saved srr0 is the irete. */
     { extern int spu_irq_regs_maybe_restore(spu_context*);
-      if (spu_irq_regs_maybe_restore(ctx)) {
+      if (ctx->irq_save_valid && spu_irq_regs_maybe_restore(ctx)) {   /* s.42: il test in linea, la chiamata solo se serve */
           static int s_it = -1; if (s_it < 0) s_it = getenv("SPU_IRQTRACE") ? 1 : 0;
           static int _r = 0;
           if (s_it && _r++ < 200)
@@ -1542,6 +1561,26 @@ void spu_indirect_branch(spu_context* ctx)
                 fprintf(stderr, "[cri-r4] policy entry pc=0xA00: forced ctxt->taskset LS[0x27B8]=0x0F000000\n"); }
         }
     }
+    /* Via veloce (s.42): senza le sonde qui sotto, un bersaglio liftato si
+     * serve subito. I salti indiretti del job della geometria (tabella dei
+     * gestori del suo interprete di record) sono milioni al secondo e le
+     * dieci sonde in fila pesavano quanto la ricerca. SPU_IB_FULL=1 per l'A/B. */
+    { static int s_fast = -1;
+      if (s_fast < 0) s_fast = !(getenv("SPU_IB_FULL") || getenv("YDKJ_IBTRACE") || getenv("LBP_IBCOV") ||
+                                 getenv("YDKJ_POLLTRACE") || getenv("SPU_IBREGS") || getenv("YDKJ_POLTRACE") ||
+                                 getenv("SPU_JOBTRACE") || getenv("LBP_HLE_JOBDONE") || getenv("SPU_JOBEXEC"));
+      if (s_fast && (ctx->policy_mode || ctx->pc != SPU_JOB_RETURN_LS)) {
+          spu_fn f = ctx->resident_ovl ? spu_lookup(ctx->pc, ctx->resident_ovl) : NULL;
+          if (!f) f = spu_lookup(ctx->pc, ctx->image_id);
+          if (f) {
+#if defined(__clang__)
+              __attribute__((musttail)) return f(ctx);
+#else
+              f(ctx);
+              return;
+#endif
+          }
+      } }
     { static int s_ib = -1; if (s_ib < 0) s_ib = getenv("YDKJ_IBTRACE") ? 1 : 0;
       if (s_ib && ctx->image_id == 23) { static int _i = 0; if (_i++ < 60)
         fprintf(stderr, "[ib23] target=0x%05X lr=0x%05X\n",

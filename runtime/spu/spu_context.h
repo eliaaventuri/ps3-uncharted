@@ -903,7 +903,22 @@ static inline void spu_pcwatch(spu_context* ctx)
             ctx->image_id, (uint32_t)w, sp, v);
 }
 
-#define SPU_DRAIN(ctx) do {                                    \
+/* Via veloce del drain (s.42). Il ciclo completo qui sotto chiama sei funzioni
+ * fuori linea a OGNI salto del trampolino (sonde, lockstep, guardia di
+ * profondita'), e i salti sono 25-60 milioni al secondo: `sample` le dava al 7%
+ * del tempo delle lane. Senza variabili diagnostiche (spu_drain_mode_init in
+ * spu_drain.c) il ciclo gira in spu_drain_fast, con gli stessi controlli di
+ * semantica e nessuna sonda. SPU_DRAIN_FULL=1 torna al ciclo completo. */
+extern int g_spu_drain_mode;              /* 0 = da decidere, 1 = veloce, 2 = completo */
+void spu_drain_slow(spu_context* ctx);
+void spu_drain_fast(spu_context* ctx);
+#define SPU_DRAIN(ctx) do {                                                  \
+        if (__builtin_expect(g_spu_drain_mode != 1, 0)) { spu_drain_slow(ctx); break; } \
+        if (__builtin_expect((ctx)->host_depth >= 2000u, 0)) spu_depth_guard(ctx); \
+        if (g_spu_trampoline_fn) spu_drain_fast(ctx);                        \
+    } while (0)
+
+#define SPU_DRAIN_FULL(ctx) do {                               \
         spu_depth_guard(ctx);                                  \
         while (g_spu_trampoline_fn) {                           \
             (ctx)->hops++;                                                    \

@@ -1140,7 +1140,8 @@ static inline int mfc_submit(mfc_engine* mfc, spu_context* spu, uint32_t cmd)
      * pages on demand the counter never advanced and a spinning job simply hung
      * the chain walker instead. Count repeats whether or not the transfer
      * succeeds, and halt at a known pc rather than hanging silently. */
-    { static uint32_t s_last_ea, s_last_lsa, s_rep;
+    /* s.42: per thread (= per SPU): globali, sei lane se le rubavano a ogni DMA (riga di cache contesa) */
+    { static SPU_THREAD_LOCAL uint32_t s_last_ea, s_last_lsa, s_rep;
       static uint32_t s_limit = 0;
       /* 256 era troppo poco: il job di geometria di Uncharted (ovl 215)
        * interroga il label della RSX (0x480+16*lane) ogni ~4 us finche' la
