@@ -134,7 +134,10 @@ piu' corto, immagine identica. Le corse "cattive" (poligoni giganti, cielo
 e mare spariti) NON dipendono da questo: compaiono con e senza BC quando il
 gioco entra nell'incontro `dive-boat-encounter-first-wave` (13/29 e 17/29
 screenshot difettosi contro 0-3/29 nelle corse in cui Drake resta fuori
-dall'incontro). E' il fronte aperto. Dettagli in "Sessione 40".
+dall'incontro). Una delle due cause (draw col programma non ancora compilato
+disegnati con una trasformazione fissa) e' sistemata; l'altra (blocchi di
+vertici letti prima che il gioco li scriva) e' il fronte aperto. Dettagli in
+"Sessione 40".
 
 **Dalla sessione 39 la geometria grande non sparisce piu' a fotogrammi
 alterni.** Il flip si diceva concluso al massimo 8 ms dopo la richiesta anche
@@ -576,11 +579,74 @@ raffinato con la posizione dall'input del VP.
 cancellata dal disco in questa sessione senza che nessun comando nostro
 l'abbia toccata; non committata la cancellazione.
 
+**3. Riprodurre l'incontro a comando.** `PAD_STICK=128,0,128,128
+PAD_STICK_FROM=65 PAD_STICK_UNTIL=85` (nuovo `PAD_STICK_UNTIL` in
+`cellPad.c`): Drake cammina avanti 20 s ed entra nell'incontro in tutte
+le corse (`first-wave` nel log). Con questo scenario i difetti sono 4-19
+screenshot su 29 (`classify2.py`), contro 0-3 senza camminare.
+
+**4. Due cause trovate, una sistemata.**
+- **(sistemata) Draw con la coppia (FP, VP) non ancora compilata.** La
+  compilazione MSL e' asincrona e costa 1,6 s in media nel livello (640
+  compilazioni in 200 s): intanto il draw ricadeva sul VS incorporato
+  (MVP fissa da c0..3, e dalla s.38 senza nemmeno i MtlVertex) e diventava
+  un poligono da 30-60 milioni di frammenti (`RSX_BIGDRAW`, f#3000: 50 draw
+  cosi' in un fotogramma, tutti `vp=00000000`). Ora `pso_for` salta il draw
+  finche' la coppia non e' pronta (`saltati=` nel framestat, ~33.000 in 200
+  s); `RSX_VP_FALLBACK=1` rimette il vecchio percorso. Dopo: 0 draw giganti
+  senza VP.
+- **(aperta) Blocchi di vertici con posizioni spazzatura.** `RSX_GARBAGE=1`
+  conta per blocco di framestat (`garb=`): ~100-200 draw ogni 50
+  fotogrammi nel livello, 1.100-1.900 al caricamento. Il valore tipico e'
+  0xCDCDCDCD (-431602080.0: riempimento di memoria liberata della build di
+  debug del titolo). `RSX_VP_DBG_STAT=3` (nuovo: una riga solo per i draw con
+  spazzatura) + `RSX_VA_RECHECK=1`: in molti draw la spazzatura c'e' GIA' al
+  record e sparisce al present (chi scrive arriva dopo che il walker ha
+  letto), in altri compare dopo (memoria riusata: innocuo, i vertici sono gia'
+  copiati). TUTTI gli offset dell'attributo 0 di questi draw sono dispari
+  (== 3 mod 4, es. 0x6B05C29F, `RSX_VAODD=<n>` li stampa con i metodi
+  precedenti): location LOCAL con valore > 256 MB, che da noi fa il giro a 32
+  bit su 0x2B05C29F in memoria principale. Nessun job SPU scrive in
+  0x2AE5xxxx-0x2B08xxxx (`SPU_DMA_EAWIN`: solo GET del job 218, e PUT di
+  212-214 in 0x2B14B-0x2B153): li scrive il PPU. Nel menu la stessa forma:
+  attr0=0x6A5FFFFF, attr8=+12, attr3=+16 (= indirizzo - 1 con pos/tc/colore
+  a 0/12/16).
+
+  **Provato e scartato:** (a) la base dei vertici (NV4097 0x1738, RPCS3
+  `get_vertex_offset_from_base`, somma + maschera a 28 bit): il titolo non
+  la scrive mai, e la sola maschera a 28 bit (lettura in VRAM 0xCB05...)
+  moltiplica la spazzatura x6 (881.000 contro 150 per blocco) -- lo stato
+  resta registrato in `rsx_state.vertex_data_base_offset` ma il fetch non lo
+  usa; (b) leggere gli offset == 3 mod 4 a +1 (allineati): nei singoli
+  blocchi sospetti la spazzatura va a 0 (draw#1543: 160 -> 0, bbox -3,9..27,2
+  sensato), ma sul totale sale x7 (1.094 per blocco) e il cielo sparisce
+  piu' spesso: molti flussi dispari sono giusti cosi'. (c) `GCM_SEMA_STAT`:
+  il titolo non usa l'ACQUIRE del semaforo (0 in 110 s).
+
+  **Da capire:** chi produce l'offset "indirizzo - 1" (0x2B05C2A0 +
+  0x3FFFFFFF = 0x6B05C29F, cioe' ptr - 0xC0000001) e perche' su una parte
+  dei blocchi i dati arrivano dopo il walker. Sul ferro quel heap sta
+  probabilmente in VRAM (0xC.......) e l'offset e' piccolo: da noi il heap e'
+  in memoria principale. Prossimo passo: trovare nel PPU liftato chi scrive
+  0x6B05xxxx nel command buffer (PS3_TTY_BT / lldb_guest_bp su
+  cellGcmAddressToOffset o sul calcolo) e da dove viene il puntatore
+  0x2B05C2A0 (sys_memory / mmapper / cellGcmMapLocalMemory?).
+
+**Diagnostiche nuove:** `RSX_BIGDRAW=<frammenti>` (+`_FROM`, `_SURF`): a GPU
+finita i draw con piu' frammenti passati (contatori di visibilita');
+`RSX_GIANT=<k>` (+`_FROM`, `_MIN`): triangoli con un lato > k volte la
+mediana del draw; `RSX_GARBAGE_FROM`; `SPU_WRING=dyn` (la finestra del wring
+la chiede il backend al primo blocco spazzatura, `g_spu_wring_req`);
+`memshots.sh` scrive `<log>.shots` con l'orologio monotono e
+`shotframe.py <log>` da' il fotogramma di ogni screenshot.
+
+**Numeri finali (scenario di riferimento, senza camminare):** 26/29
+screenshot puliti (3 = morte di Drake), 28,6 fps mediani, picco 3,3 GB.
+
 ### Fronte aperto (dopo la sessione 40)
 
-1. Le corse cattive nell'incontro: poligoni giganti + geometria grande
-   sparita (punto 2). Prima cosa: riprodurre a comando (PAD_SCRIPT), poi
-   `RSX_GARBAGE` per capire quali draw hanno i vertici sbagliati.
+1. Gli offset dei vertici "indirizzo - 1" e i dati scritti dopo il walker
+   (punto 4, aperta): scenario `PAD_STICK_FROM=65 PAD_STICK_UNTIL=85`.
 2. Velocita' del codice SPU liftato (cache dei registri con analisi
    vivi/sporchi, u128 in ordine SPU).
 3. Giocare oltre il checkpoint con la tastiera (Elia); audio: si sente?

@@ -502,8 +502,10 @@ int rsx_ring_guard_check(unsigned lane, u32 r12, u32 r5, u32 r23, u32 r26, u32* 
     return 0;
 }
 
+static u32 s_mr_m[16], s_mr_d[16], s_mr_i;   /* ultimi metodi (RSX_VAODD, s.40) */
 int rsx_process_method(rsx_state* state, u32 method, u32 data)
 {
+    s_mr_m[s_mr_i & 15u] = method; s_mr_d[s_mr_i & 15u] = data; s_mr_i++;
     /* YDKJ_RSXTRACE=<N>: trace the first N methods (bare "1" keeps the old 250).
      * The fixed 250 was spent entirely on boot-time setup, so the methods around
      * the first real draw -- exactly the ones worth seeing -- were never traced. */
@@ -648,9 +650,22 @@ int rsx_process_method(rsx_state* state, u32 method, u32 data)
     if (method >= 0x1740 && method < 0x1740 + RSX_MAX_VERTEX_ATTRIBS * 4)
         return process_vertex_attrib_method(state, method, data);
 
+    if (method == 0x1738) { { static u32 seen[32]; static int ns = 0; int k; for (k = 0; k < ns && seen[k] != data; k++) ; if (k == ns && ns < 32) { seen[ns++] = data; extern unsigned rsx_backend_frame_no(void); fprintf(stderr, "[RSX] VERTEX_DATA_BASE_OFFSET=%08X (nuovo, f#%u)\n", data, rsx_backend_frame_no()); } }
+        state->vertex_data_base_offset = data; return 0; }   /* s.40: Uncharted non lo scrive mai (misurato), ne' lo usa il fetch */
+    if (method == 0x173C) { state->vertex_data_base_index = data;
+        { static int _n = 0; if (data && _n++ < 4) fprintf(stderr, "[RSX] VERTEX_DATA_BASE_INDEX=%u (non applicato)\n", data); } return 0; }
     /* Vertex attribute OFFSET: 0x1680..0x16BC */
-    if (method >= 0x1680 && method < 0x1680 + RSX_MAX_VERTEX_ATTRIBS * 4)
+    if (method >= 0x1680 && method < 0x1680 + RSX_MAX_VERTEX_ATTRIBS * 4) {
+        /* RSX_VAODD=<n> (s.40): i primi n offset di attributo NON allineati a 4
+         * (float impossibili: i draw con i vertici spazzatura li hanno tutti),
+         * con i metodi che li precedono nel flusso */
+        { static int s_vo = -2; if (s_vo == -2) { const char* e = getenv("RSX_VAODD"); s_vo = e ? atoi(e) : 0; }
+          if (s_vo > 0 && (data & 3u)) { s_vo--; extern unsigned rsx_backend_frame_no(void);
+              fprintf(stderr, "[vaodd] f#%u attr%u offset=%08X; prima:", rsx_backend_frame_no(), (method - 0x1680) >> 2, data);
+              for (u32 k = 1; k <= 12; k++) { u32 i = (s_mr_i - k) & 15u; fprintf(stderr, " %04X=%08X", s_mr_m[i], s_mr_d[i]); }
+              fputc('\n', stderr); } }
         return process_vertex_attrib_method(state, method, data);
+    }
 
     /* Viewport */
     /* Viewport transform: window = ndc*scale + offset. The z lane is the

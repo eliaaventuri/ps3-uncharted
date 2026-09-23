@@ -845,14 +845,21 @@ static int vpdbg_common(const MtlDraw* d, const rsx_state* st, u32 prim, u32 wro
     /* RSX_VP_DBG_STAT=1: una riga con min/max di ogni attributo su TUTTI i
      * vertici del draw (per vedere i dati stantii/sovrascritti, s.29) */
     { static int s_st = -1; if (s_st < 0) { const char* e = getenv("RSX_VP_DBG_STAT"); s_st = e ? atoi(e) : 0; }
-      if (s_st == 2) {   /* s.31: quanti vertici del draw hanno una posizione spazzatura, e il bbox dei sani */
+      if (s_st >= 2) {   /* s.31: quanti vertici del draw hanno una posizione spazzatura, e il bbox dei sani; =3 (s.40): solo i draw CON spazzatura, e non contano nel tetto RSX_VP_DBG */
           u32 nb = 0, nb_first = 0xFFFFFFFFu, nb_last = 0; float mn[3] = {1e30f,1e30f,1e30f}, mx[3] = {-1e30f,-1e30f,-1e30f};
           for (u32 v = 0; v < wrote; v++) { const float* f = base_f + (size_t)v * na * 4; int ok = 1;
               for (int k = 0; k < 3; k++) if (!(f[k] == f[k]) || fabsf(f[k]) > 1e6f) ok = 0;
               if (!ok) { nb++; if (v < nb_first) nb_first = v; nb_last = v; continue; }
               for (int k = 0; k < 3; k++) { if (f[k] < mn[k]) mn[k] = f[k]; if (f[k] > mx[k]) mx[k] = f[k]; } }
-          fprintf(stderr, "[vpbbox] draw#%u surf=%08X vp=%08X fp=%08X n=%u spazzatura=%u (vertici %u..%u) bbox=[%.2f..%.2f %.2f..%.2f %.2f..%.2f] va=%08X ea=%08X f#%lu\n", s_draw_count - 1, d->surf, s_vps[d->vp].hash, d->fp_hash, wrote, nb, nb ? nb_first : 0, nb ? nb_last : 0, mn[0], mx[0], mn[1], mx[1], mn[2], mx[2], d->attr0_off,
-                  (d->attr0_off & 0x80000000u) ? cellGcmResolveLocated(0, d->attr0_off & 0x7FFFFFFFu) : cellGcmResolveLocated(1, d->attr0_off), s_frame_no);
+          if (s_st == 3) { s_vn--; if (!nb) return 0; }
+          /* SPU_WRING=dyn: il primo blocco con >= meta' dei vertici spazzatura
+           * (nel livello) diventa la finestra del wring: chi ci scrive dopo, e quando */
+          if (nb * 2 >= wrote && wrote >= 64) { extern u32 g_spu_wring_req[2];
+              u32 bea = (d->attr0_off & 0x80000000u) ? cellGcmResolveLocated(0, d->attr0_off & 0x7FFFFFFFu) : cellGcmResolveLocated(1, d->attr0_off);
+              if (!g_spu_wring_req[1] && (g_spu_wring_req[0] = bea, g_spu_wring_req[1] = bea + 0x400)) fprintf(stderr, "[vpbbox] finestra wring impostata a %08X..%08X (draw#%u f#%lu)\n", bea, bea + 0x400, s_draw_count - 1, s_frame_no); }
+          { extern unsigned long long ps3_ms_now(void);
+          fprintf(stderr, "[vpbbox] draw#%u surf=%08X vp=%08X fp=%08X n=%u spazzatura=%u (vertici %u..%u) bbox=[%.2f..%.2f %.2f..%.2f %.2f..%.2f] va=%08X ea=%08X f#%lu t=%llu\n", s_draw_count - 1, d->surf, s_vps[d->vp].hash, d->fp_hash, wrote, nb, nb ? nb_first : 0, nb ? nb_last : 0, mn[0], mx[0], mn[1], mx[1], mn[2], mx[2], d->attr0_off,
+                  (d->attr0_off & 0x80000000u) ? cellGcmResolveLocated(0, d->attr0_off & 0x7FFFFFFFu) : cellGcmResolveLocated(1, d->attr0_off), s_frame_no, ps3_ms_now()); }
           /* RSX_VA_RECHECK: il blocco intero (float3 BE, passo dal formato) riletto al present */
           { static int s_rc = -1; if (s_rc < 0) s_rc = getenv("RSX_VA_RECHECK") ? 1 : 0;
             const rsx_vertex_attrib* va0 = &st->vertex_attribs[0];
@@ -939,6 +946,8 @@ static id<MTLSamplerState> sampler_for(u16 key)
     return ss;
 }
 
+u32 g_spu_wring_req[2];   /* SPU_WRING=dyn (s.40): finestra chiesta al wring del runtime SPU */
+static unsigned long s_garbage_draws;   /* draw con posizioni spazzatura (RSX_GARBAGE), per blocco di RSX_FRAMESTAT (s.40) */
 static void record_draw(const rsx_state* st, u32 prim, u32 base, u32 count,
                         IndexResolver resolve)
 {
@@ -999,11 +1008,46 @@ static void record_draw(const rsx_state* st, u32 prim, u32 base, u32 count,
               for (int k = 0; k < 3; k++) { if (!(f[k] == f[k]) || fabsf(f[k]) > 1e6f) ok = 0; else { if (f[k] < mn[k]) mn[k] = f[k]; if (f[k] > mx[k]) mx[k] = f[k]; } }
               if (!ok) nb++; }
           float ext = 0; for (int k = 0; k < 3; k++) if (mx[k] - mn[k] > ext) ext = mx[k] - mn[k];
-          if (nb || ext > 20000.f) { static int _n = 0; if (_n++ < 200)
+          static long s_gbf = -2; if (s_gbf == -2) { const char* e = getenv("RSX_GARBAGE_FROM"); s_gbf = e ? atol(e) : 0; }   /* righe solo dal fotogramma n (s.40) */
+          if (nb || ext > 20000.f) { s_garbage_draws++; static int _n = 0; if ((long)s_frame_no >= s_gbf && _n++ < 200)
               fprintf(stderr, "[garbage] f#%lu draw#%u n=%u spazzatura=%u bbox=%.0f va0=%08X ea=%08X stride=%u vp=%08X fp=%08X surf=%08X prim=%u\n",
                       s_frame_no, s_draw_count - 1, wrote, nb, ext, st->vertex_attribs[0].offset,
                       (st->vertex_attribs[0].offset & 0x80000000u) ? cellGcmResolveLocated(0, st->vertex_attribs[0].offset & 0x7FFFFFFFu) : cellGcmResolveLocated(1, st->vertex_attribs[0].offset),
                       st->vertex_attribs[0].stride, s_vps[d->vp].hash, d->fp_addr, d->surf, prim); } } }
+    /* RSX_GIANT=<k> (s.40): triangoli "giganti" in spazio oggetto -- lato
+     * massimo > k volte la mediana dei lati del draw (liste di triangoli con
+     * VP, posizione nell'attributo 0). Un vertice stantio (blocco dell'anello
+     * riscritto o non ancora scritto) da' un triangolo lungo quanto la scena
+     * con posizioni plausibili: RSX_GARBAGE non lo vede. Una riga per draw
+     * (tetto 400, da RSX_GIANT_FROM) con l'indice dei vertici colpevoli. */
+    { static long s_gi = -2; if (s_gi == -2) { const char* e = getenv("RSX_GIANT"); s_gi = e ? atol(e) : -1; }
+      static long s_gif = -2; if (s_gif == -2) { const char* e = getenv("RSX_GIANT_FROM"); s_gif = e ? atol(e) : 0; }
+      static double s_gim = -1; if (s_gim < 0) { const char* e = getenv("RSX_GIANT_MIN"); s_gim = e ? atof(e) : 30.0; }   /* e lato > questo, in unita' del gioco (le mesh del ponte hanno mediana 0,1-0,2 e lati fino a 7) */
+      if (s_gi > 0 && d->vp >= 0 && wrote >= 6 && d->topology == MTLPrimitiveTypeTriangle && (s_vps[d->vp].mask & 1u) && (long)s_frame_no >= s_gif) {
+          const float* bf = s_vpd + tmp.vbase / 4; const u32 na = tmp.vstride / 16; const u32 nt = wrote / 3;
+          static float edges[65536]; u32 ne = 0; float emax = 0; u32 tmax = 0;
+          for (u32 t = 0; t < nt && ne + 3 <= 65536; t++) {
+              const float* p0 = bf + (size_t)(t * 3 + 0) * na * 4; const float* p1 = p0 + na * 4; const float* p2 = p1 + na * 4;
+              float e01 = 0, e12 = 0, e20 = 0;
+              for (int k = 0; k < 3; k++) { float a = p1[k] - p0[k], b = p2[k] - p1[k], c = p0[k] - p2[k]; e01 += a * a; e12 += b * b; e20 += c * c; }
+              float m = e01 > e12 ? e01 : e12; if (e20 > m) m = e20;
+              edges[ne++] = e01; edges[ne++] = e12; edges[ne++] = e20;
+              if (m > emax) { emax = m; tmax = t; } }
+          if (ne >= 6) {
+              /* mediana per selezione parziale: ordina una copia */
+              static float tmpe[65536]; memcpy(tmpe, edges, ne * sizeof(float));
+              /* nth_element a mano: quickselect semplice */
+              u32 lo = 0, hi = ne - 1, k = ne / 2;
+              while (lo < hi) { float piv = tmpe[(lo + hi) / 2]; u32 i = lo, j = hi;
+                  while (i <= j) { while (tmpe[i] < piv) i++; while (tmpe[j] > piv) { if (j == 0) break; j--; }
+                      if (i <= j) { float x = tmpe[i]; tmpe[i] = tmpe[j]; tmpe[j] = x; i++; if (j == 0) break; j--; } }
+                  if (k <= j) hi = j; else if (k >= i) lo = i; else break; }
+              float med = tmpe[k];
+              if (med > 0 && emax > (float)(s_gi * s_gi) * med && emax > (float)(s_gim * s_gim)) { static int _n = 0; if (_n++ < 400) {
+                  const float* p0 = bf + (size_t)(tmax * 3) * na * 4;
+                  fprintf(stderr, "[giant] f#%lu draw#%u n=%u tri#%u lato=%.1f mediana=%.1f va0=%08X first=%u stride=%u vp=%08X fp=%08X surf=%08X v0=(%.1f %.1f %.1f) v1=(%.1f %.1f %.1f) v2=(%.1f %.1f %.1f)\n",
+                          s_frame_no, s_draw_count - 1, wrote, tmax, sqrtf(emax), sqrtf(med), st->vertex_attribs[0].offset, base, st->vertex_attribs[0].stride, s_vps[d->vp].hash, d->fp_hash, d->surf,
+                          p0[0], p0[1], p0[2], p0[na*4], p0[na*4+1], p0[na*4+2], p0[na*8], p0[na*8+1], p0[na*8+2]); } } } } }
     draw_shadow_setup(d, st);
     for (u32 t = 0; t < RSX_MAX_TEXTURES; t++) {
         d->tex[t] = (st->textures[t].control0 & 0x80000000u) ? tex_with_remap(s_tex[t].tex, st->textures[t].control1) : nil;
@@ -2261,6 +2305,7 @@ static u64 pso_key(const MtlDraw* d)
     return h;
 }
 
+static unsigned long s_skipped_pair;   /* draw saltati perche' la coppia (FP, VP) non e' ancora compilata (s.40), per RSX_FRAMESTAT */
 static id<MTLRenderPipelineState> pso_for(MtlDraw* d)
 {
     /* Un VP che non compila (ok=0) manda il draw sul percorso incorporato. */
@@ -2303,7 +2348,16 @@ static id<MTLRenderPipelineState> pso_for(MtlDraw* d)
     s_fp_shadow_cur = d->tex_zfunc; s_fp_cube_cur = d->cube_mask;
     id<MTLLibrary> glib = (d->fp_addr && !s_fb) ? guest_fp_library(d->fp_addr, vp, d->shader_ctrl, (d->n_mrt ? d->n_mrt : 1) | (d->shadow_key << 8), d->fp_hash) : nil;
     if (!glib && vp >= 0) {
-        /* il VP non compila: si riprova la coppia con il VS incorporato */
+        /* La coppia (FP, VP) non c'e' ancora: la compilazione e' asincrona e
+         * costa 1,6 s in media nel livello (s.40). Prima il draw ricadeva sul
+         * VS incorporato (MVP fissa da c0..3, e dalla s.38 i draw con VP non
+         * hanno nemmeno i MtlVertex): erano i "poligoni giganti" e il cielo
+         * sparito delle corse nell'incontro (ogni materiale nuovo = 1-2 s di
+         * spazzatura a schermo, 50 draw da 30-60 M frammenti in un fotogramma,
+         * RSX_BIGDRAW). Il draw si salta: l'oggetto compare quando la sua
+         * coppia e' pronta. RSX_VP_FALLBACK=1 rimette il vecchio percorso. */
+        static int s_fbk = -1; if (s_fbk < 0) { const char* e = getenv("RSX_VP_FALLBACK"); s_fbk = (e && *e && *e != '0') ? 1 : 0; }
+        if (!s_fbk) { s_skipped_pair++; return nil; }
         vp = -1; d->vp = -1;
         { id<MTLRenderPipelineState> hit = pso_find(key, -2); if (hit) return hit; }
         vd = [MTLVertexDescriptor vertexDescriptor];
@@ -2596,9 +2650,9 @@ static void rsx_metal_backend_present_impl(void)
           s_acc += s_draw_count; if (s_draw_count) s_nz++;
           if (s_fs > 0 && (s_frame_no % (unsigned long)s_fs) == 0) {
               extern unsigned long long ps3_ms_now(void);
-              fprintf(stderr, "[RSX metal] fotogramma #%lu: negli ultimi %d presentati %lu draw in %lu fotogrammi non vuoti, t=%llums decodifiche=%lu (%lu Mpx) bc=%lu cache=%u texMB=%lu fp=%u vp=%u fpc=%uKB\n",
-                      s_frame_no, s_fs, s_acc, s_nz, ps3_ms_now(), s_tex_decodes, s_tex_decode_px >> 20, s_tex_bc_native, s_texcache_n, s_tex_bytes >> 20, s_fp_count, s_vp_count, s_fpc_used >> 10);
-              s_tex_decodes = 0; s_tex_decode_px = 0; s_acc = 0; s_nz = 0; } }
+              fprintf(stderr, "[RSX metal] fotogramma #%lu: negli ultimi %d presentati %lu draw in %lu fotogrammi non vuoti, t=%llums decodifiche=%lu (%lu Mpx) bc=%lu cache=%u texMB=%lu fp=%u vp=%u fpc=%uKB garb=%lu saltati=%lu\n",
+                      s_frame_no, s_fs, s_acc, s_nz, ps3_ms_now(), s_tex_decodes, s_tex_decode_px >> 20, s_tex_bc_native, s_texcache_n, s_tex_bytes >> 20, s_fp_count, s_vp_count, s_fpc_used >> 10, s_garbage_draws, s_skipped_pair);
+              s_tex_decodes = 0; s_tex_decode_px = 0; s_acc = 0; s_nz = 0; s_garbage_draws = 0; s_skipped_pair = 0; } }
         /* RSX_DRAWLIST=<n>: l'elenco dei draw del fotogramma n (o di ogni
          * fotogramma con piu' di 5 draw quando n = 0 e' il primo tale):
          * superficie, programmi, texture, ritaglio, blend. La radiografia di
@@ -3208,8 +3262,27 @@ static void rsx_metal_backend_present_impl(void)
             MtlReport* reps = (MtlReport*)malloc(sizeof(MtlReport) * nrep);
             memcpy(reps, s_reports, sizeof(MtlReport) * nrep);
             id<MTLBuffer> visb = vis;
+            /* RSX_BIGDRAW=<n>: a GPU finita, i draw sul display con piu' di n
+             * frammenti passati (contatori di visibilita'): i "poligoni
+             * giganti" (s.40) si prendono cosi', con FP/VP/attributo 0 del
+             * draw, senza sapere in anticipo quale fotogramma guardare. */
+            static long s_big = -2; if (s_big == -2) { const char* e = getenv("RSX_BIGDRAW"); s_big = e ? atol(e) : -1; }
+            static long s_bigf = -2; if (s_bigf == -2) { const char* e = getenv("RSX_BIGDRAW_FROM"); s_bigf = e ? atol(e) : 0; }   /* dal fotogramma n */
+            static long s_bigs = -2; if (s_bigs == -2) { const char* e = getenv("RSX_BIGDRAW_SURF"); s_bigs = e ? (long)strtoul(e, 0, 16) : -1; }   /* solo i draw su quella superficie (es. 7D0000: via le shadow map) */
+            typedef struct { u32 fp, vp, va0, first, n, surf, prim; } BigMeta;
+            BigMeta* meta = NULL; u32 nmeta = 0; unsigned long fno = s_frame_no;
+            if (s_big >= 0 && (long)s_frame_no >= s_bigf) { nmeta = s_draw_count; meta = (BigMeta*)malloc(sizeof(BigMeta) * (nmeta ? nmeta : 1));
+                for (u32 q = 0; q < nmeta; q++) { const MtlDraw* d = &s_draws[q];
+                    meta[q].fp = d->fp_hash; meta[q].vp = d->vp >= 0 ? s_vps[d->vp].hash : 0; meta[q].va0 = d->attr0_off; meta[q].first = d->first;
+                    meta[q].n = d->count; meta[q].surf = d->surf; meta[q].prim = (u32)d->topology | (cellGcmOffsetIsDisplay(d->surf) ? 0x100u : 0u); } }
             [cb addCompletedHandler:^(id<MTLCommandBuffer> _u) {
                 if (_u.error) { static int _e = 0; if (_e++ < 8) fprintf(stderr, "[RSX metal] command buffer FALLITO: %s\n", [[_u.error localizedDescription] UTF8String]); }
+                if (meta) { const uint64_t* cnt = (const uint64_t*)[visb contents]; static unsigned long _n = 0;
+                    for (u32 q = 0; q < nmeta && q < MTL_MAX_DRAWS; q++)
+                        if ((long)cnt[q] > s_big && meta[q].n > 6 && (s_bigs < 0 || (long)meta[q].surf == s_bigs) && _n++ < 6000)   /* > 6 vertici: via i quad a tutto schermo del post-processing */
+                            fprintf(stderr, "[bigdraw] f#%lu draw#%u frammenti=%llu n=%u fp=%08X vp=%08X va0=%08X first=%u surf=%08X%s topo=%u\n",
+                                    fno, q, (unsigned long long)cnt[q], meta[q].n, meta[q].fp, meta[q].vp, meta[q].va0, meta[q].first, meta[q].surf, (meta[q].prim & 0x100u) ? "*" : "", meta[q].prim & 0xFFu);
+                    free(meta); }
                 reports_publish(visb, reps, nrep);
                 if (atomic_fetch_sub(&s_gpu_pending, 1) == 1) { extern void cellGcm_gpu_idle(void); cellGcm_gpu_idle(); }   /* flip dovuto (s.39) */
             }];

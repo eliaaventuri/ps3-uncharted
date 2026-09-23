@@ -11,7 +11,7 @@ while [ $at -le $secs ]; do
   if [ $vm_done = 0 ] && [ $tvm -le $at ]; then sleep $((tvm-t)); t=$tvm; vm_done=1
      pid=$(pgrep -f "uncharted-data/uncharted" | head -1)
      { echo "[vmmap] t=$t s pid=$pid"; vmmap --summary "$pid" 2>/dev/null | grep -E "IOAccelerator|TOTAL|Physical footprint"; } >> "$log.vmmap"; fi
-  sleep $((at-t)); t=$at; id=$(/tmp/winid uncharted 2>/dev/null | head -1); [ -n "$id" ] && screencapture -x -l "$id" "${pre}_${at}.png"; echo "[shot] $at s" >> "$log"; at=$((at+step)); done
+  sleep $((at-t)); t=$at; id=$(/tmp/winid uncharted 2>/dev/null | head -1); [ -n "$id" ] && screencapture -x -l "$id" "${pre}_${at}.png"; echo "[shot] $at s mono_ms=$(python3 -c "import time; print(int(time.clock_gettime(time.CLOCK_MONOTONIC)*1000))")" >> "$log.shots"; at=$((at+step)); done
 sleep $((secs-t))
 pkill -9 -f "uncharted-data/uncharted" 2>/dev/null; sleep 1
 echo "fatto: $log ($(wc -l < "$log") righe)"

@@ -197,17 +197,25 @@ typedef struct { uint32_t ea, size, pc, lr; int img, ovl; char kind[12]; uint8_t
 static spu_wring_ent s_wring[SPU_WRING_N];
 static unsigned s_wring_n;
 static uint32_t s_wring_lo, s_wring_hi;
+static int s_wring_on_v = -1;
+/* s.40: richiesta di finestra dal backend RSX (SPU_WRING=dyn), definita nel
+ * backend (rsx_metal_backend.m): qui solo letta */
+extern uint32_t g_spu_wring_req[2] __attribute__((weak));
 static inline int spu_wring_on(void)
 {
-    static int s_on = -1;
-    if (s_on < 0) { const char* e = getenv("SPU_WRING"); s_on = 0;
-        if (e && *e) { char* c = NULL; s_wring_lo = (uint32_t)strtoul(e, &c, 16);
-            s_wring_hi = s_wring_lo + (uint32_t)((c && *c == ':') ? strtoul(c + 1, 0, 16) : 0x80); s_on = 1; } }
-    return s_on;
+    if (s_wring_on_v < 0) { const char* e = getenv("SPU_WRING"); s_wring_on_v = 0;
+        /* SPU_WRING=dyn (s.40): finestra vuota finche' qualcuno (il backend
+         * RSX, al primo blocco di vertici spazzatura) chiama spu_wring_set_window */
+        if (e && !strcmp(e, "dyn")) { s_wring_lo = s_wring_hi = 0; s_wring_on_v = 1; }
+        else if (e && *e) { char* c = NULL; s_wring_lo = (uint32_t)strtoul(e, &c, 16);
+            s_wring_hi = s_wring_lo + (uint32_t)((c && *c == ':') ? strtoul(c + 1, 0, 16) : 0x80); s_wring_on_v = 1; } }
+    return s_wring_on_v;
 }
 static inline void spu_wring_note(spu_context* spu, const char* kind, uint32_t ea, uint32_t size, const uint8_t* data)
 {
-    if (!spu_wring_on() || ea >= s_wring_hi || ea + size <= s_wring_lo) return;
+    if (!spu_wring_on()) return;
+    if (!s_wring_hi && &g_spu_wring_req[0] && g_spu_wring_req[1]) { s_wring_lo = g_spu_wring_req[0]; s_wring_hi = g_spu_wring_req[1]; }
+    if (ea >= s_wring_hi || ea + size <= s_wring_lo) return;
     extern unsigned long long ps3_ms_now(void);
     spu_wring_ent* w = &s_wring[s_wring_n++ % SPU_WRING_N];
     w->ea = ea; w->size = size; w->pc = (uint32_t)spu->pc & SPU_LS_MASK; w->lr = spu->gpr[0]._u32[0] & SPU_LS_MASK;

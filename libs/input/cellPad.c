@@ -575,9 +575,13 @@ skip_inject: ;
       int stick_ok = 1;
       { static double s_from = -1.0; static unsigned long long s_t0s = 0;
         if (s_from < 0) { const char* e = getenv("PAD_STICK_FROM"); s_from = e ? atof(e) : 0.0; }
-        if (s_from > 0) { extern unsigned long long ps3_ms_now(void);
+        /* PAD_STICK_UNTIL=<sec>: e fino a quel secondo (s.40: 20 s di stick avanti
+         * portano Drake nell'incontro, poi lo si lascia fermo) */
+        static double s_until = -1.0; if (s_until < 0) { const char* e = getenv("PAD_STICK_UNTIL"); s_until = e ? atof(e) : 0.0; }
+        if (s_from > 0 || s_until > 0) { extern unsigned long long ps3_ms_now(void);
             unsigned long long now = ps3_ms_now(); if (!s_t0s) s_t0s = now;
-            if ((double)(now - s_t0s) / 1000.0 < s_from) stick_ok = 0; } }
+            double el = (double)(now - s_t0s) / 1000.0;
+            if (el < s_from || (s_until > 0 && el >= s_until)) stick_ok = 0; } }
       if (s_st && stick_ok) { hs->analog_lx = s_v[0]; hs->analog_ly = s_v[1];
                   hs->analog_rx = s_v[2]; hs->analog_ry = s_v[3];
                   hs->connected = 1; }

@@ -261,6 +261,11 @@ typedef struct rsx_state {
 
     /* Vertex attributes */
     rsx_vertex_attrib vertex_attribs[RSX_MAX_VERTEX_ATTRIBS];
+    /* NV4097_SET_VERTEX_DATA_BASE_OFFSET (0x1738) / _BASE_INDEX (0x173C), s.40.
+     * La RSX somma la base all'offset di ogni array e maschera a 28 bit prima
+     * di tradurre l'indirizzo (RPCS3 get_vertex_offset_from_base): Uncharted
+     * scrive offset come 0x6A5FFFFF, sensati solo con la base. */
+    u32 vertex_data_base_offset, vertex_data_base_index;
     /* Constant ("current") vertex attributes -- NV4097_SET_VERTEX_DATA4F_M and
      * friends. When an attribute array is DISABLED, the hardware feeds every
      * vertex this register rather than zero, exactly like glColor4f with the
