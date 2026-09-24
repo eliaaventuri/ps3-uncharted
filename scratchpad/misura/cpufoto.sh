@@ -31,14 +31,17 @@ sleep $((secs - t0))
 c1=$(cpu); t1s=$(thr); f1=$(frame); w1=$(python3 -c 'import time; print(time.time())')
 pkill -9 -f "uncharted-data/uncharted"; sleep 1
 
-python3 - "$c0" "$c1" "${f0:-0}" "${f1:-0}" "$w0" "$w1" "$log" "$t0s" "$t1s" <<'EOF'
+D="$D" python3 - "$c0" "$c1" "${f0:-0}" "${f1:-0}" "$w0" "$w1" "$log" "$t0s" "$t1s" <<'EOF'
 import sys
 c0,c1,f0,f1,w0,w1=map(float,sys.argv[1:7]); log=sys.argv[7]
 ta=[float(x) for x in sys.argv[8].split()]; tb=[float(x) for x in sys.argv[9].split()]
 fr=f1-f0; wall=w1-w0; cpu=c1-c0
 if fr <= 0: print(f"{log}: nessun fotogramma nella finestra (#{int(f0)} -> #{int(f1)})"); sys.exit()
+# s.45: draw medi per fotogramma nella finestra -- la CPU segue il contenuto
+# (~6 ms ogni 100 draw), confrontare le corse a parita' di draw.
+import re; dr=[int(m.group(2)) for m in re.finditer(rb"fotogramma #(\d+): negli ultimi 1 presentati (\d+) draw", open(__import__('os').environ['D']+'/'+log,'rb').read()) if f0 <= int(m.group(1)) <= f1]
 print(f"{log}: {cpu*1000/fr:.0f} ms CPU/fotogramma, {cpu/wall:.2f} core medi, "
-      f"{fr/wall:.1f} fps, fotogrammi #{int(f0)}-#{int(f1)}")
+      f"{fr/wall:.1f} fps, fotogrammi #{int(f0)}-#{int(f1)}, {sum(dr)//max(len(dr),1)} draw medi")
 # per thread (ms CPU/fotogramma, i 9 piu' pesanti): lane SPU, PPU, ticker...
 if ta and tb:  # un thread nato o finito nella finestra: zip tronca, gli indici bassi restano allineati
     d = sorted(((i, (b - a) * 1000 / fr) for i, (a, b) in enumerate(zip(ta, tb))), key=lambda x: -x[1])[:9]

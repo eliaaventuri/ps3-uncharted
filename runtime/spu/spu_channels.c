@@ -61,7 +61,19 @@ static uint64_t spu_host_ns(void)
      * (sessione 28: `sample` lo dava come prima voce di CPU delle lane). */
     static mach_timebase_info_data_t tb;
     if (!tb.denom) mach_timebase_info(&tb);
+#if defined(__aarch64__)
+    /* s.45: CNTVCT_EL0 letto direttamente, senza l'`isb` che
+     * mach_absolute_time mette davanti (stessa unita' di tick): era il 3% dei
+     * campioni delle lane. Qui contano solo le differenze fra letture dello
+     * stesso contatore. SPU_HOST_NS_MACH=1 ridà mach_absolute_time (A/B). */
+    static int s_mach = -1;
+    if (s_mach < 0) { const char* e = getenv("SPU_HOST_NS_MACH"); s_mach = (e && *e && *e != '0') ? 1 : 0; }
+    uint64_t t;
+    if (s_mach) t = mach_absolute_time();
+    else __asm__ __volatile__("mrs %0, cntvct_el0" : "=r"(t));
+#else
     uint64_t t = mach_absolute_time();
+#endif
     return (tb.numer == tb.denom) ? t : t * tb.numer / tb.denom;
 #else
     struct timespec ts;
@@ -348,9 +360,55 @@ __attribute__((noinline)) static void resv_lock_spin(void)
         }
     } while (atomic_exchange_explicit(&g_resv_lock, 1, memory_order_acquire));
 }
-static void resv_lock(void)   { if (atomic_exchange_explicit(&g_resv_lock, 1, memory_order_acquire)) resv_lock_spin(); }
-static void resv_unlock(void) { atomic_store_explicit(&g_resv_lock, 0, memory_order_release); }
+/* s.45: contatore di sequenza (seqlock) sopra il lock: dispari mentre qualcuno
+ * lo tiene e scrive. GETLLAR legge la riga senza prendere il lock e riprova se
+ * la sequenza e' cambiata nel frattempo: il job 0089df80 (allocatore ad anello
+ * GETLLAR/PUTLLC su una riga sola, sei lane) dava da solo il 60% di
+ * resv_lock_spin, e meta' delle prese erano letture. */
+static _Atomic unsigned g_resv_seq = 0;
+static void resv_lock(void)
+{
+    if (atomic_exchange_explicit(&g_resv_lock, 1, memory_order_acquire)) resv_lock_spin();
+    atomic_store_explicit(&g_resv_seq, atomic_load_explicit(&g_resv_seq, memory_order_relaxed) + 1, memory_order_relaxed);
+    atomic_thread_fence(memory_order_release);
+}
+static void resv_unlock(void)
+{
+    atomic_store_explicit(&g_resv_seq, atomic_load_explicit(&g_resv_seq, memory_order_relaxed) + 1, memory_order_release);
+    atomic_store_explicit(&g_resv_lock, 0, memory_order_release);
+}
 #endif
+
+/* Copia atomica di una riga da 128 byte rispetto a chi scrive sotto il lock.
+ * SPU_ATOMIC_LOCKALL=1 torna al lock anche per le letture (A/B). */
+static int spu_atomic_lockall(void)
+{
+    static int s = -1;
+    if (s < 0) { const char* e = getenv("SPU_ATOMIC_LOCKALL"); s = (e && *e && *e != '0') ? 1 : 0; }
+    return s;
+}
+static void resv_read_line(uint8_t* dst, const uint8_t* src)
+{
+#if !defined(_MSC_VER)
+    if (!spu_atomic_lockall()) {
+        for (;;) {
+            unsigned s1 = atomic_load_explicit(&g_resv_seq, memory_order_acquire);
+            if (s1 & 1) {
+#if defined(__aarch64__)
+                __asm__ __volatile__("yield");
+#endif
+                continue;
+            }
+            memcpy(dst, src, MFC_ATOMIC_LINE);
+            atomic_thread_fence(memory_order_acquire);
+            if (atomic_load_explicit(&g_resv_seq, memory_order_relaxed) == s1) return;
+        }
+    }
+#endif
+    resv_lock();
+    memcpy(dst, src, MFC_ATOMIC_LINE);
+    resv_unlock();
+}
 
 /* The PPU-side HLE of a lock-free queue does its read-modify-write on the SAME
  * 128-byte guest line the SPU reaches with GETLLAR/PUTLLC. Holding this lock for
@@ -529,8 +587,7 @@ static int spu_mfc_atomic(spu_context* ctx, uint32_t cmd)
          * peer that must WRITE the line waits for it (canersaka ticks the
          * GETLLAR fast+slow paths for exactly this reason). */
         yz_lockstep_tick(ctx);
-        resv_lock();
-        memcpy(ls, mem, MFC_ATOMIC_LINE);              /* line -> local store */
+        resv_read_line(ls, mem);                       /* line -> local store */
         /* Snapshot from `ls`, NOT a second read of `mem`. Hardware GETLLAR is a
          * single atomic 128-byte read, so the reserved data and the reservation
          * come from the same instant. Reading guest memory twice lets a PPU store
@@ -543,7 +600,6 @@ static int spu_mfc_atomic(spu_context* ctx, uint32_t cmd)
          * stale, which is exactly what makes the lost-reservation event fire. */
         memcpy(ctx->resv_line, ls, MFC_ATOMIC_LINE);   /* snapshot for compare */
         ctx->resv_ea = ea; ctx->resv_valid = 1; ctx->atomic_stat = 0;
-        resv_unlock();
         spu_adma_note(ctx, cmd, (uint32_t)(ls - ctx->ls), (uint32_t)ea, MFC_ATOMIC_LINE);
         return 1;
 
@@ -552,6 +608,14 @@ static int spu_mfc_atomic(spu_context* ctx, uint32_t cmd)
         { extern uint32_t g_barrier_sync_watch;
           uint32_t b = g_barrier_sync_watch;
           if (b && (ea & ~127u) == (b & ~127u)) g_spu_putllc_sync_hit++; }
+        /* s.45: se la riga e' gia' cambiata dal GETLLAR la prenotazione e' persa
+         * comunque (sul ferro come qui): si fallisce senza prendere il lock. */
+        if (!spu_atomic_lockall() &&
+            (!ctx->resv_valid || ctx->resv_ea != ea ||
+             memcmp(mem, ctx->resv_line, MFC_ATOMIC_LINE) != 0)) {
+            ctx->atomic_stat = 1; ctx->resv_valid = 0;
+            return 1;
+        }
         resv_lock();
         if (ctx->resv_valid && ctx->resv_ea == ea &&
             memcmp(mem, ctx->resv_line, MFC_ATOMIC_LINE) == 0) {
@@ -569,8 +633,11 @@ static int spu_mfc_atomic(spu_context* ctx, uint32_t cmd)
             static int s_full = -1;
             if (s_full < 0) { const char* e = getenv("SPU_PUTLLC_FULL"); s_full = (e && *e && *e != '0') ? 1 : 0; }
             if (s_full) memcpy(mem, ls, MFC_ATOMIC_LINE);   /* commit local store */
-            else for (int i = 0; i < MFC_ATOMIC_LINE; i++)
-                if (ls[i] != ctx->resv_line[i]) mem[i] = ls[i];
+            else for (int w = 0; w < MFC_ATOMIC_LINE; w += 8) {   /* s.45: 8 byte per volta, meno tempo sotto il lock */
+                uint64_t a, b; memcpy(&a, ls + w, 8); memcpy(&b, ctx->resv_line + w, 8);
+                if (a != b) for (int i = w; i < w + 8; i++)
+                    if (ls[i] != ctx->resv_line[i]) mem[i] = ls[i];
+            }
             spu_wring_note(ctx, "PUTLLC", (uint32_t)ea, MFC_ATOMIC_LINE, ls);
             ctx->atomic_stat = 0;                      /* PUTLLC_SUCCESS */
         } else {
@@ -833,7 +900,10 @@ u128 spu_rdch(spu_context* ctx, uint32_t channel)
      * Wraparound on subtract is deliberate -- it is what hardware does, and the
      * `cgti > 0` test above is written to tolerate it. */
     case SPU_RdDec: {
-        atomic_fetch_add(&g_spu_rddec_count, 1);   /* diagnostica: [label-wait] */
+        /* s.45: solo con la diagnostica accesa -- sei lane che incrementano la
+         * stessa riga a ogni lettura del decrementer se la rubano a vicenda. */
+        { static int s_rc = -1; if (s_rc < 0) s_rc = getenv("SPU_LABEL_POLL") ? 1 : 0;
+          if (s_rc) atomic_fetch_add(&g_spu_rddec_count, 1); }   /* diagnostica: [label-wait] */
         { static int s_bm = -1; if (s_bm < 0) { s_bm = getenv("SPU_DEC_BENCH") ? 1 : 0;
               if (s_bm) { uint64_t t0 = spu_host_ns(), acc = 0; for (int i = 0; i < 200000; i++) acc += spu_host_ns();
                           uint64_t t1 = spu_host_ns(); fprintf(stderr, "[dec-bench] spu_host_ns: %.1f ns/chiamata (thread della lane, acc=%llu)\n", (t1 - t0) / 200000.0, (unsigned long long)(acc & 1)); } } }

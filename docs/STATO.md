@@ -863,6 +863,42 @@ corse da 160 s, 10/10 OK, 0 assert del PM, fotogrammi a 160 s 6.087-6.399
 PM ora resta sporca fra una corsa e l'altra, come sul ferro: se riappare uno
 stallo del PM, provare prima `SPURS_PM_FRESH_LS=40000`.
 
+**Atomici SPU senza lock in lettura + decrementer senza `isb`** (sessione 45,
+24/09 notte). Profilo per thread (`prof2.sh`, 10 s a 100 s, `callers.py` in
+scratchpad di sessione) prima: `resv_lock_spin` 1.211 campioni su ~25.000
+attivi (4,8%), di cui 715 dal job 0089df80 `func_000075F0` (allocatore ad
+anello: GETLLAR / calcolo / PUTLLC / riprova, sei lane sulla STESSA riga) e
+294 da 008ff700 `func_00004038`; `mach_absolute_time` 747 (3%) quasi tutto da
+`spu_host_ns` <- `SPU_RdDec` (job 008dc900 e policy module). Modifiche, tutte
+in `runtime/spu/spu_channels.c`:
+1. seqlock sopra `g_resv_lock` (`g_resv_seq`, dispari mentre qualcuno scrive
+   sotto il lock): GETLLAR copia la riga senza lock e riprova se la sequenza
+   cambia (`resv_read_line`); PUTLLC fallisce SENZA lock se la riga e' gia'
+   diversa dall'istantanea (prenotazione persa comunque); commit del PUTLLC
+   confrontato a 8 byte per volta (meno tempo sotto il lock);
+2. `spu_host_ns` su macOS/arm64 legge `cntvct_el0` direttamente (stessa unita'
+   di mach_absolute_time, senza `isb`);
+3. `atomic_fetch_add(&g_spu_rddec_count)` a ogni `rdch Dec` solo con
+   `SPU_LABEL_POLL` (era una riga condivisa da sei lane).
+A/B con lo stesso binario: `SPU_ATOMIC_LOCKALL=1 SPU_HOST_NS_MACH=1` = prima
+(il punto 3 non ha interruttore). Profilo dopo: `resv_lock_spin` 1.211 -> 638,
+`mach_absolute_time` 747 -> 176 (resta `spurs_lane_sched_thread`),
+`spu_rdch` 390 -> 172.
+**cpufoto, 10+10 corse alternate**: la CPU per fotogramma segue il CONTENUTO
+(~6 ms ogni 100 draw medi; corse con Drake altrove danno 850 draw e 120 ms):
+confrontate con una retta comune CPU~draw, **-9,9 +- 5,3 ms/fotogramma (~5%)
+a parita' di draw** (a 2.000 draw: 197 -> 187). `cpufoto.sh` ora stampa anche
+i draw medi della finestra: confrontare solo a draw simili.
+Stabilita': lotto alternato 6+6 da 160 s tutto OK; nelle 20 cpufoto un fermo
+per parte (c45on_3 e c45off_6, tipo B senza assert: gia' noti, ~1 su 10). In
+una corsa (c45ab_3_v1, con le modifiche) il gioco e' rimasto nel menu dopo
+l'assert `joblist.cpp(524): IsListFinished()` -- NON nuova: compare nel 22%
+delle corse s.43-44 (60 log), 6 volte con la corsa ferma nel menu.
+Prossimi bersagli: la contesa vera sulla riga dell'allocatore di 0089df80
+(638 campioni restano, sono PUTLLC in conflitto), `spurs_lane_sched_thread`
+che legge l'orologio (143 campioni), `mfc_for` che prende il lock per il PM
+a ogni esecuzione (contesto rinfrescato: mfc_cache azzerato).
+
 ## Storico
 
 Sessioni fino alla 37 e la vecchia "Dove siamo", verbatim, in
