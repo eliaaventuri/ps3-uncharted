@@ -140,13 +140,6 @@ static inline int spu_backedge_pending(const spu_context* ctx)
 #define SPU_BACKEDGE(ctx, tgt, fn, lbl) do { \
         if (__builtin_expect(spu_backedge_pending(ctx), 0)) { (ctx)->pc = (tgt); g_spu_trampoline_fn = fn; return; } \
         goto lbl; } while (0)
-/* --reg-cache (s.36): i registri della funzione sono variabili locali (r3,
- * r4, ...) e vengono scritti in ctx->gpr (RC_FLUSH) prima di ogni uscita,
- * chiamata o operazione di canale, e riletti (RC_LOAD) dopo. RC_FLUSH/RC_LOAD
- * sono macro definite davanti a ciascuna funzione generata. */
-#define SPU_BACKEDGE_RC(ctx, tgt, fn, lbl) do { \
-        if (__builtin_expect(spu_backedge_pending(ctx), 0)) { RC_FLUSH(); (ctx)->pc = (tgt); g_spu_trampoline_fn = fn; return; } \
-        goto lbl; } while (0)
 
 /* Execution trace (only emitted when the lifter was invoked with --trace). */
 void spu_trace_init(const char* path);
@@ -233,7 +226,7 @@ class LiftedFunction:
     cur_addr: int = 0     # istruzione in traduzione (--merge-blocks: archi all'indietro)
     labels: list = field(default_factory=list)   # --merge-blocks: ingressi interni registrati
     rc_regs: list = field(default_factory=list)  # --reg-cache: registri in variabili locali
-    rc_written: list = field(default_factory=list)  # --reg-cache: quelli scritti (da flushare)
+    rc_lines: list = field(default_factory=list)  # --reg-cache: (indice riga, istruzione)
 
 
 # Mnemonics whose last operand is a branch target address (0x...).
@@ -490,9 +483,7 @@ class SPULifter:
     # --reg-cache: prefissi/suffissi dei punti di sincronizzazione (vuoti se spento)
     reg_cache = False
     reg_cache_min = 24
-    _rcf = ""            # "RC_FLUSH(); " prima di chiamate/uscite
     _rcl = ""            # " RC_LOAD();" dopo le chiamate
-    _rcbe = "SPU_BACKEDGE"
 
     def __init__(self, trace: bool = False, prefix: str = ""):
         self.functions: list[LiftedFunction] = []
@@ -529,6 +520,7 @@ class SPULifter:
         self.merge_blocks: bool = False
         self.labels_by_func: dict = {}    # start -> set(addr)
         self.label_owner: dict = {}       # addr -> start della funzione che la contiene
+        self.rc_stats = [0, 0]            # --reg-cache: scritture in ctx->gpr, riletture (statiche)
 
     def _owner(self, tgt: int) -> int:
         """La funzione liftata da chiamare per arrivare a tgt (tgt stessa se e' un inizio)."""
@@ -571,6 +563,7 @@ class SPULifter:
             if c:
                 if self.trace:
                     func.body_lines.append(f"    spu_trace_pc(ctx, 0x{insn.addr:X});")
+                func.rc_lines.append((len(func.body_lines), insn))
                 func.body_lines.append(f"    {c}")
                 if self.trace and insn.mnemonic not in _NO_RT_WRITE:
                     rt_idx = insn.raw & 0x7F
@@ -595,7 +588,7 @@ class SPULifter:
                 # Tail call diretta (musttail: nessuna crescita dello stack);
                 # interrupt, lockstep e diagnostiche restano sui salti veri.
                 func.body_lines.append(
-                    f"    {{ ctx->pc = 0x{end:X}; {self._rcf}"
+                    f"    {{ ctx->pc = 0x{end:X}; "
                     f"SPU_TAILCALL({self.prefix}spu_func_{end:08X}(ctx)); }}")
             else:
                 func.body_lines.append(
@@ -619,45 +612,172 @@ class SPULifter:
                     "    /* infinite no-op self-loop (SPU halt idiom) -> abort */",
                     "    spu_halt(ctx); return;",
                 ]
+                func.rc_lines = []
 
         if self.reg_cache and len(body_insns) >= self.reg_cache_min:
             self._apply_reg_cache(func)
         self.functions.append(func)
         return func
 
-    # --reg-cache (s.36). Il corpo liftato tiene ogni registro in
-    # ctx->gpr[n]: le scritture nella LS passano da puntatori a byte, quindi
-    # per il compilatore possono toccare qualunque cosa e ogni valore va
-    # riletto dalla memoria dopo ogni store (misurato sul job di geometria di
-    # Uncharted: 26% di load/store). Qui i registri usati dalla funzione
-    # diventano variabili locali (u128 rN), caricate all'ingresso e scritte in
-    # ctx->gpr (solo quelle assegnate) prima di ogni uscita, chiamata,
-    # operazione di canale o stop; dopo le chiamate e i canali si ricaricano
-    # tutte (il runtime legge e scrive i gpr: ring guard, intercetti, irq).
-    _RC_SYNC_CALLS = ("spu_stop(", "spu_stop_at(", "spu_halt(", "spu_unsupported(")
+    # --reg-cache. Il corpo liftato tiene ogni registro in ctx->gpr[n]: le
+    # scritture nella LS passano da puntatori a byte, quindi per il compilatore
+    # possono toccare qualunque cosa e ogni valore va riletto dalla memoria
+    # dopo ogni store (misurato sul job di geometria di Uncharted: 26% di
+    # load/store). Qui i registri usati dalla funzione diventano variabili
+    # locali (u128 rN) e ctx->gpr resta la verita' ai punti di
+    # sincronizzazione: uscite (return, trampolino, SPU_RETR, stop/halt, arco
+    # all'indietro) e chiamate/canali (il runtime legge e scrive i gpr: ring
+    # guard, intercetti, irq).
+    #   - Scrittura: un valore che puo' arrivare a un punto di sincronizzazione
+    #     prima di essere riscritto va in ctx->gpr SUBITO, accanto alla sua
+    #     definizione (write-through); uno che viene sempre riscritto prima
+    #     resta solo locale. Cosi' non serve nessun flush e nessun registro
+    #     resta vivo fino all'uscita solo per essere scaricato.
+    #   - Lettura: all'ingresso (anche dalle etichette dello switch) e dopo
+    #     chiamate e canali si ricaricano solo i registri VIVI.
+    # Due analisi sulle istruzioni della funzione: "arriva a una
+    # sincronizzazione" e "vivo", tutte e due all'indietro.
+    # Fallimenti misurati: s.36, flush e reload di TUTTI i registri a ogni
+    # punto, 6,9 fps contro 8,0; s.44, flush dei soli sporchi alle uscite
+    # (write-back): i registri sporchi restano vivi fino all'uscita e il
+    # codice raddoppia (2,29 -> 4,96 M istruzioni host), piu' lento del
+    # riferimento nel banco differenziale.
+    _RC_GPR = re.compile(r"ctx->gpr\[(\d+)\](\s*=(?!=))?")
+    _RC_SYNC = re.compile(r"return;|SPU_RETR\(|SPU_TAILCALL\(|SPU_BACKEDGE\(|"
+                          r"spu_stop\(ctx|spu_stop_at\(ctx|spu_halt\(ctx|RC_LOAD\(\)")
+
+    @staticmethod
+    def _rc_load(mask: int) -> str:
+        if not mask:
+            return "((void)0)"
+        return "do { " + " ".join(f"r{r} = ctx->gpr[{r}];"
+                                  for r in range(128) if mask >> r & 1) + " } while (0)"
 
     def _apply_reg_cache(self, func: LiftedFunction) -> None:
-        text = "\n".join(func.body_lines)
-        regs = sorted({int(m) for m in re.findall(r"ctx->gpr\[(\d+)\]", text)})
+        lines = func.body_lines
+        items = func.rc_lines
+        if not items:
+            return
+        regs = sorted({int(m) for m in re.findall(r"ctx->gpr\[(\d+)\]", "\n".join(lines))})
         if not regs:
             return
-        written = sorted({int(m) for m in
-                          re.findall(r"ctx->gpr\[(\d+)\]\s*=(?!=)", text)})
-        out = []
-        for ln in func.body_lines:
+        ALL = (1 << 128) - 1
+        n = len(items)
+        # 1. riassunto di ogni istruzione
+        use = [0] * n; dpre = [0] * n; dpost = [0] * n; upost = [0] * n
+        dsync = [0] * n     # scritte prima dell'ultimo punto di sincronizzazione della riga
+        dfirst = [0] * n    # scritte prima del primo
+        is_call = [False] * n; has_sync = [False] * n; succ = [None] * n
+        defs_at = [None] * n  # (fine dell'istruzione C, registro, dopo l'ultima sincronizzazione)
+        addr_k = {insn.addr: k for k, (_, insn) in enumerate(items)}
+        addrs = sorted(addr_k)
+        def k_of(a):
+            if a in addr_k:
+                return addr_k[a]
+            for b in addrs:        # etichetta senza riga propria: la successiva
+                if b >= a:
+                    return addr_k[b]
+            return n
+        for k, (li, insn) in enumerate(items):
+            ln = lines[li]
+            ev = []
+            for m in self._RC_GPR.finditer(ln):
+                r = int(m.group(1))
+                if m.group(2):      # scrittura: avviene alla fine dell'istruzione C
+                    e = ln.find(";", m.end())
+                    ev.append((e if e >= 0 else len(ln), 1, r))
+                else:
+                    ev.append((m.start(), 0, r))
+            lpos = ln.find("RC_LOAD()")
+            spos = [m.start() for m in self._RC_SYNC.finditer(ln)]
+            is_call[k] = lpos >= 0
+            has_sync[k] = bool(spos)
+            first_s = min(spos) if spos else len(ln) + 1
+            last_s = max(spos) if spos else -1
+            defs_at[k] = []
+            for pos, kind, r in sorted(ev):
+                b = 1 << r
+                if is_call[k] and pos > lpos:
+                    if kind:
+                        dpost[k] |= b
+                        defs_at[k].append((pos, r, True))
+                    elif not dpost[k] & b:
+                        upost[k] |= b
+                elif kind:
+                    dpre[k] |= b
+                    if pos < last_s:
+                        dsync[k] |= b
+                    if pos < first_s:
+                        dfirst[k] |= b
+                    defs_at[k].append((pos, r, pos > last_s))
+                elif not dpre[k] & b:
+                    use[k] |= b
+            mn = insn.mnemonic
+            tgt = self._branch_target(insn)
+            term = (mn in ("br", "bra", "bi", "iret", "stop", "stopd")
+                    or (mn in ("brsl", "brasl") and tgt in (insn.addr, insn.addr + 4)))
+            s = [k_of(int(a, 16)) for a in re.findall(r"\bloc_([0-9A-F]{8})\b", ln)]
+            if not term:
+                s.append(k + 1)     # k + 1 == n: la fine della funzione (un'uscita)
+            succ[k] = s
+        # 2. all'indietro: esc = registri che da qui arrivano a una
+        #    sincronizzazione senza essere riscritti; lin = vivi
+        esc = [0] * (n + 1); lin = [0] * (n + 1)
+        esc[n] = ALL
+        eout = [0] * n; lout = [0] * n
+        changed = True
+        while changed:
+            changed = False
+            for k in range(n - 1, -1, -1):
+                eo = lo = 0
+                for s in succ[k]:
+                    eo |= esc[s]
+                    lo |= lin[s]
+                eout[k] = eo; lout[k] = lo
+                e = (ALL & ~dfirst[k]) if has_sync[k] else 0
+                if not is_call[k]:
+                    e |= eo & ~dpre[k]
+                v = use[k] if is_call[k] else (use[k] | (lo & ~dpre[k]))
+                if e != esc[k] or v != lin[k]:
+                    esc[k] = e; lin[k] = v
+                    changed = True
+        # 3. emissione
+        line_k = {li: k for k, (li, _) in enumerate(items)}
+        out = ["    u128 " + ", ".join(f"r{r}" for r in regs) + ";"]
+        has_switch = any(ln.strip() == "default: break; }" for ln in lines)
+        if not has_switch:
+            out.append("    " + self._rc_load(lin[0]) + ";")
+        nwt = nload = 0
+        for li, ln in enumerate(lines):
+            m = re.match(r"(\s*case 0x[0-9A-F]+u: )goto loc_([0-9A-F]{8});$", ln)
+            if m:
+                out.append(f"{m.group(1)}{self._rc_load(lin[k_of(int(m.group(2), 16))])}; "
+                           f"goto loc_{m.group(2)};")
+                continue
+            if ln.strip() == "default: break; }":
+                out += [ln, "    " + self._rc_load(lin[0]) + ";"]
+                continue
+            k = line_k.get(li)
+            if k is None:
+                out.append(ln)
+                continue
+            # write-through: dopo l'istruzione C che scrive rN, se il valore
+            # arriva a una sincronizzazione (nella riga stessa o piu' avanti)
+            for pos, r, after in sorted(defs_at[k], reverse=True):
+                if not after or eout[k] >> r & 1:
+                    ln = ln[:pos + 1] + f" @WT{r}@" + ln[pos + 1:]
+                    nwt += 1
             ln = re.sub(r"ctx->gpr\[(\d+)\]", r"r\1", ln)
-            if any(k in ln for k in self._RC_SYNC_CALLS):
-                # stop/halt fanno longjmp PRIMA del return: flush davanti a
-                # tutta l'istruzione (incondizionato: e' sempre corretto).
-                ln = "RC_FLUSH(); " + ln.lstrip() if not ln.endswith(":") else ln
-            if "return;" in ln and "RC_FLUSH(); return;" not in ln:
-                ln = ln.replace("return;", "{ RC_FLUSH(); return; }")
+            ln = re.sub(r"@WT(\d+)@", r"ctx->gpr[\1] = r\1;", ln)
+            if is_call[k]:
+                rl = (lout[k] & ~dpost[k]) | upost[k]
+                ln = ln.replace("RC_LOAD()", self._rc_load(rl))
+                nload += bin(rl).count("1")
             out.append(ln)
-        head = ["    u128 " + ", ".join(f"r{n}" for n in regs) + ";",
-                "    RC_LOAD();"]
-        func.body_lines = head + out
+        func.body_lines = out
         func.rc_regs = regs
-        func.rc_written = written
+        self.rc_stats[0] += nwt
+        self.rc_stats[1] += nload
 
     @staticmethod
     def _branch_target(insn: SPUInstruction):
@@ -925,19 +1045,19 @@ class SPULifter:
         # ---- channel ops ----
         if mn == "rdch":
             if self.reg_cache:
-                return (f"{{ RC_FLUSH(); u128 _v = spu_rdch(ctx, {_chan(ops[1])}); "
+                return (f"{{ u128 _v = spu_rdch(ctx, {_chan(ops[1])}); "
                         f"RC_LOAD(); {g(rt())} = _v; }}")
             return f"{g(rt())} = spu_rdch(ctx, {_chan(ops[1])});"
         if mn == "rchcnt":
             # CBEA: the count lands in the PREFERRED word, remaining slots ZERO
             # (splatting it is the spu_link bug class; RPCS3 = v128::from32r).
             if self.reg_cache:
-                return (f"{{ RC_FLUSH(); uint32_t _v = spu_rchcnt(ctx, {_chan(ops[1])}); "
+                return (f"{{ uint32_t _v = spu_rchcnt(ctx, {_chan(ops[1])}); "
                         f"RC_LOAD(); {g(rt())} = spu_pref_u32(_v); }}")
             return f"{g(rt())} = spu_pref_u32(spu_rchcnt(ctx, {_chan(ops[1])}));"
         if mn == "wrch":
             # operands: channel, $rt
-            return f"{self._rcf}spu_wrch(ctx, {_chan(ops[0])}, {g(_reg(ops[1]))});{self._rcl}"
+            return f"spu_wrch(ctx, {_chan(ops[0])}, {g(_reg(ops[1]))});{self._rcl}"
 
         # ---- branches ----
         if mn in ("br", "bra"):
@@ -987,7 +1107,7 @@ class SPULifter:
                 setpc = f"ctx->pc = 0x{tgt:X}u; " if self.merge_blocks else ""
                 return (f"{link} {{ int32_t _si = (int32_t)ctx->image_id; "
                         f"uint32_t _rl = ctx->ret_link; ctx->ret_link = 0x{addr + 4:X}u; "
-                        f"{self._rcf}ctx->host_depth++; {setpc}{self.prefix}spu_func_{self._owner(tgt):08X}(ctx); "
+                        f"ctx->host_depth++; {setpc}{self.prefix}spu_func_{self._owner(tgt):08X}(ctx); "
                         f"SPU_DRAIN(ctx); ctx->host_depth--; ctx->ret_link = _rl; "
                         f"spu_img_restore(ctx, _si); {self._rcl}}}")
             return f"{link} /* TODO spu: brsl unresolved target */;"
@@ -999,7 +1119,7 @@ class SPULifter:
                         f'spu_unsupported(0x{insn.addr:X}, "{mn}");')
             if func.start_addr <= tgt < func.end_addr:
                 if self.merge_blocks and tgt <= insn.addr:
-                    return f"if ({cond}) {self._rcbe}(ctx, 0x{tgt:X}u, {func.name}, loc_{tgt:08X});"
+                    return f"if ({cond}) SPU_BACKEDGE(ctx, 0x{tgt:X}u, {func.name}, loc_{tgt:08X});"
                 return f"if ({cond}) goto loc_{tgt:08X};"
             self.branch_targets.add(tgt)
             # Cross-function conditional branch = conditional tail: hand the
@@ -1028,7 +1148,7 @@ class SPULifter:
                 # (host_depth>0); at 0 the frame was destroyed -> dispatch to r0.
                 # SPU_RETR: il registro di collegamento e' quello del `bi`
                 # (r78 nei ritorni `brsl $r78` del policy module), non sempre r0.
-                return f"{_ied}{self._rcf}SPU_RETR(ctx, {int(tgt_reg)});"
+                return f"{_ied}SPU_RETR(ctx, {int(tgt_reg)});"
             # Computed indirect tail: set pc + trampoline to the dispatcher, unwind.
             return (f"{_ied}ctx->pc = {g(tgt_reg)}._u32[0]; "
                     f"g_spu_trampoline_fn = spu_indirect_branch; return;")
@@ -1055,7 +1175,7 @@ class SPULifter:
                     f"{g(link_rt)} = spu_link(0x{addr + 4:X}); "
                     f"int32_t _si = (int32_t)ctx->image_id; "
                     f"uint32_t _rl = ctx->ret_link; ctx->ret_link = 0x{addr + 4:X}u; "
-                    f"{_ied}ctx->pc = _tg; {self._rcf}ctx->host_depth++; "
+                    f"{_ied}ctx->pc = _tg; ctx->host_depth++; "
                     f"spu_indirect_branch(ctx); SPU_DRAIN(ctx); "
                     f"ctx->host_depth--; ctx->ret_link = _rl; spu_img_restore(ctx, _si); {self._rcl}}}")
         # bisled: set link, branch to RA only if an external event is pending.
@@ -1078,7 +1198,7 @@ class SPULifter:
             # land on an unregistered mid-function PC.
             if (tgt_reg == "0" and addr not in self.bi_r0_jump) \
                     or addr in self.link_return:
-                return f"if ({cond}) {{ {_ied}{self._rcf}SPU_RETR(ctx, {int(tgt_reg)}); }}"
+                return f"if ({cond}) {{ {_ied}SPU_RETR(ctx, {int(tgt_reg)}); }}"
             return (f"if ({cond}) {{ {_ied}ctx->pc = {g(tgt_reg)}._u32[0]; "
                     f"g_spu_trampoline_fn = spu_indirect_branch; return; }}")
 
@@ -1112,7 +1232,7 @@ class SPULifter:
             return "/* TODO spu: unresolved branch */;"
         if func.start_addr <= tgt < func.end_addr:
             if self.merge_blocks and tgt <= func.cur_addr:
-                return f"{self._rcbe}(ctx, 0x{tgt:X}u, {func.name}, loc_{tgt:08X});"
+                return f"SPU_BACKEDGE(ctx, 0x{tgt:X}u, {func.name}, loc_{tgt:08X});"
             return f"goto loc_{tgt:08X};"
         self.branch_targets.add(tgt)
         # Cross-function unconditional tail: hand the target to the trampoline
@@ -1144,27 +1264,12 @@ class SPULifter:
             # le funzioni sotto --reg-cache-min restano su ctx->gpr: per loro
             # i punti di sincronizzazione sono vuoti
             lines.append("#define RC_LOAD() ((void)0)")
-            lines.append("#define RC_FLUSH() ((void)0)")
             lines.append("")
         for f in self.functions:
-            if f.rc_regs:
-                lines.append("#undef RC_LOAD")
-                lines.append("#undef RC_FLUSH")
-                lines.append("#define RC_LOAD() do { " +
-                             " ".join(f"r{n} = ctx->gpr[{n}];" for n in f.rc_regs) +
-                             " } while (0)")
-                lines.append("#define RC_FLUSH() do { " +
-                             " ".join(f"ctx->gpr[{n}] = r{n};" for n in f.rc_written) +
-                             " } while (0)")
             lines.append(f"void {f.name}(spu_context* ctx) {{")
             for b in f.body_lines:
                 lines.append(b if b.endswith(":") else f"    {b}")
             lines.append("}")
-            if f.rc_regs:
-                lines.append("#undef RC_LOAD")
-                lines.append("#undef RC_FLUSH")
-                lines.append("#define RC_LOAD() ((void)0)")
-                lines.append("#define RC_FLUSH() ((void)0)")
             lines.append("")
 
         # Stubs for cross-function branch/call targets the function-boundary
@@ -1243,8 +1348,10 @@ def main() -> None:
                         "del trampolino. Solo i salti veri passano dal trampolino.")
     p.add_argument("--reg-cache", action="store_true",
                    help="I registri di ogni funzione liftata sono variabili locali "
-                        "(u128 rN), scritte in ctx->gpr prima di uscite/chiamate/"
-                        "canali e rilette dopo (s.36). Incompatibile con --trace.")
+                        "(u128 rN): scritti in ctx->gpr subito se il valore arriva "
+                        "a un'uscita/chiamata/canale, riletti dopo chiamate e canali "
+                        "solo se vivi (s.44; spento: nel banco differenziale non "
+                        "accelera). Incompatibile con --trace.")
     p.add_argument("--reg-cache-min", type=int, default=24,
                    help="--reg-cache solo per le funzioni con almeno N istruzioni "
                         "(default 24: sotto, il carico/flush costa piu' del corpo).")
@@ -1387,9 +1494,7 @@ def main() -> None:
     if args.reg_cache and not args.trace:
         lifter.reg_cache = True
         lifter.reg_cache_min = int(args.reg_cache_min)
-        lifter._rcf = "RC_FLUSH(); "
         lifter._rcl = " RC_LOAD();"
-        lifter._rcbe = "SPU_BACKEDGE_RC"
     if args.merge_blocks:
         # Etichette: i semi non promossi a funzione, gli extra dentro una
         # funzione, e l'indirizzo di ritorno di ogni brsl/bisl (un `bi $r0` a
@@ -1443,6 +1548,9 @@ def main() -> None:
     print(f"Wrote {sp}")
     print(f"  {len(lifter.functions)} function(s) lifted")
     print(f"  {len(lifter.call_targets)} call target(s)")
+    if lifter.reg_cache:
+        print(f"  reg-cache: {sum(1 for f in lifter.functions if f.rc_regs)} funzioni, "
+              f"{lifter.rc_stats[0]} scritture in ctx->gpr, {lifter.rc_stats[1]} riletture")
     if lifter.unsupported:
         total = sum(lifter.unsupported.values())
         print(f"  {total} unsupported instruction(s) across "

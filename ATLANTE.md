@@ -58,6 +58,7 @@ libs/video/rsx_commands.c    stato RSX + modalita immediata (SET_VERTEX_DATA fra
 tools/ppu_lifter.py          lift PPU -> C++ (chunk in uncharted-data/recomp)
 tools/spu_lifter.py          lift SPU -> C
 tools/lift_jobmods.py        lift dei job module WwsJob
+tools/spu_lift_diff/         banco differenziale del lifter SPU: due lift degli stessi job, stati casuali, hash dello stato finale e tempi (run.sh; s.44)
 tools/extract_spu_images.py  estrae le immagini SPU dall'ELF
 tools/gen_hle_nids.py        genera la tabella NID per il port (--all)
 tools/check_ppu_scaffold.py  ratchet del boot

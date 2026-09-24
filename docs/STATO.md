@@ -736,6 +736,79 @@ s27-s39), `iterate.log`, `shot.log`, `uncharted.s37`, `recomp.bak`,
 `recomp.bak_s35`, `recomp.bak_s36`, e in `obj/`: `o1_backup`, `o2_s35_backup`,
 `o2_s36_backup`, `spu_s35_backup`, `spu_s36_neon`. I backup citati sopra (s35/s36)
 non esistono piu': per tornare indietro si rifa' il lift da git.
+## Calore: cache dei registri SPU con analisi di flusso (branch `spu-regcache-flow`, 24/09/2026) — NON ACCELERA
+
+Rifatta `--reg-cache` di `tools/spu_lifter.py` (s.36: flush/reload di tutti i
+registri a ogni sync, 6,9 contro 8,0 fps). Tutto senza gioco e senza toccare
+`runtime/spu` (macchina occupata da un'altra sessione).
+
+**Verifica.** `spu_lift_selftest.py` NON puo' girare su questo Mac: vuole
+`spu-lv2-gcc` (SDK Sony), che non c'e'. Al suo posto un banco differenziale
+nuovo, `tools/spu_lift_diff/run.sh`: i 28 moduli di job liftati in due modi
+(stessi flag di `relift_spu.sh`), compilati come `build.sh` (clang -O2
+-DSPU_LS_NODIAG), ogni ingresso registrato (funzioni ed etichette dello
+switch, 50-1.279 per modulo) eseguito 20 volte da stati casuali
+deterministici (immagine a LS 0x4000), fine caso a stop/halt/LS 0/pc non
+registrato/limite di 20.000 salti, hash di gpr+LS+pc+canali. L'arco
+all'indietro chiede al banco se uscire al trampolino (ogni 1/3/16/256 archi o
+mai): cosi' si provano sia i cicli C sia i rientri dallo switch.
+Risultato: **256.380 casi, 0 divergenze** con la cache, con due generatori di
+dati (casuali puri e `GEN_FLOAT=1`), TRANNE 9 (16 con GEN_FLOAT) casi nel
+modulo 0091dc40: NaN nelle operazioni double (`spu_fesd`->`spu_dfm`->
+`spu_frds`), il payload del NaN dipende dall'ordine degli operandi che il
+compilatore sceglie. Con `spu__dset` che rende canonici i NaN (copia degli
+helper nello scratchpad): 0/4.860 con tutti e due i generatori. Non e' la
+cache: e' un'imprecisione gia' presente negli helper double (sul ferro un
+float esteso non e' un NaN; da sistemare se un job double diverge in gioco).
+
+**Fallito 1 — write-back** (flush dei soli registri sporchi alle uscite,
+reload dei soli vivi dopo le chiamate; il flush conta come lettura
+nell'analisi dei vivi): corretto, ma i registri sporchi restano vivi fino
+all'uscita. Codice host dei 28 moduli 2,29 -> **4,96 M istruzioni**, load
+446k -> 1,67 M, compilazione 74 -> **748 s**; nel banco piu' lento ovunque
+(job 215: 8,7 -> 11,2 s).
+
+**Fallito 2 — write-through** (quello che resta nel branch): un valore che puo'
+arrivare a una sincronizzazione (uscita, chiamata, canale, arco all'indietro)
+senza essere riscritto va in ctx->gpr accanto alla sua definizione; nessun
+flush; reload dei soli vivi all'ingresso (per etichetta dello switch) e dopo
+chiamate/canali. Codice 2,65 M istruzioni (+16%), compilazione 89 s. Tempo nel
+banco (`TIME=1`: GEN_FLOAT=1, nessuna uscita forzata, somma dei 28 moduli):
+**174,0 s senza, 177,2 s con (+1,9%)**; per modulo da -4,5% (008aa980) a
++100% (008ff700: una funzione con 301 etichette d'ingresso, ogni rientro
+ricarica i vivi) e +13% (008d5800).
+Perche' non rende: (a) il codice SPU di questi job tiene 50-100+ registri da
+128 bit vivi insieme (cicli software-pipelined, es. 0x10520 del job 215),
+l'host ha 32 registri NEON: le variabili locali finiscono comunque sullo
+stack, e ctx->gpr era gia' un'ottima area di spill (L1, store->load
+forwarding); (b) su ARM64 una chiamata distrugge tutti i registri vettoriali
+(v8-v15 salvano solo 64 bit) e nei corpi ci sono ~150 chiamate per funzione
+alle vie lente dei float (`spu_fm_slow`, `spu_fma_slow`, ... 5.095 + 4.451
+siti) e centinaia di `spu_shufb`/`spu_rotqbyi` non messe in linea (739/490
+siti): ogni valore vivo attraverso una chiamata va salvato. In un ciclo
+software-pipelined quasi tutti i valori arrivano all'arco all'indietro,
+quindi il write-through scrive quasi quanto il riferimento.
+**Non riprovare la cache dei registri** senza prima cambiare questi due fatti.
+
+**Trovato invece: `preserve_all` sulle vie lente dei float = -7,5%.** Stessa
+misura, solo il riferimento (senza cache), helper modificati in una copia:
+`__attribute__((noinline, preserve_all))` sulle `*_slow` di SPU__FLOAT3 e
+SPU__FLOAT2_ATTR in `runtime/spu/spu_helpers.h`: **178,2 -> 164,9 s**
+(fino a -24% su 0091c9c0, -9% su 008aa980, -8% su 00903d80 = job 218).
+`always_inline` su shufb/rotqbyi da solo: 177,4 s (niente). La via lenta
+resta fuori linea e rara; il guadagno viene dal chiamante, che non deve piu'
+salvare i registri attorno a una chiamata quasi mai presa. Clang 21 lo
+supporta su arm64 (provato: 11 -> 3 accessi a memoria in un ciclo di prova).
+DA FARE a macchina libera: la modifica in `runtime/spu/spu_helpers.h`
+(dietro `__clang__ && __aarch64__`, per non rompere Windows/MSVC), build,
+`cpufoto.sh` 3 corse contro 3; criterio: meno ms CPU/fotogramma a fps pari.
+Opzionale: una corsa col lift `--reg-cache` per confermare in gioco che e'
+neutra (il banco non e' il gioco).
+Per rifare le misure: `tools/spu_lift_diff/run.sh <dir> "" "--reg-cache" 20`
+(correttezza, ~10 min); `TIME=1 HELPERS_B=<copia di runtime/spu con la
+modifica> tools/spu_lift_diff/run.sh <dir> "" ""` (tempo degli helper). I tempi
+del banco sono sintetici: ordinano le varianti, non predicono i fotogrammi.
+
 ## Storico
 
 Sessioni fino alla 37 e la vecchia "Dove siamo", verbatim, in
