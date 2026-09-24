@@ -388,6 +388,8 @@ extern "C" void ppu_log_host_chain(const char* tag);  /* fwd decl (defined below
  * lock is cheap enough; shard by address later if it shows up in a profile.
  * -----------------------------------------------------------------------*/
 extern "C" PPU_THREAD_LOCAL ppu_context* g_active_ctx;   /* fwd (defined below) */
+/* id guest del thread corrente, per le diagnostiche C (GCM_PUMP_STAT, s.43) */
+extern "C" unsigned ppu_active_tid(void) { return g_active_ctx ? (unsigned)g_active_ctx->thread_id : 999u; }
 #define PPU_RESV_MAX 128
 #define PPU_RESV_INVALID 0x100000000ull   /* out of (uint32_t) ea range */
 static ppu_context* g_resv_ctxs[PPU_RESV_MAX];

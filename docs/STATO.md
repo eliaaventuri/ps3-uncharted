@@ -571,9 +571,74 @@ banca di `stopd`, raggiunto da `brz $r5,0x15B0` a 0x33FC: il magic
 letta da LS 0x1330 vale 0 (scritta a 0x23FC da `r10 = roti r31,10`). Un
 job partito senza codice caricato. Solo una corsa, niente riproduzione.
 
+### Seconda parte: lwmutex veri su macOS, e lo stallo "fotogrammi fermi"
+
+**Scoperta:** su macOS `sys_lwmutex_lock/trylock/unlock` (i gestori ctx in
+`runtime/ppu/ppu_sysprx.cpp`, registrati prima della tabella generica) erano
+NO-OP: il semaforo per indirizzo esisteva solo nel ramo `_WIN32`, il ramo
+POSIX era `lwm_sem() { return nullptr; }`. SCREAM protegge il tick con un
+lwmutex (pool a *(r2-0x7164) = 0x10A56F88, voci da 0x20 a +8; lock/unlock/
+trylock = `func_00723390`/`func_00723358`/`func_007233D0`; il nome
+"snd_tick_lock_sema" non e' un sys_semaphore -- zero semafori creati).
+Fix: ramo POSIX con mutex+cond per indirizzo (`LwmPx`), stessa semantica
+del ramo Win32 (ricorsione via owner/recur, ETIMEDOUT, EBUSY, create che
+libera, lwcond_wait che rilascia e riprende). Diagnostiche: `LWM_CONTEND=1|2`
+(prese contese: ~300 in 160 s su due mutex, 0x109ECC48 e 0x2A870F28),
+`[LWM-STALL]` (attesa > 3 s: chi tiene il lucchetto e da quale lr),
+`[LWM-LOST]` (sveglia persa recuperata). Mai visti STALL o LOST.
+
+**Conteggi (corse da 160 s):** prima del fix 31 corse = 2 DoGrain, 1
+"stuck on reference", 1 fotogrammi fermi; dopo 31 corse = 0 DoGrain, 0
+stuck, 3 fotogrammi fermi (lwmb1 a 68 s, lwmb3 a 115 s, lc4 a 99 s), 1 corsa
+rimasta nel menu (l'autopress ha mancato il tasto: difetto dell'imbracatura,
+non del gioco). Non significativo in nessuna delle due direzioni.
+
+**Fotogrammi fermi, catturato dal vivo** (`scratchpad/misura/framecatch.sh`,
+campiona con `sample` quando i fotogrammi non avanzano per 20 s; s43_fc7):
+il main (tid 1) gira in `func_0014F528` @0x14F9CC: `while (*0x10511F2C < r27)
+sys_timer_usleep(10)` -- aspetta il PROPRIO contatore dei vblank (r27 = 0/1/2
+dall'intervallo di vsync); tutte le lane SPURS dormono. Chi scrive il
+contatore (YDKJ_WWATCH): il gestore vblank del titolo (valore 1) e il main
+(0 dopo l'attesa); nessuna SPU (SPU_DMA_EAWIN/SPU_ATOM_EA: zero). Il gestore
+vblank si esegue solo in `ppu_gcm_pump` (a ogni import HLE di qualunque
+thread, o dopo 4096 letture consecutive dello stesso indirizzo). Nuova
+diagnostica `GCM_PUMP_STAT=1`: ogni 300 vblank del ticker, gestori
+eseguiti e tid dell'ultimo (normale: consegnati da tid 1, 15, 18, 19).
+Aperto: nello stallo il gestore smette di essere consegnato, o gira ma il
+contatore non basta? Serve una cattura con GCM_PUMP_STAT=1.
+
+**Risposta (catture pc25 e pc31, con GCM_PUMP_STAT=1):** il gestore vblank
+gira regolarmente anche durante lo stallo (300 esecuzioni ogni 300 impulsi,
+contatore a 0x618 in pc31); il gestore del titolo e' `func_0014EA80`
+(counter++ non atomico); soglia a 0x104296B8+8 = 2 (30 fps), bandierina
+0x10503F48+0x1C. IL VBLANK NON C'ENTRA: la cattura fc7 aveva preso il main
+di passaggio. Nei due stalli il main e' nel controllo "job list finita"
+(`func_0074073C`: minimo dei 5 contatori per SPU >= obiettivo), chiamato da
+`func_0047CC40` (pc25) o `func_001AD590`/`func_007417D8` (pc31). Due tipi:
+- **A (pc25; e s42_b3_1):** subito dopo AddWorkload(14/15) il PM asserisce
+  (`stopd @0x1654`, da `brz $r21` a 0x23DC; in s42 `@0x15B0` da 0x33FC, magic
+  0xC0DEC0DE): il comando di caricamento letto in LS (r16, a LS 0xD00)
+  vale 0x1008EB00 = l'EA del PM stesso, cioe' i comandi del job sono stati
+  copiati da un EA dentro la tabella dei workload di SPURS. Il job e' perso
+  e la lista non si chiude. Le lane restano in `resv_lock_spin` nel PM.
+- **B (pc31, lc4, lwmb1, lwmb3):** nessuna assert, lane tutte a dormire,
+  il main aspetta la lista. Diagnostica nuova `SPURS_WSTAT=1`: ogni 5 s per
+  wid in uso abil/stato/shutdown/rdy/sig, avvii, kick, avvii con lavoro,
+  spumask, idle, imask, maxc, arg.
+**Bilancio con gli lwmutex veri: 71 corse** (160 s): 0 DoGrain, 0 SIGSEGV,
+0 "stuck on reference", 5 fotogrammi fermi (tipo A 1, tipo B 4). Prima:
+31 corse, 2 DoGrain + 1 stuck + 1 fermo. Con `SPURS_WSTAT=1` acceso 25 corse
+su 25 pulite (senza: 2 fermi su 15) -- p ~0,13, forse un heisenbug di
+tempi: la lane 0 chiama spurs_ns_now() a ogni giro.
+`framecatch.sh` ora legge memoria guest dal processo vivo (`FC_PEEK="ea..."`,
+lldb) e rifiuta di partire senza ISO montata. ATTENZIONE: dopo un riavvio
+del Mac /tmp/uc_iso sparisce e le corse restano nel menu (~24.500
+fotogrammi vuoti in 160 s): 16 corse buttate in s.43.
+
 ### Fronte aperto (dopo la sessione 43)
 
-1. Crash DoGrain (SH.Sound NULL sul thread del synth): corsa fra lo stop
+0. Fotogrammi fermi tipo A/B (sopra): ~1 corsa su 10-15.
+1. (Probabilmente chiuso dagli lwmutex veri: 0/71) Crash DoGrain (SH.Sound NULL sul thread del synth): corsa fra lo stop
    di un suono e il tick? Lock SCREAM = `func_00720B68`/`func_00720B20`
    (trylock via `func_007416B0`). Servono piu' corse per la frequenza.
 2. Contesa `resv_lock`, fallimenti rari della s.42, codice SPU liftato.

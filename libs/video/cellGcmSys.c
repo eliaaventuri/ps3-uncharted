@@ -638,6 +638,14 @@ void cellGcm_gpu_idle(void)
  * and mark a vblank+flip tick pending for the main thread to deliver. */
 static u32 s_fifo_getoff;   /* tentative: defined below */
 
+/* GCM_PUMP_STAT=1 (s.43): ogni ~5 s impulsi del ticker, gestori vblank
+ * eseguiti e il thread guest che ha eseguito l'ultimo -- per gli stalli in cui
+ * il main thread aspetta il proprio contatore dei vblank. */
+#ifndef _WIN32
+static atomic_uint s_pump_vbl_calls, s_pump_last_tid;
+/* il port vero la ridefinisce in ppu_loader.cpp; qui basta per ps3recomp_host */
+__attribute__((weak)) unsigned ppu_active_tid(void) { return 999u; }
+#endif
 void cellGcm_request_tick(void)
 {
     s_vblank_count++;
@@ -687,6 +695,10 @@ void ppu_gcm_pump(void)
         ydkj_restore_handler_opd(s_vblank_handler_opd, s_vblank_handler_code);
         g_ps3_guest_caller(s_vblank_handler_opd, (uint64_t)s_vblank_count,
                            0, 0, 0, 0, 0, 0, 0);
+#ifndef _WIN32
+        { atomic_fetch_add(&s_pump_vbl_calls, 1);
+          atomic_store(&s_pump_last_tid, ppu_active_tid()); }
+#endif
     }
     if (p & 2) s_flip_status = CELL_GCM_FLIP_STATUS_DONE;
     int calls = (p & 6) ? 1 : 0;   /* 4: solo il gestore (flip chiuso in cellGcmSetFlipCommand, s.37) */
@@ -704,7 +716,15 @@ void ppu_gcm_pump(void)
 
 /* Back-compat: the old direct entry points now just mark a tick pending (so any
  * caller other than the ticker still works) -- delivery stays on the main thread. */
-void cellGcmTickVBlank(void) { s_vblank_count++; GCM_PENDING_SET(1); }
+void cellGcmTickVBlank(void) { s_vblank_count++; GCM_PENDING_SET(1);
+#ifndef _WIN32
+    { static int st = -1; if (st < 0) st = getenv("GCM_PUMP_STAT") ? 1 : 0;
+      static unsigned n; if (st && ++n % 300 == 0)
+          fprintf(stderr, "[gcm-pump] vblank=%u gestori_vblank=%u ultimo_tid=%u pending=%d\n",
+                  s_vblank_count, atomic_load(&s_pump_vbl_calls),
+                  atomic_load(&s_pump_last_tid), atomic_load(&s_gcm_pending)); }
+#endif
+}
 /* Only deliver a flip completion when a flip is actually outstanding.
  *
  * Ticking unconditionally at 60 Hz fires the guest's flip handler even when

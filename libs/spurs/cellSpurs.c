@@ -1608,6 +1608,12 @@ static void spurs_lane_stat_flush(void)
 
 extern PPU_THREAD_LOCAL volatile unsigned g_spurs_pm_polls, g_spurs_pm_exited;   /* spurs_policy.c, per thread */
 
+/* SPURS_WSTAT=1 (s.43): ogni ~5 s, dalla lane 0, lo stato di ogni workload in
+ * uso -- per gli stalli in cui il PPU aspetta una job list e le lane dormono:
+ * dice se il wid viene ancora avviato, se e' "kickato", se il PM trova lavoro. */
+static unsigned s_ws_disp[CELL_SPURS_MAX_WORKLOAD], s_ws_kick[CELL_SPURS_MAX_WORKLOAD],
+                s_ws_work[CELL_SPURS_MAX_WORKLOAD];
+
 /* Contention di un workload come la vede il dispatch: quella dichiarata dal
  * titolo (1..6), alzata da SPURS_FORCE_SPUS solo per i multi-SPU (s.35). */
 static u8 spurs_wkl_maxcont(u32 ea, u32 wid)
@@ -1738,6 +1744,9 @@ static DWORD WINAPI spurs_lane_sched_thread(LPVOID p)
                     }
                 } else { __atomic_store_n(&s_lsch[wid].idle, 0, __ATOMIC_RELAXED);
                          __atomic_store_n(&s_lsch[wid].idle_mask, 0, __ATOMIC_RELAXED); }
+                __atomic_fetch_add(&s_ws_disp[wid], 1, __ATOMIC_RELAXED);
+                if (kicked) __atomic_fetch_add(&s_ws_kick[wid], 1, __ATOMIC_RELAXED);
+                if (g_spurs_pm_polls) __atomic_fetch_add(&s_ws_work[wid], 1, __ATOMIC_RELAXED);
                 if (s_dt && (kicked || g_spurs_pm_polls) && (s_dt_wid < 0 || (long)wid == s_dt_wid))
                     fprintf(stderr, "[spurs-disp] lane=%u spu=%u wid=%u kicked=%d arg=0x%016llX polls=%u exited=%u %.0f us\n",
                             lane, sn, wid, kicked, (unsigned long long)arg, g_spurs_pm_polls, g_spurs_pm_exited, ns / 1e3);
@@ -1760,6 +1769,27 @@ static DWORD WINAPI spurs_lane_sched_thread(LPVOID p)
               u8 c = 0; for (; nm; nm &= nm - 1) c++;
               *(vm_base + ea + SPURS_WKL_CURCONT + wid) = c; }
         }
+        { static int s_ws = -1; if (s_ws < 0) s_ws = getenv("SPURS_WSTAT") ? 1 : 0;
+          static unsigned long long s_ws_t;
+          if (s_ws && lane == 0 && spurs_ns_now() - s_ws_t > 5000000000ull) {
+              s_ws_t = spurs_ns_now();
+              for (u32 w = 0; w < CELL_SPURS_MAX_WORKLOAD; w++) {
+                  SpursWorkload* x = &s_workloads[w];
+                  if (!x->in_use || !x->spurs_ea) continue;
+                  u32 e = x->spurs_ea;
+                  fprintf(stderr, "[wstat] wid=%u abil=%d stato=%u shutdown=%d rdy=%u sig=%d avvii=%u kick=%u lavoro=%u "
+                          "spumask=0x%X idle=%u imask=0x%X maxc=%u arg=0x%llX\n", w,
+                          !!(vm_read32(e + SPURS_WKL_ENABLED) & (0x80000000u >> w)),
+                          *(vm_base + e + SPURS_WKL_STATE1 + w), x->shutdown,
+                          *(vm_base + e + SPURS_WKL_READY1 + w),
+                          !!((vm_read32(e + SPURS_WKL_SIGNAL1) >> 16) & (0x8000u >> w)),
+                          __atomic_exchange_n(&s_ws_disp[w], 0, __ATOMIC_RELAXED),
+                          __atomic_exchange_n(&s_ws_kick[w], 0, __ATOMIC_RELAXED),
+                          __atomic_exchange_n(&s_ws_work[w], 0, __ATOMIC_RELAXED),
+                          s_lsch[w].spumask, s_lsch[w].idle, s_lsch[w].idle_mask,
+                          spurs_wkl_maxcont(e, w), (unsigned long long)vm_read64(e + SPURS_WKL_INFO1 + w * SPURS_WKL_INFO_SZ + 8));
+              }
+          } }
         if (!ran) {
 #ifdef _WIN32
             Sleep(s_idle_us >= 1000 ? (DWORD)(s_idle_us / 1000) : 1);

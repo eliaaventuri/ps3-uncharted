@@ -109,6 +109,11 @@ static void sys_process_is_stack(ppu_context* ctx)
 
 #ifdef _WIN32
 static HANDLE lwm_sem(uint32_t addr);   /* fwd (defined below) */
+#else
+struct LwmPx;
+static LwmPx* lwm_sem(uint32_t addr);   /* fwd (ramo POSIX, sotto) */
+static void lwm_px_release(LwmPx* s);
+static int  lwm_px_acquire(LwmPx* s, uint64_t timeout_us, int try_only, const ppu_context* ctx);
 #endif
 static void sys_lwmutex_create(ppu_context* ctx)
 {
@@ -129,6 +134,8 @@ static void sys_lwmutex_create(ppu_context* ctx)
      * previous holder exited while holding). Force the semaphore signaled;
      * over-release of an already-free sem fails harmlessly at max count 1. */
     { HANDLE s = lwm_sem(lwm); if (s) ReleaseSemaphore(s, 1, NULL); }
+#else
+    { LwmPx* s = lwm_sem(lwm); if (s) lwm_px_release(s); }
 #endif
     ctx->gpr[3] = 0;
 }
@@ -205,7 +212,96 @@ static HANDLE lwm_sem(uint32_t addr)
     return nullptr;   /* table full (raise LWM_HASH) */
 }
 #else
-static void* lwm_sem(uint32_t) { return nullptr; }
+/* POSIX: la stessa esclusione del ramo Win32 -- un semaforo binario per
+ * indirizzo guest, rilasciabile da qualunque thread -- fatto con mutex+cond
+ * (macOS non ha sem_timedwait). Prima qui c'era un `return nullptr` e su macOS
+ * lock/trylock/unlock non escludevano nessuno: il tick di SCREAM trovava un
+ * handler a meta' (s.43, "DoGrain but handler's SH.Sound member is NULL"). */
+#include <pthread.h>
+#include <errno.h>
+#include <time.h>
+#include <atomic>
+#define LWM_HASH 65536u
+struct LwmPx { std::atomic<uint32_t> addr; pthread_mutex_t m; pthread_cond_t c; int held;
+               uint32_t holder_tid, holder_lr; };   /* chi l'ha preso: per [LWM-STALL] */
+static LwmPx g_lwmp[LWM_HASH];
+static pthread_mutex_t g_lwmp_tab = PTHREAD_MUTEX_INITIALIZER;
+static LwmPx* lwm_sem(uint32_t addr)
+{
+    if (!addr) return nullptr;
+    uint32_t h = (addr * 2654435761u) & (LWM_HASH - 1);
+    for (uint32_t i = 0; i < LWM_HASH; i++) {
+        LwmPx* s = &g_lwmp[(h + i) & (LWM_HASH - 1)];
+        uint32_t cur = s->addr.load(std::memory_order_acquire);
+        if (cur == addr) return s;
+        if (cur == 0) {
+            pthread_mutex_lock(&g_lwmp_tab);
+            cur = s->addr.load(std::memory_order_relaxed);
+            if (cur == 0) {
+                pthread_mutex_init(&s->m, NULL);
+                pthread_cond_init(&s->c, NULL);
+                s->held = 0;
+                s->addr.store(addr, std::memory_order_release);   /* pubblica DOPO l'init */
+                cur = addr;
+            }
+            pthread_mutex_unlock(&g_lwmp_tab);
+            if (cur == addr) return s;
+        }
+    }
+    return nullptr;   /* tabella piena (alzare LWM_HASH) */
+}
+/* 0 = preso; 1 = occupato (try) o scaduto (timeout_us != 0). */
+static int lwm_px_acquire(LwmPx* s, uint64_t timeout_us, int try_only, const ppu_context* ctx)
+{
+    pthread_mutex_lock(&s->m);
+    if (s->held && try_only) { pthread_mutex_unlock(&s->m); return 1; }
+    /* LWM_CONTEND=1: prese contese (prima di s.43 erano sovrapposizioni). */
+    /* LWM_CONTEND=2: ogni presa contesa, per contare per indirizzo. */
+    { static int _d = -1; if (_d < 0) { const char* e = getenv("LWM_CONTEND"); _d = e ? atoi(e) : 0; }
+      if (_d && s->held) { static std::atomic<unsigned> _n{0}; unsigned n = ++_n;
+        if (_d >= 2 || (n & (n - 1)) == 0 || n % 10000 == 0)
+            fprintf(stderr, "[LWM-CONTEND] #%u lwm=0x%08X\n", n, s->addr.load()); } }
+    if (timeout_us) {
+        struct timespec ts; clock_gettime(CLOCK_REALTIME, &ts);
+        ts.tv_sec  += (time_t)(timeout_us / 1000000);
+        ts.tv_nsec += (long)((timeout_us % 1000000) * 1000);
+        if (ts.tv_nsec >= 1000000000L) { ts.tv_sec++; ts.tv_nsec -= 1000000000L; }
+        while (s->held)
+            if (pthread_cond_timedwait(&s->c, &s->m, &ts) == ETIMEDOUT && s->held) {
+                pthread_mutex_unlock(&s->m); return 1; }
+    } else {
+        /* Attesa infinita a fette di 3 s: un'attesa cosi' lunga su un lwmutex
+         * e' quasi certamente uno stallo, e va detto chi tiene il lucchetto. */
+        int waited = 0;
+        while (s->held) {
+            struct timespec ts; clock_gettime(CLOCK_REALTIME, &ts); ts.tv_sec += 3;
+            int rc = pthread_cond_timedwait(&s->c, &s->m, &ts);
+            if (rc == ETIMEDOUT && !s->held)   /* libero ma nessuno ci ha svegliati */
+                fprintf(stderr, "[LWM-LOST] tid=%u lwm=0x%08X: sveglia persa, recuperata\n",
+                        (unsigned)ctx->thread_id, s->addr.load());
+            if (rc == ETIMEDOUT && s->held) {
+                waited += 3;
+                if (waited == 3 || waited % 30 == 0)
+                    fprintf(stderr, "[LWM-STALL] tid=%u lr=0x%08X aspetta lwm=0x%08X da %d s: "
+                            "tenuto da tid=%u preso a lr=0x%08X\n",
+                            (unsigned)ctx->thread_id, (uint32_t)ctx->lr, s->addr.load(), waited,
+                            s->holder_tid, s->holder_lr);
+            }
+        }
+    }
+    s->held = 1;
+    s->holder_tid = (uint32_t)ctx->thread_id;
+    s->holder_lr  = (uint32_t)ctx->lr;
+    pthread_mutex_unlock(&s->m);
+    return 0;
+}
+static void lwm_px_release(LwmPx* s)
+{
+    pthread_mutex_lock(&s->m);
+    s->held = 0;
+    pthread_cond_signal(&s->c);
+    pthread_mutex_unlock(&s->m);
+}
 #endif
 /* Contention-probe window flag: 0 by default (prints stay bounded). A title's
  * diagnostic code may set it around a suspect wait to uncap the [LWM-BLOCK]
@@ -259,6 +355,18 @@ static void sys_lwmutex_lock(ppu_context* ctx)
         }
     }
     if (lwm_trace()) { struct LwmSlot* sl = lwm_find(lwm); if (sl) { sl->holder = (long)self; sl->acq_us = lwm_now_us(); sl->acq_fences = g_gcm_ref_pub_count; sl->acq_cpu_us = ppu_thread_cpu_us(self); } }
+#else
+    if (LwmPx* s = lwm_sem(lwm)) {
+        if (vm_read32(lwm + LWM_OWNER) == self && vm_read32(lwm + LWM_RECUR) > 0) {
+            vm_write32(lwm + LWM_RECUR, vm_read32(lwm + LWM_RECUR) + 1);
+            ctx->gpr[3] = 0;
+            return;
+        }
+        if (lwm_px_acquire(s, timeout_us, 0, ctx)) {   /* scaduto: ETIMEDOUT, niente presa */
+            ctx->gpr[3] = (uint64_t)(int64_t)(int32_t)0x8001000Bu;
+            return;
+        }
+    }
 #endif
     vm_write32(lwm + LWM_OWNER, self);
     vm_write32(lwm + LWM_RECUR, 1);
@@ -279,6 +387,15 @@ static void sys_lwmutex_trylock(ppu_context* ctx)
         if (WaitForSingleObject(s, 0) != WAIT_OBJECT_0) { ctx->gpr[3] = (uint64_t)(int64_t)(int32_t)0x8001000Bu; return; } // EBUSY
     }
     if (lwm_trace()) { struct LwmSlot* sl = lwm_find(lwm); if (sl) { sl->holder = (long)self; sl->acq_us = lwm_now_us(); sl->acq_fences = g_gcm_ref_pub_count; sl->acq_cpu_us = ppu_thread_cpu_us(self); } }
+#else
+    if (LwmPx* s = lwm_sem(lwm)) {
+        if (vm_read32(lwm + LWM_OWNER) == self && vm_read32(lwm + LWM_RECUR) > 0) {
+            vm_write32(lwm + LWM_RECUR, vm_read32(lwm + LWM_RECUR) + 1);
+            ctx->gpr[3] = 0;
+            return;
+        }
+        if (lwm_px_acquire(s, 0, 1, ctx)) { ctx->gpr[3] = (uint64_t)(int64_t)(int32_t)0x8001000Bu; return; } // EBUSY, come Win32
+    }
 #endif
     vm_write32(lwm + LWM_OWNER, self);
     vm_write32(lwm + LWM_RECUR, 1);
@@ -328,6 +445,8 @@ static void sys_lwmutex_unlock(ppu_context* ctx)
      * hands lwmutex ownership across threads. Over-release (unlock of a free
      * mutex) fails harmlessly at the max count of 1. */
     if (s) ReleaseSemaphore(s, 1, NULL);
+#else
+    if (LwmPx* s = lwm_sem(lwm)) lwm_px_release(s);
 #endif
     ctx->gpr[3] = 0;
 }
@@ -371,6 +490,18 @@ static void sys_lwcond_wait(ppu_context* ctx)
         ReleaseSemaphore(s, 1, NULL);
         Sleep(1);
         WaitForSingleObject(s, INFINITE);
+        vm_write32(lwmutex + LWM_OWNER, own);
+        vm_write32(lwmutex + LWM_RECUR, rc ? rc : 1);
+    }
+#else
+    if (LwmPx* s = lwm_sem(lwmutex)) {
+        uint32_t own = vm_read32(lwmutex + LWM_OWNER);
+        uint32_t rc  = vm_read32(lwmutex + LWM_RECUR);
+        vm_write32(lwmutex + LWM_RECUR, 0);
+        vm_write32(lwmutex + LWM_OWNER, 0);
+        lwm_px_release(s);
+        Sleep(1);
+        lwm_px_acquire(s, 0, 0, ctx);
         vm_write32(lwmutex + LWM_OWNER, own);
         vm_write32(lwmutex + LWM_RECUR, rc ? rc : 1);
     }
