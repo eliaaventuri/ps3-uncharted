@@ -8,7 +8,8 @@ con `kill -9` finale: il port ignora SIGTERM, senza -9 restano orfani).
 
 ```
 CLAUDE.md                 regole del fork; docs/STATO.md e' la memoria operativa
-.github/README.md         README mostrato su GitHub (quello di upstream resta README.md)
+.github/README.md         README mostrato su GitHub, in inglese (quello di upstream resta README.md)
+.github/README.it.md      la stessa presentazione in italiano
 docs/STATO.md             stato, misure, fallimenti — leggere a ogni avvio
 docs/PPU_RECOMP.md        numeri del lift PPU (entry, TOC, import)
 docs/SPU_LIFTER.md        come funziona il lifter SPU
