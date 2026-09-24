@@ -38,6 +38,7 @@ extern int spu_run_with_halt(void (*)(spu_context*), spu_context*);
 SPU_THREAD_LOCAL volatile unsigned g_spurs_pm_polls = 0;   /* selectWorkload calls this run */
 SPU_THREAD_LOCAL volatile unsigned g_spurs_pm_exited = 0;  /* set when exitToKernel was taken */
 volatile unsigned g_wws_batch_gets = 0;   /* loadCommands (LS 0xC00) fetch count, spu_dma.h */
+volatile unsigned long g_spu_adma_run = 0; /* corse del PM, per SPU_ASSERT_DMA (spu_dma.h) */
 
 /* Watchdog delle corse del PM (SPURS_PM_WATCHDOG=<s>), vedi il punto d'uso. */
 #include "../platform/win32_compat.h"
@@ -276,6 +277,7 @@ int spu_run_policy_module(spu_lifted_entry_fn entry, int image_id,
       } }
     ctx->gpr[5]._u32[0] = 0;                           /* poll status */
 
+    __atomic_fetch_add(&g_spu_adma_run, 1, __ATOMIC_RELAXED);
     g_spurs_pm_polls  = 0;
     g_spurs_pm_exited = 0;
 

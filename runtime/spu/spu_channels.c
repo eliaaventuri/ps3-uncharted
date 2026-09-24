@@ -188,6 +188,7 @@ void spu_stop_at(spu_context* ctx, uint32_t addr)
                           ctx->gpr[i]._u32[0]);
         snprintf(b + q, sizeof(b) - q, "\n");
         fputs(b, stderr); fflush(stderr);
+        spu_adma_dump(ctx);
     }
     spu_stop(ctx);
 }
@@ -543,6 +544,7 @@ static int spu_mfc_atomic(spu_context* ctx, uint32_t cmd)
         memcpy(ctx->resv_line, ls, MFC_ATOMIC_LINE);   /* snapshot for compare */
         ctx->resv_ea = ea; ctx->resv_valid = 1; ctx->atomic_stat = 0;
         resv_unlock();
+        spu_adma_note(ctx, cmd, (uint32_t)(ls - ctx->ls), (uint32_t)ea, MFC_ATOMIC_LINE);
         return 1;
 
     case MFC_PUTLLC_CMD:

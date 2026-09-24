@@ -1,6 +1,6 @@
 # Stato del progetto
 
-Ultimo aggiornamento: **23 settembre 2026** — sessione 42.
+Ultimo aggiornamento: **24 settembre 2026** — sessione 44.
 
 ## Dove siamo
 
@@ -40,6 +40,8 @@ fino alla 37 stanno in `docs/STATO_STORICO.md`):
 - s.42: costo fisso del runtime SPU ridotto (drain veloce, TTAS).
 - s.43: audio, indice di lettura = slot dell'anello (click 22% -> 0,1%);
   lwmutex veri su macOS (crash DoGrain 2/31 -> 0/71).
+- s.44: gli stalli "fotogrammi fermi" si riproducono col carico CPU (4/6
+  corse); sono tutti la job list del wid 8 (0x10695C80) con la riga SPU 2 ferma.
 
 Tastiera = pad 0 nella finestra (frecce, Spazio/X = CROSS, C = CERCHIO,
 Invio = START); `PAD_SCRIPT` per le corse senza nessuno.
@@ -65,6 +67,71 @@ Tutti i riferimenti upstream valgono per noi 1:1.
 Il lift completo richiede **12 secondi**: 18.628 funzioni, 4 chunk, 2,16
 milioni di righe di C++. La nota in `docs/PPU_RECOMP.md` sugli "88 MB in un
 file" è superata: il lifter emette già chunk.
+
+## Sessione 44 — stalli tipo A/B: un riproduttore (carico CPU) e un colpevole (job list wid 8)
+
+**SPURS_WSTAT=1 non li nasconde.** Lotto A/B alternato (`scratchpad/misura/ablotto.sh`,
+20 coppie da 160 s): WSTAT=0 4 fermi su 20, WSTAT=1 2 su 20. Il 25/25 della
+s.43 era fortuna. Due dei fermi con assert del PM, entrambi `stopd @0x15B0`
+con registri identici (r14 = 0x10695C80).
+
+**La frequenza dipende dallo stato della macchina, non dalle variabili.**
+Stesso binario (con la nuova diagnostica, spenta): 6/20 fermi alle 17-18;
+poco dopo 0/10. `SPU_ASSERT_DMA=1` aveva dato 0/30 (sembrava che nascondesse
+gli stalli: con il carico non li nasconde, 4/6). Morale: confronti A/B solo
+alternati e nello stesso lotto; `lotto.sh` ora scrive il carico medio a fine corsa.
+
+**Riproduttore:** `scratchpad/misura/stress_lotto.sh 8 <n> <pref> [VAR=..]`
+(8 cicli occupati sulla CPU, carico ~15-25): fermi 2/8 e 4/6, assert del PM
+in 3 corse su 8 (senza carico ~1 su 70). Assert viste sotto carico: @0x1654
+(il tipo A della s.43, comando 0x1008EB00), @0x15B0, @0x15B4, @0x1640,
+@0x423C e @0x8218 (overlay 217/218). Una famiglia di corse, non un bug solo.
+
+**Il comando 0x1008EB00 non viene da SPURS:** LS 0xD00 e' la copia della riga
+di intestazione della job list (GET 0x80, `pc 0x2558`), la cui prima parola
+e' l'EA del PM. Il PM legge i comandi a 8 byte da LS 0xC00 saltando gli zeri
+(`0x1BDC`: `brz r16`); con una lista comandi vuota/senza terminatore cammina
+fino a 0xD00 e decodifica 0x1008EB00 come kRunJob ((f>>9)&7 = 5) -> r21 = 0 ->
+assert @0x1654. Cioe': il job aveva una lista comandi vuota.
+
+**Diagnostica nuova `SPU_ASSERT_DMA=1`** (spu_dma.h, spu_channels.c): per lane,
+gli ultimi 24 GET/GETLLAR del PM (immagine 2); all'assert li stampa (`[adma]`)
+col confronto LS vs memoria di ORA e LS 0xC00-0xD1F. Solo le voci della corsa
+corrente (`run=` = contatore globale delle corse PM, `g_spu_adma_run`) hanno
+un confronto sensato: la LS sotto 0x4000 si azzera a ogni corsa.
+Cattura s44sd_6 (@0x15B0, wid 8): GETLLAR della lista 0x10695C80, GET delle
+voci 0x10695D00 = `00400001 20316DF0 00400001 20319800`, GET 0x40 da
+0x20319800 -> LS 0xC00 = `00000000 00000000 00000000 00000001 02000005
+00000000 2050B150 0A40B150 00000131 ...`: **identica alla memoria di adesso**
+(0 byte diversi). Quindi NON e' una lettura di dati non ancora pubblicati:
+il blocco a 0x20319800 e' stabile ma non ha la forma di una lista comandi
+(le liste buone iniziano `00000200 10410100 ...`). Ipotesi: voce della lista
+vecchia (fotogramma precedente) o memoria del job gia' riciclata.
+
+**Tipo B, cattura con FC_PEEK** (s44st8_1): intestazioni delle job list a +0x10
+(u16 per SPU, 0xFFFF = SPU mai agganciata). Tutte le liste hanno le righe
+uguali (`0001 0001`, `0982 0982`, `0050 0050`) tranne **wid 8 (0x10695C80):
+`0050 0050 0001`** -- la riga della SPU 2 e' ferma a 1 mentre le altre sono a
+0x50. E' il minimo che il main aspetta in `func_0074073C` (legge *(r3+4),
+contatori a +0x10+2i). Nello stallo il wid 8 gira ~2.700 volte/s su tutti e
+5 gli spuNum (imask 0x1F) senza trovare lavoro: la SPU 2 non recupera.
+Tutte le assert @0x15B0 (s42_b3_1, s43_fc7, s44ab_3/16, s44sd_6) hanno
+r14 = 0x10695C80: stesso workload.
+
+### Fronte aperto (dopo la sessione 44)
+
+0. Wid 8 (lista 0x10695C80, maxc 5, mai rimosso, a differenza di 12/14/15):
+   perche' la riga SPU 2 resta indietro e perche' il PM trova voci che puntano
+   a blocchi non-comando. Idea da verificare: una lane prelazionata dal
+   sistema (host thread sospeso ms) che riprende dopo che il PPU ha fatto
+   ResetList e riempito di nuovo la lista -- sul ferro una SPU non si ferma
+   mai a meta' corsa. Strumenti: `stress_lotto.sh` + `SPU_ASSERT_DMA=1` +
+   FC_PEEK sulle 10 liste (vedi s44st8_1.sample.peek). Chi scrive
+   0x10695D00+8 e quando (YDKJ_WWATCH sul lato PPU)?
+1. RPCS3 (oracolo): come il suo kernel SPURS sceglie lo spuNum per un
+   workload con maxc 5, e se una SPU puo' agganciarsi alla lista una volta
+   sola e poi non tornarci.
+2. Resto del fronte della s.43 invariato.
 
 ## Sessione 43 — l'audio gracchiava: l'indice di lettura era un contatore, non lo slot dell'anello
 

@@ -244,6 +244,53 @@ static inline void spu_wring_note(spu_context* spu, const char* kind, uint32_t e
               p += snprintf(w->who + p, sizeof w->who - p, "%s%.40s+0x%lx", p ? " < " : "", di.dli_sname, (unsigned long)((char*)fr[i] - (char*)di.dli_saddr)); } }
 #endif
 }
+/* SPU_ASSERT_DMA=1 (s.44): per lane (thread host), gli ultimi GET/GETLLAR del
+ * policy module WwsJob (immagine 2). spu_stop_at li stampa all'assert e
+ * confronta la copia in LS con la memoria guest di ADESSO: una copia diversa
+ * dalla memoria vuol dire dati vecchi o non ancora pubblicati quando il PM li
+ * ha letti (stallo tipo A: comando 0x1008EB00 letto a LS 0xD00). */
+enum { SPU_ADMA_N = 24 };
+typedef struct { uint32_t lsa, ea, size, cmd, pc; unsigned run; } spu_adma_ent;
+static SPU_THREAD_LOCAL spu_adma_ent s_adma[SPU_ADMA_N];
+static SPU_THREAD_LOCAL unsigned s_adma_n;
+static int s_adma_on = -1;
+extern volatile unsigned long g_spu_adma_run;   /* corse del PM, spurs_policy.c */
+static inline void spu_adma_note(spu_context* spu, uint32_t cmd, uint32_t lsa, uint32_t ea, uint32_t size)
+{
+    if (s_adma_on < 0) s_adma_on = getenv("SPU_ASSERT_DMA") ? 1 : 0;
+    if (!s_adma_on || spu->image_id != 2) return;
+    spu_adma_ent* e = &s_adma[s_adma_n++ % SPU_ADMA_N];
+    e->lsa = lsa & SPU_LS_MASK; e->ea = ea; e->size = size; e->cmd = cmd;
+    e->pc = (uint32_t)spu->pc & SPU_LS_MASK; e->run = (unsigned)g_spu_adma_run;
+}
+static inline void spu_adma_dump(spu_context* spu)
+{
+    if (s_adma_on != 1) return;
+    extern uint8_t* vm_base;
+    unsigned n = s_adma_n < SPU_ADMA_N ? s_adma_n : SPU_ADMA_N;
+    char b[4096]; int p = 0;
+    p += snprintf(b + p, sizeof b - p, "[adma] ultimi %u GET del PM su questa lane (corsa PM ora %lu):\n",
+                  n, (unsigned long)g_spu_adma_run);
+    for (unsigned i = s_adma_n - n; i < s_adma_n && p < (int)sizeof b - 160; i++) {
+        spu_adma_ent* e = &s_adma[i % SPU_ADMA_N];
+        uint32_t sz = e->size, nd = 0, first = ~0u;
+        if (e->lsa + sz > SPU_LS_SIZE) sz = SPU_LS_SIZE - e->lsa;
+        for (uint32_t k = 0; k < sz; k++)
+            if (spu->ls[e->lsa + k] != vm_base[e->ea + k]) { if (first == ~0u) first = k; nd++; }
+        p += snprintf(b + p, sizeof b - p, "[adma]   run=%u pc=0x%05X cmd=0x%02X lsa=0x%05X ea=0x%08X size=0x%X  LS!=mem ora: %u byte",
+                      e->run, e->pc, e->cmd, e->lsa, e->ea, e->size, nd);
+        if (nd) p += snprintf(b + p, sizeof b - p, " (primo a +0x%X: LS %02X mem %02X)", first,
+                              spu->ls[e->lsa + first], vm_base[e->ea + first]);
+        p += snprintf(b + p, sizeof b - p, "\n");
+    }
+    for (uint32_t a = 0xC00; a < 0xD20 && p < (int)sizeof b - 80; a += 32) {
+        p += snprintf(b + p, sizeof b - p, "[adma]   LS %05X:", a);
+        for (uint32_t k = 0; k < 32; k += 4)
+            p += snprintf(b + p, sizeof b - p, " %02X%02X%02X%02X", spu->ls[a+k], spu->ls[a+k+1], spu->ls[a+k+2], spu->ls[a+k+3]);
+        p += snprintf(b + p, sizeof b - p, "\n");
+    }
+    fputs(b, stderr); fflush(stderr);
+}
 static inline void spu_wring_dump(void)
 {
     if (!spu_wring_on()) return;
@@ -1493,6 +1540,7 @@ static inline int mfc_submit(mfc_engine* mfc, spu_context* spu, uint32_t cmd)
                                   ea & 0xFFFFFFFF00000000ull, size, cmd);
     } else {
         rc = mfc_do_transfer(spu, lsa, ea, size, cmd);
+        if (rc == 0 && mfc_is_get(cmd)) spu_adma_note(spu, cmd, lsa, (uint32_t)ea, size);
     }
 
     /* wwsjob batch-fetch probe: the claim path GETs the batch's command data
