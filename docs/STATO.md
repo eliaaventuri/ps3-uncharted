@@ -803,7 +803,7 @@ s27-s39), `iterate.log`, `shot.log`, `uncharted.s37`, `recomp.bak`,
 `recomp.bak_s35`, `recomp.bak_s36`, e in `obj/`: `o1_backup`, `o2_s35_backup`,
 `o2_s36_backup`, `spu_s35_backup`, `spu_s36_neon`. I backup citati sopra (s35/s36)
 non esistono piu': per tornare indietro si rifa' il lift da git.
-## Calore: pausa nell'attesa del PPU (branch `ppu-spin-backoff`, 24/09/2026, DA MISURARE)
+## Calore: pausa nell'attesa del PPU (24/09/2026): -10% di CPU per fotogramma, -0,4 core
 
 Misura di partenza con `scratchpad/misura/cpufoto.sh` (letta sulla corsa
 s44ad_18, SPU_ASSERT_DMA=1, 30 s nel livello): **271 ms di CPU per
@@ -819,8 +819,22 @@ vuoto, poi `sched_yield`, poi `nanosleep` 20-50 us; un'attesa nuova dopo
 una pausa > 200 us. `PPU_SPIN_BACKOFF=0` lo spegne (A/B con lo STESSO
 binario). Verificato senza gioco: il lift cambia solo `func_0074232C`
 (26.650 funzioni confrontate), `ppu_loader.cpp` e il chunk compilano.
-Da fare a macchina libera: build del branch, poi `cpufoto.sh` 3 corse con
-e 3 con `PPU_SPIN_BACKOFF=0`; criterio: meno ms CPU/fotogramma a fps pari.
+**Misurato (sera del 24/09, macchina libera)**, stesso binario, alternate,
+`cpufoto.sh 90` (30 s nel livello), 4+4 corse:
+- `PPU_SPIN_BACKOFF=0`: 241/249/263/235 ms CPU/fotogramma (media 247), core
+  6,38-6,51, 26,2 fps; thread PPU 33-37 ms/fotogramma.
+- con la pausa: 234/212/230/210 (media 222), core 5,96-6,08, 27,3 fps;
+  thread PPU 18 ms/fotogramma.
+Le due serie di core non si sovrappongono. Nessun HALT/assert nei log. Il
+lift installato in uncharted-data/recomp ha la pausa (solo
+ppu_recomp_005.cpp e ppu_recomp.h cambiati, una riga di codice).
+`cpufoto.sh` ora stampa anche i ms CPU/fotogramma per thread (indice nella
+lista di `ps -M`): 7 thread pesanti = PPU + 6 lane SPU (~30 ms ciascuno),
+poi il ticker (~18). Profilo per thread (sample, 10 s nel livello): le lane
+passano ~65% nel codice dei job, ~10% a interrogare nel policy module, ~21%
+ferme; il ticker ha `getenv` nel cammino caldo (`__findenv_locked`, 8% del
+thread). Prossimi bersagli per il calore: l'interrogazione del policy module
+nelle lane e quel getenv.
 
 ## Storico
 

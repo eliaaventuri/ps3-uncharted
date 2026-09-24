@@ -21,19 +21,26 @@ cpu() { ps -o cputime= -p "$pid" | python3 -c "
 import sys; p=sys.stdin.read().strip().split(':'); s=0.0
 for x in p: s=s*60+float(x)
 print(s)"; }
+# tempo CPU (s) di ogni thread, in ordine di lista (stabile a livello caricato)
+thr() { ps -M -p "$pid" | awk 'NR>1 {t=0; for(i=NF-1;i<=NF;i++){n=split($i,a,":"); v=0; for(j=1;j<=n;j++) v=v*60+a[j]; t+=v}; printf "%s ", t}'; }
 frame() { grep -a -oE "fotogramma #[0-9]+:" "$D/$log" | tail -1 | grep -oE "[0-9]+"; }
 
 sleep $((t0 - 3))
-c0=$(cpu); f0=$(frame); w0=$(python3 -c 'import time; print(time.time())')
+c0=$(cpu); t0s=$(thr); f0=$(frame); w0=$(python3 -c 'import time; print(time.time())')
 sleep $((secs - t0))
-c1=$(cpu); f1=$(frame); w1=$(python3 -c 'import time; print(time.time())')
+c1=$(cpu); t1s=$(thr); f1=$(frame); w1=$(python3 -c 'import time; print(time.time())')
 pkill -9 -f "uncharted-data/uncharted"; sleep 1
 
-python3 - "$c0" "$c1" "${f0:-0}" "${f1:-0}" "$w0" "$w1" "$log" <<'EOF'
+python3 - "$c0" "$c1" "${f0:-0}" "${f1:-0}" "$w0" "$w1" "$log" "$t0s" "$t1s" <<'EOF'
 import sys
 c0,c1,f0,f1,w0,w1=map(float,sys.argv[1:7]); log=sys.argv[7]
+ta=[float(x) for x in sys.argv[8].split()]; tb=[float(x) for x in sys.argv[9].split()]
 fr=f1-f0; wall=w1-w0; cpu=c1-c0
 if fr <= 0: print(f"{log}: nessun fotogramma nella finestra (#{int(f0)} -> #{int(f1)})"); sys.exit()
 print(f"{log}: {cpu*1000/fr:.0f} ms CPU/fotogramma, {cpu/wall:.2f} core medi, "
       f"{fr/wall:.1f} fps, fotogrammi #{int(f0)}-#{int(f1)}")
+# per thread (ms CPU/fotogramma, i 9 piu' pesanti): lane SPU, PPU, ticker...
+if ta and tb:  # un thread nato o finito nella finestra: zip tronca, gli indici bassi restano allineati
+    d = sorted(((i, (b - a) * 1000 / fr) for i, (a, b) in enumerate(zip(ta, tb))), key=lambda x: -x[1])[:9]
+    print("   thread (indice:ms/fotogramma): " + " ".join(f"{i}:{x:.0f}" for i, x in d))
 EOF
