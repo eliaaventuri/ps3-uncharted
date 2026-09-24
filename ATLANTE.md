@@ -68,6 +68,7 @@ scratchpad/misura/           fps.sh/fpsmed.sh (fps da RSX_FRAMESTAT), tl*.py (ti
 tools/lldb_guest_bp.py       breakpoint lldb sui func_XXXX del port vivo (r3-r5, f1, catena)
 tools/stallcatch.sh          corsa Uncharted che campiona il processo se il caricamento si ferma
 tests/                       torture e conformance del runtime
+uncharted/                   ricetta del port nel repo: prepare.sh (analisi+lift PPU+NID+immagini SPU), relift_spu.sh, build.sh, run.sh, runfor.sh, iterate.sh, extra_targets.txt; dati in ../uncharted-data (UNCHARTED_DATA)
 lbp/, wave/                  altri port (riferimento, non toccare)
 fw_spu/                      job/prx firmware liftati (audio, sre)
 tasks/                       TASK.md / RESULT.md per i worker

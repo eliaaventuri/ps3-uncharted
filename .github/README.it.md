@@ -132,8 +132,8 @@ cmake --build build                                  # compila runtime e strumen
 
 Questo compila il runtime e gli strumenti. **Nel repository non c'è nessun file
 del gioco**, e non ci sarà mai: per costruire il gioco vero serve il proprio
-disco e il suo eseguibile decifrato. Gli script che compilano e avviano il gioco
-non fanno ancora parte del repository.
+disco e il suo eseguibile decifrato. La ricetta passo per passo che trasforma la
+propria copia nell'app per Mac è in [`uncharted/`](../uncharted/README.md) (in inglese).
 
 ## Mappa del repository
 
@@ -145,6 +145,7 @@ non fanno ancora parte del repository.
 | `libs/` | Librerie di sistema Sony: grafica, audio, input, salvataggi, video… |
 | `libs/video/rsx_metal_backend.m` | Il renderer Metal |
 | `runtime/host/`, `runtime/platform/` | Finestra, compatibilità macOS e Windows |
+| `uncharted/` | Gli script che compilano e avviano il gioco dalla propria copia |
 | `tools/` | Lifter PPU e SPU, strumenti di analisi |
 | `docs/` | Documentazione tecnica; `STATO.md` è il diario di lavoro |
 

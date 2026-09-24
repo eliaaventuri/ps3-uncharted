@@ -712,6 +712,23 @@ PS3_HLE_INJECT_BASE=0x50000000 PS3_VFS_ROOT=/tmp/uc_iso \
 La tabella NID è **per-port**: `ppu_hle_register_all()` nel runtime è weak e
 vuota, e senza `tools/gen_hle_nids.py --all` ogni import resta non risolto.
 
+**Dal 24/09/2026 la ricetta completa sta anche nel repo, in `uncharted/`**
+(`prepare.sh` nuovo; `relift_spu.sh`, `build.sh`, `run.sh`, `runfor.sh`,
+`iterate.sh` copiati da uncharted-data con i percorsi relativi al repo,
+`UNCHARTED_DATA` per spostare la cartella dati). Verificato rigenerando in una
+cartella a parte: analisi dell'ELF, ingressi indiretti, immagine SPU e policy
+module (`wrap_spu_elf.py --entry 0xa00 --base 0xa00` sul dump
+`spu_dump/spu_pm_1008EB00_12160.bin`) **identici byte per byte**; il lift PPU
+da' le stesse 26.650 funzioni, corpi uguali tranne 2 al confine fra chunk
+(func_001B156C, func_001B18DC: i commenti coi nomi spostano i confini).
+`names.json` rigenerato ha 1.741 voci contro 1.772 (solo commenti). La tabella
+NID rigenerata ha dichiarazioni in piu' rispetto a quella in uncharted-data
+(cellGcm_gpu_idle, cellGcm_note_park_put, ...): quella di lavoro e' vecchia.
+NON provati: `relift_spu.sh` e `build.sh` della copia nel repo (compilazione
+pesante, c'era una serie di corse in parallelo). Gli script in uncharted-data
+sono ancora gli originali: le due copie vanno tenute allineate o sostituite
+da un rimando.
+
 ## Pulizia uncharted-data (23/09/2026)
 
 Cartella `uncharted-data` 40 GB -> 1,0 GB. Cancellati: 930 `run_*.log` (37,5 GB,

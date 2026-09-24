@@ -130,8 +130,8 @@ cmake --build build                                  # build the runtime and too
 
 This builds the runtime and the tools. **No game files are included** in this
 repository, and none ever will be: to build the actual game you need your own
-disc and its decrypted executable. The scripts that build and launch the game
-itself are not part of the repository yet.
+disc and its decrypted executable. The step-by-step recipe that turns your copy
+into the Mac app is in [`uncharted/`](../uncharted/README.md).
 
 ## Repository map
 
@@ -143,6 +143,7 @@ itself are not part of the repository yet.
 | `libs/` | Sony system libraries: graphics, audio, input, saves, video… |
 | `libs/video/rsx_metal_backend.m` | The Metal renderer |
 | `runtime/host/`, `runtime/platform/` | Window, macOS and Windows compatibility |
+| `uncharted/` | Scripts that build and launch the game from your own copy |
 | `tools/` | PPU and SPU lifters, analysis tools |
 | `docs/` | Technical docs; `STATO.md` is the work diary |
 
