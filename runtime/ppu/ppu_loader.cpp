@@ -2473,7 +2473,8 @@ extern "C" void lv2_syscall(ppu_context* ctx)
      * callsite (lr) in the runtime-side thread info. cia itself is the thread
      * entry OPD (load-bearing for the entry trampoline) -- do not touch it. */
     ppu_prof_stamp(ctx, ppu_prof_resolve_host(__builtin_return_address(0)));
-    if (getenv("YDKJ_SCTRACE"))
+    static int s_sctrace = -1; if (s_sctrace < 0) s_sctrace = getenv("YDKJ_SCTRACE") ? 1 : 0;
+    if (s_sctrace)
         fprintf(stderr, "[sc] %llu r3=%08X r4=%08X r5=%08X r6=%08X\n",
                 (unsigned long long)num, (uint32_t)ctx->gpr[3], (uint32_t)ctx->gpr[4],
                 (uint32_t)ctx->gpr[5], (uint32_t)ctx->gpr[6]);
@@ -2675,7 +2676,8 @@ extern "C" void lv2_syscall(ppu_context* ctx)
          * rwlock / event / timer / memory / vm / fs / spu). Initialised by
          * lv2_init_syscalls() at boot. Unregistered numbers fall through to the
          * return-0 stub below (which is what got the CRT this far). */
-        if (getenv("YDKJ_BLOCKTRACE")) {
+        static int s_blocktrace = -1; if (s_blocktrace < 0) s_blocktrace = getenv("YDKJ_BLOCKTRACE") ? 1 : 0;
+        if (s_blocktrace) {
             static ULONGLONG s_acc[1024]={0}; static uint32_t s_cnt[1024]={0}; static ULONGLONG s_win=0;
             uint32_t _a3=(uint32_t)ctx->gpr[3], _a4=(uint32_t)ctx->gpr[4], _a5=(uint32_t)ctx->gpr[5];
             ULONGLONG _t0 = GetTickCount64();

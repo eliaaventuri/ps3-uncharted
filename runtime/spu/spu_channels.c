@@ -240,8 +240,8 @@ int spu_run_with_halt(void (*entry)(spu_context*), spu_context* ctx)
          * halts (stop -> longjmp) or the trampoline empties. Nested brsl/bisl
          * calls drain inside their own call brackets (see the lifter). */
         entry(ctx);
-        { static int _e = 0;
-          if (getenv("SPU_ARGWATCH") && _e < 8) { _e++;
+        { static int _e = 0, _on = -1; if (_on < 0) _on = getenv("SPU_ARGWATCH") ? 1 : 0;
+          if (_on && _e < 8) { _e++;
               fprintf(stderr, "[argwatch] after entry(): img=%d pc=0x%05X "
                       "r2=0x%08X r3=0x%08X r4=0x%08X\n", ctx->image_id,
                       (uint32_t)ctx->pc & SPU_LS_MASK, ctx->gpr[2]._u32[0],

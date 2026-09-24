@@ -1726,7 +1726,8 @@ static void gcm_rsx_process_fifo_unlocked(void)
     { static unsigned _n = 0; static unsigned long long _t0 = 0;
       extern unsigned long long ps3_ms_now(void);
       _n++;
-      if (getenv("GCM_RATE")) {
+      static int s_rate = -1; if (s_rate < 0) s_rate = getenv("GCM_RATE") ? 1 : 0;
+      if (s_rate) {
           unsigned long long now = ps3_ms_now();
           if (_t0 == 0) _t0 = now;
           if (now - _t0 >= 2000) {
@@ -1761,7 +1762,8 @@ static void gcm_rsx_process_fifo_unlocked(void)
      * writes its waits spin on) silently never executed. */
     u32 put = vm_read32(GCM_CONTROL_GUEST_ADDR + 0);
 
-    if (getenv("GCM_DRAINDBG")) {
+    static int s_draindbg = -1; if (s_draindbg < 0) s_draindbg = getenv("GCM_DRAINDBG") ? 1 : 0;
+    if (s_draindbg) {
         static int n = 0;
         if (n++ % 60 == 0)
             printf("[DRAIN] getoff=%08X put=%08X ref=%08X ctx.current=%08X\n",
@@ -1774,7 +1776,8 @@ static void gcm_rsx_process_fifo_unlocked(void)
      * two very different causes -- we missed the command, or it was never
      * submitted -- and only a direct scan of the ring separates them. */
     { static int scanned = 0;
-      if (!scanned && getenv("GCM_SCANREF") && put >= 0x19F0) { scanned = 1;
+      static int s_scanref = -1; if (s_scanref < 0) s_scanref = getenv("GCM_SCANREF") ? 1 : 0;
+      if (!scanned && s_scanref && put >= 0x19F0) { scanned = 1;
         unsigned found = 0;
         for (u32 io = 0; io + 8 <= put; io += 4) {
             u32 ea = gcm_io2ea(io); if (!ea) continue;

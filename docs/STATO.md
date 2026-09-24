@@ -836,6 +836,16 @@ ferme; il ticker ha `getenv` nel cammino caldo (`__findenv_locked`, 8% del
 thread). Prossimi bersagli per il calore: l'interrogazione del policy module
 nelle lane e quel getenv.
 
+**getenv nei cammini caldi tolto** (stessa sera): 12 siti che leggevano una
+variabile d'ambiente a ogni chiamata (rsx_commands.c: RSX_REPORT_DBG,
+LOAD_DBG, SEQ_DBG x2, MVPDBG; cellGcmSys.c: GCM_RATE, GCM_DRAINDBG,
+GCM_SCANREF; spu_channels.c: SPU_ARGWATCH in spu_run_with_halt; ppu_hle.cpp
+e lv2_register.c: YDKJ_GFXSCAN; ppu_loader.cpp: YDKJ_SCTRACE,
+YDKJ_BLOCKTRACE) ora la leggono una volta (static, stesso pattern degli
+altri). `sample` 10 s nel livello: campioni in getenv 350 -> 3 (~1,3% della
+CPU del processo). Troppo poco per cpufoto (rumore +-10%): verificato solo col
+profilo e con una corsa normale (fotogramma #3661 a 80 s, nessun assert).
+
 ## Storico
 
 Sessioni fino alla 37 e la vecchia "Dove siamo", verbatim, in

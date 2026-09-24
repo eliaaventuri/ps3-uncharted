@@ -1710,7 +1710,8 @@ int lv2_try_syscall(ppu_context* ctx)
               fprintf(stderr, "[lv2err] syscall %u(r3=0x%08X r4=0x%08X r5=0x%08X)"
                               " -> 0x%08X lr=0x%08X%c",
                       num, _a3, _a4, _a5, (uint32_t)ctx->gpr[3], (uint32_t)ctx->lr, 10); } } }
-    if (getenv("YDKJ_GFXSCAN") && num >= 128 && num <= 141) {
+    static int s_gfxscan = -1; if (s_gfxscan < 0) s_gfxscan = getenv("YDKJ_GFXSCAN") ? 1 : 0;
+    if (s_gfxscan && num >= 128 && num <= 141) {
         static int _e = 0; if (_e++ < 60)
             fprintf(stderr, "[EVT-SC] #%u(r3=0x%08X r4=0x%08X r5=0x%08X) -> 0x%08X lr=0x%08X\n",
                     num, _a3, _a4, _a5, (uint32_t)ctx->gpr[3], (uint32_t)ctx->lr);

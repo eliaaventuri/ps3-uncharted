@@ -237,7 +237,7 @@ extern "C" void ps3_hle_call(uint32_t nid, ppu_context* ctx)
     ppu_prof_stamp(ctx, ppu_prof_resolve_host(__builtin_return_address(0)));
     g_last_hle_nid = nid;
     /* GFX-SCAN: is the menu .gfx ever inflated into guest RAM? (magic 'GFX'=47 46 58) */
-    { static long _c=0; if(getenv("YDKJ_GFXSCAN") && (++_c % 200000)==0){ extern uint8_t* vm_base;
+    { static long _c=0; static int _on=-1; if(_on<0) _on = getenv("YDKJ_GFXSCAN") ? 1 : 0; if(_on && (++_c % 200000)==0){ extern uint8_t* vm_base;
         int gfx=0,cfx=0,swf=0,dds=0,png=0; for(uint32_t a=0x10000; a<0x0FF00000u; a++){
           uint8_t m0=vm_base[a],m1=vm_base[a+1],m2=vm_base[a+2],vv=vm_base[a+3];
           /* uncompressed GFx: 'GFX'/'GFC' ver 4..20 */
