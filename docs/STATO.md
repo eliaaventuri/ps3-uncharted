@@ -803,6 +803,25 @@ s27-s39), `iterate.log`, `shot.log`, `uncharted.s37`, `recomp.bak`,
 `recomp.bak_s35`, `recomp.bak_s36`, e in `obj/`: `o1_backup`, `o2_s35_backup`,
 `o2_s36_backup`, `spu_s35_backup`, `spu_s36_neon`. I backup citati sopra (s35/s36)
 non esistono piu': per tornare indietro si rifa' il lift da git.
+## Calore: pausa nell'attesa del PPU (branch `ppu-spin-backoff`, 24/09/2026, DA MISURARE)
+
+Misura di partenza con `scratchpad/misura/cpufoto.sh` (letta sulla corsa
+s44ad_18, SPU_ASSERT_DMA=1, 30 s nel livello): **271 ms di CPU per
+fotogramma, 6,52 core, 24,1 fps**. Gli fps sono al tetto del vsync, quindi
+il numero da far scendere e' questo, non gli fps.
+
+Il main thread aspetta i ticket dei job SPU girando in `func_0074232C`
+(ciclo a `loc_00742388` che richiama `func_007428C0`): 61% del suo tempo
+(s.42). Il rilevatore di spin in `vm_read32` non lo vede (ogni giro legge
+indirizzi diversi). Nuovo: `ppu_lifter.py --spin-backoff 0x742388` mette
+`ppu_spin_backoff()` sul salto all'indietro; in `ppu_loader.cpp` 64 giri a
+vuoto, poi `sched_yield`, poi `nanosleep` 20-50 us; un'attesa nuova dopo
+una pausa > 200 us. `PPU_SPIN_BACKOFF=0` lo spegne (A/B con lo STESSO
+binario). Verificato senza gioco: il lift cambia solo `func_0074232C`
+(26.650 funzioni confrontate), `ppu_loader.cpp` e il chunk compilano.
+Da fare a macchina libera: build del branch, poi `cpufoto.sh` 3 corse con
+e 3 con `PPU_SPIN_BACKOFF=0`; criterio: meno ms CPU/fotogramma a fps pari.
+
 ## Storico
 
 Sessioni fino alla 37 e la vecchia "Dove siamo", verbatim, in

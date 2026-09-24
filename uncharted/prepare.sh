@@ -28,11 +28,14 @@ echo "== ingressi indiretti =="
     --functions analysis/EBOOT.functions.json -o analysis/names.json > /dev/null
 
 echo "== lift PPU (~12 s) =="
+# --spin-backoff 0x742388: il main thread aspetta i ticket dei job SPU in un
+# ciclo (func_0074232C); con la pausa dorme invece di bruciare un core.
 rm -rf recomp
 "$PY" "$R/tools/ppu_lifter.py" EBOOT.elf \
     --functions analysis/EBOOT.functions.json \
     --hle-stubs analysis/EBOOT.imports.json \
-    --names analysis/names.json --toc 0x7d3190 -o recomp
+    --names analysis/names.json --toc 0x7d3190 \
+    --spin-backoff 0x742388 -o recomp
 
 echo "== tabella NID =="
 (cd "$R" && "$PY" tools/gen_hle_nids.py --all --out "$D/gen/ppu_hle_nids.cpp")

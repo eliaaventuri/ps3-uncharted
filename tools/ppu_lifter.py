@@ -170,6 +170,8 @@ void     vm_write64(uint64_t addr, uint64_t val);
  * YDKJ_WWATCH perche' sono memcpy diretti. */
 extern uint32_t g_vwatch_lo, g_vwatch_hi;
 void     ppu_vwatch_hit(uint32_t ea, const void* v, uint32_t insn_addr);
+/* Pausa crescente sui cicli di attesa indicati con --spin-backoff (ppu_loader.cpp). */
+void     ppu_spin_backoff(void);
 /* stwcx./stdcx. store-conditional: atomically store `val` at `addr` iff the raw
  * big-endian guest word still equals `expected` (the value the paired lwarx/ldarx
  * loaded). Returns 1 if the reservation held (store applied), 0 otherwise. This
@@ -578,6 +580,9 @@ class PPULifter:
         # `.lib.stub` trampoline (which derefs an import pointer table the recomp
         # never populates -> bctrl to garbage). Populated from --hle-stubs.
         self.hle_stub_nids: dict[int, int] = {}
+        # --spin-backoff: teste dei cicli di attesa; il salto all'indietro verso
+        # una di queste chiama ppu_spin_backoff() prima del goto.
+        self.spin_backoff: set[int] = set()
         # Module primary TOC (r2). Set by main() only when the ELF yields exactly
         # one TOC candidate; enables the `ld r2, N(r1)` restore lowering below.
         self.toc_base: int = 0
@@ -1412,6 +1417,8 @@ class PPULifter:
                     self.branch_targets.add(tgt)
                     return f"{{ g_trampoline_fn = (void(*)(void*)){self.prefix}func_{tgt:08X}; return; }}"
                 if func.start_addr <= tgt < func.end_addr:
+                    if tgt in self.spin_backoff and tgt <= insn.addr:
+                        return f"{{ ppu_spin_backoff(); goto loc_{tgt:08X}; }}"
                     return f"goto loc_{tgt:08X};"
                 elif self._outside_code(tgt):
                     # Target is outside the executable window -> data misread as
@@ -1493,6 +1500,8 @@ class PPULifter:
                             f"(void(*)(void*)){self.prefix}func_{tgt:08X}; return; }}")
                 if func.start_addr <= tgt < func.end_addr:
                     cond = self._branch_condition(mn, ops)
+                    if tgt in self.spin_backoff and tgt <= insn.addr:
+                        return f"if ({cond}) {{ ppu_spin_backoff(); goto loc_{tgt:08X}; }}"
                     return f"if ({cond}) goto loc_{tgt:08X};"
                 elif self._outside_code(tgt):
                     # Conditional branch to non-code: data misread as code.
@@ -3803,8 +3812,9 @@ _WORKER_STATE: dict = {}
 
 def _worker_init(segs, big_endian, name_map, prefix, hle_stub_nids=None,
                  function_entries=None, code_lo=0, code_hi=None, jump_tables=None,
-                 toc_base=0):
+                 toc_base=0, spin_backoff=None):
     _WORKER_STATE["segs"] = segs
+    _WORKER_STATE["spin_backoff"] = spin_backoff or set()
     _WORKER_STATE["be"] = big_endian
     _WORKER_STATE["names"] = name_map
     _WORKER_STATE["prefix"] = prefix
@@ -3833,6 +3843,7 @@ def _worker_lift(task):
     lifter.code_hi = _WORKER_STATE.get("code_hi", None)
     lifter.jump_tables = _WORKER_STATE.get("jump_tables", {})
     lifter.toc_base = _WORKER_STATE.get("toc_base", 0)
+    lifter.spin_backoff = _WORKER_STATE.get("spin_backoff", set())
     results = []
     for start, end in bounds:
         blob = b""
@@ -3867,7 +3878,7 @@ def _parallel_lift(lifter, func_bounds, segs, big_endian, jobs):
                    initargs=(segs, big_endian, lifter.name_map, lifter.prefix,
                              lifter.hle_stub_nids, lifter.function_entries,
                              lifter.code_lo, lifter.code_hi, lifter.jump_tables,
-                             getattr(lifter, "toc_base", 0)))
+                             getattr(lifter, "toc_base", 0), lifter.spin_backoff))
     try:
         for idx0, results, ct, bt in pool.imap_unordered(_worker_lift, tasks):
             results_by_idx[idx0] = results
@@ -3931,6 +3942,10 @@ def main() -> None:
                         help="Prefix for every emitted func_*/function_table "
                              "symbol (e.g. 'libsre_') so a relocated PRX image "
                              "links alongside the main title without collisions")
+    parser.add_argument("--spin-backoff", default="",
+                        help="Comma-separated loop-head addresses of guest wait loops: "
+                             "the backward branch to each calls ppu_spin_backoff() "
+                             "(sleeps instead of burning a host core).")
     parser.add_argument("--hle-stubs", metavar="FILE", default=None,
                         help="EBOOT.imports.json ([{library,nid,stub}]). Each "
                              "import stub address is lifted as ps3_hle_call(nid) "
@@ -4369,6 +4384,7 @@ def main() -> None:
         lifter.code_lo = min(s for s, _ in func_bounds)
         lifter.code_hi = max(e for _, e in func_bounds)
     lifter.hle_stub_nids = hle_stubs
+    lifter.spin_backoff = {int(a, 16) for a in args.spin_backoff.split(",") if a.strip()}
     lifter.function_entries = _func_entries
     lifter.jump_tables = jt_dispatchers
 

@@ -346,6 +346,7 @@ static void sc_trace(uint64_t num, ppu_context* ctx, uint64_t a3, uint64_t a4,
 #include <stdlib.h>
 #ifndef _WIN32
 #include <unistd.h>   /* _exit: uscire da un trap senza gli atexit */
+#include <sched.h>    /* sched_yield: ppu_spin_backoff */
 #endif
 #include <string.h>
 
@@ -783,6 +784,34 @@ static int vm_fast_init(void)
 struct vm_spin_tls { uint32_t last, n; };
 extern "C" vm_spin_tls g_vm_spin;
 vm_spin_tls g_vm_spin;
+
+/* PPU_SPIN_BACKOFF (24/09/2026): chiamata dal codice liftato sul salto
+ * all'indietro dei cicli di attesa indicati al lifter (--spin-backoff). Il
+ * main thread di Uncharted passa il 61% del tempo a interrogare il ticket di
+ * un job SPU (func_0074232C -> func_007428C0, s.42): sul Cell la PPU gira a
+ * vuoto, qui e' un core pieno di calore. Il rilevatore di vm_read32 non lo
+ * vede (ogni giro legge indirizzi diversi). Prima si insiste (64 giri), poi si
+ * cede il processore, poi si dorme 20-50 us: niente rispetto ai 33 ms di un
+ * fotogramma. Un'attesa nuova e' riconosciuta da una pausa > 200 us fra due
+ * chiamate. PPU_SPIN_BACKOFF=0 lo spegne (A/B). */
+extern "C" void ppu_spin_backoff(void) {
+    static int s_on = -1;
+    if (__builtin_expect(s_on < 0, 0)) { const char* e = getenv("PPU_SPIN_BACKOFF"); s_on = !(e && *e == '0'); }
+    if (!s_on) return;
+#ifdef _WIN32
+    YieldProcessor();
+#else
+    static PPU_THREAD_LOCAL unsigned long long s_last = 0;
+    static PPU_THREAD_LOCAL uint32_t s_n = 0;
+    const unsigned long long now = ps3__mono_ns();
+    if (now - s_last > 200000ull) s_n = 0;
+    const uint32_t n = ++s_n;
+    if (n <= 64) YieldProcessor();
+    else if (n <= 256) sched_yield();
+    else { struct timespec ts = { 0, n <= 1024 ? 20000L : 50000L }; nanosleep(&ts, NULL); }
+    s_last = ps3__mono_ns();
+#endif
+}
 uint8_t  vm_read8 (uint64_t a) { if (__builtin_expect(g_vm_fast > 0, 1)) { const uint32_t ua = (uint32_t)a; return vm_oob(ua, 1) ? 0 : vm_base[ua]; }
     if (g_vm_fast < 0) g_vm_fast = vm_fast_init();
     if (vm_oob((uint32_t)a,1)) return 0; vm_hotmap((uint32_t)a,1);
