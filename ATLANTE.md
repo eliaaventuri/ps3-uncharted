@@ -11,6 +11,7 @@ CLAUDE.md                 regole del fork; docs/STATO.md e' la memoria operativa
 .github/README.md         README mostrato su GitHub, in inglese (quello di upstream resta README.md)
 .github/README.it.md      la stessa presentazione in italiano
 docs/STATO.md             stato, misure, fallimenti — leggere a ogni avvio
+docs/STATO_STORICO.md     sessioni fino alla 37 e vecchio "Dove siamo", verbatim (indice in fondo a STATO.md)
 docs/PPU_RECOMP.md        numeri del lift PPU (entry, TOC, import)
 docs/SPU_LIFTER.md        come funziona il lifter SPU
 docs/RSX_GRAPHICS.md      backend RSX, FIFO, Metal
