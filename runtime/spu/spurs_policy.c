@@ -189,13 +189,18 @@ int spu_run_policy_module(spu_lifted_entry_fn entry, int image_id,
          * SPURS_PM_FRESH_LS=<hex> cambia la soglia (0x40000 = tutto). */
         static long s_fresh_ls = -1;
         if (s_fresh_ls < 0) { const char* e = getenv("SPURS_PM_FRESH_LS"); s_fresh_ls = e ? strtol(e, 0, 16) : 0x4000; }
-        if (s_fresh_ls >= SPU_LS_SIZE) memset(ctx, 0, sizeof(*ctx));
+        /* spu_context_init azzera TUTTO il contesto: chiamata qui dopo
+         * l'azzeramento parziale lo annullava (s.44: bzero ancora al 3,5% delle
+         * lane). Nel ramo parziale si impostano a mano i due campi che
+         * spu_context_init scrive oltre all'azzeramento. */
+        if (s_fresh_ls >= SPU_LS_SIZE) spu_context_init(ctx, 0);
         else {
             memset(ctx, 0, offsetof(spu_context, ls) + (size_t)s_fresh_ls);
             memset((uint8_t*)ctx + offsetof(spu_context, ls) + SPU_LS_SIZE, 0,
                    sizeof(*ctx) - offsetof(spu_context, ls) - SPU_LS_SIZE);
+            ctx->spu_id = 0;
+            ctx->status = SPU_STATUS_STOPPED;
         }
-        spu_context_init(ctx, 0);
     }
     s_pm_data[wid][spu_num] = wkl_data;
     ctx->image_id    = image_id;

@@ -158,6 +158,12 @@ static inline void YieldProcessor(void)
 /* --- timing ------------------------------------------------------------- */
 static inline unsigned long long ps3__mono_ns(void)
 {
+#ifdef __APPLE__
+    /* CLOCK_MONOTONIC su macOS passa da _mach_boottime_usec (gettimeofday):
+     * ~10x piu' lento. UPTIME_RAW = mach_absolute_time in ns, si ferma col
+     * sistema in stop -- qui servono solo intervalli (s.44: 0,7% delle lane). */
+    return clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
+#endif
     struct timespec ts;
     clock_gettime(CLOCK_MONOTONIC, &ts);
     return (unsigned long long)ts.tv_sec * 1000000000ull + (unsigned long long)ts.tv_nsec;

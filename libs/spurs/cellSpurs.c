@@ -1490,6 +1490,9 @@ struct spurs_pm_worker_arg {
 };
 static unsigned long long spurs_ns_now(void)
 {
+#ifdef __APPLE__
+    return clock_gettime_nsec_np(CLOCK_UPTIME_RAW);   /* v. ps3__mono_ns: MONOTONIC e' lento su macOS */
+#endif
     struct timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts);
     return (unsigned long long)ts.tv_sec * 1000000000ull + (unsigned long long)ts.tv_nsec;
 }

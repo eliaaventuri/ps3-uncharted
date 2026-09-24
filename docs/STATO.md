@@ -846,6 +846,23 @@ altri). `sample` 10 s nel livello: campioni in getenv 350 -> 3 (~1,3% della
 CPU del processo). Troppo poco per cpufoto (rumore +-10%): verificato solo col
 profilo e con una corsa normale (fotogramma #3661 a 80 s, nessun assert).
 
+**Azzeramento del policy module davvero parziale + orologio veloce** (stessa
+sera). (1) Con `SPURS_PM_FRESH=1` ogni esecuzione del PM (~10.000/s) azzerava
+256 KB: `spu_context_init` fa `memset` di tutto il contesto, e in
+`spu_run_policy_module` veniva chiamata DOPO l'azzeramento parziale della s.28
+(solo LS 0..0x4000), annullandolo -- dal primo giorno. Ora nel ramo parziale
+si impostano a mano spu_id/status; `SPURS_PM_FRESH_LS=40000` ridà
+l'azzeramento totale (A/B). (2) `ps3__mono_ns` (win32_compat.h) e
+`spurs_ns_now` (cellSpurs.c) su macOS usano `clock_gettime_nsec_np(
+CLOCK_UPTIME_RAW)`: CLOCK_MONOTONIC passa da `_mach_boottime_usec`.
+Profilo 10 s nel livello: `__bzero` 730 -> 55 campioni, `clock_gettime`
+218 -> 29 (~2,8% della CPU del processo). cpufoto A/B (4+4, solo il punto 1):
+218 contro 232 ms/fotogramma, dentro il rumore. **Stabilita': lotto.sh 10
+corse da 160 s, 10/10 OK, 0 assert del PM, fotogrammi a 160 s 6.087-6.399
+(media 6.250; lotti di controllo s44ad/s44pk ~5.970/5.850).** La LS alta del
+PM ora resta sporca fra una corsa e l'altra, come sul ferro: se riappare uno
+stallo del PM, provare prima `SPURS_PM_FRESH_LS=40000`.
+
 ## Storico
 
 Sessioni fino alla 37 e la vecchia "Dove siamo", verbatim, in
