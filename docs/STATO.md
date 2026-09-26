@@ -918,6 +918,38 @@ alternato 7 corse da 160 s (3 nuove + 4 `STRIPES=1`, l'ottava interrotta dal
 riavvio del Mac) tutte OK. I 224 campioni di attesa che restano sono la
 contesa vera sulla riga 0x10184B00 (job 0089df80 `func_000075F0`).
 
+**Trasferimenti SPU e salti indiretti** (sessione 46, 26/09). Profilo (10 s a
+100 s) prima: ~25.000 campioni attivi, di cui `spu_drain_fast` 1.279,
+`spu_indirect_branch` 889, `mfc_do_transfer` 816, `mfc_channel_write` 698,
+`spu_lookup` 550, `spu_wrch` 515. Tre modifiche:
+1. `mfc_do_transfer` (spu_dma.h) ha una via veloce: senza variabili
+   diagnostiche fa solo validazione, memcpy e gli effetti veri (note
+   dell'overlay, report RSX in ritardo, park dei pacchetti, flag cri). Il
+   percorso completo passava ~35 sonde e il rilevatore POISON-DMA scandiva
+   parola per parola OGNI PUT. Malformati/fuori memoria scendono nel percorso
+   completo. A/B: `SPU_DMA_FULL=1`. Campioni 816 -> 110-130.
+2. cache per contesto dei salti indiretti (`ib_cache[256]` in coda a
+   spu_context, chiave pc|immagine<<32|overlay<<48): il registro e' riempito
+   solo all'avvio (boot_main -> spu_register_all), quindi non scade mai.
+   A/B: `SPU_IB_NOCACHE=1`. `spu_lookup` 550 -> ~190 (1.024 voci = stesso
+   numero: i residui non sono conflitti). `spu_indirect_branch` in se' resta
+   ~850: e' il salto indiretto stesso, come `spu_drain_fast` (~1.200, un salto
+   imprevedibile per hop). Per scendere ancora servono meno hop (lifter), non
+   un runtime piu' magro.
+3. in `mfc_submit` il contatore della traccia del PM (`_pn`) si incrementava a
+   ogni DMA del PM da sei lane (riga contesa): ora oltre il tetto e' solo
+   letto. `mfc_channel_write` 652 -> ~380-410.
+**cpufoto 7+7 alternate** (le prime due modifiche spente con le variabili, la
+terza non ha interruttore), retta comune CPU~draw: **-5,0 +- 4,1 ms/fotogramma**
+(a 2.200 draw: 180 -> 175), pendenza 4,1 ms ogni 100 draw. Una corsa con le
+modifiche (c46_1_on) ferma in silenzio a #2965 senza assert (tipo B noto).
+**Lotto 8 corse da 160 s: 8/8 OK, 0 assert, fotogrammi 6.523-6.660 (media
+~6.600; lotto di controllo della sera del 24/09: 6.250).**
+Build: il runtime va ricompilato con `cmake --build build` PRIMA di
+`uncharted/build.sh` (la prima misura era sul runtime vecchio: 0 effetto).
+Restano in cima: job 008dc900 (codice del gioco), fetch_vp_vertex_fast,
+memmove, spu_wrch (atomici), mfc_for (~200).
+
 ## Storico
 
 Sessioni fino alla 37 e la vecchia "Dove siamo", verbatim, in

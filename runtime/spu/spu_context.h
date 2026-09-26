@@ -371,6 +371,12 @@ typedef struct spu_context {
     uint64_t dec_cache_ns;   /* ultimo clock host letto per SPU_RdDec (rinfrescato ogni 64 letture) */
     uint32_t dec_cache_n;    /* letture dall'ultimo rinfresco */
     uint64_t hops;           /* salti del trampolino (SPU_DRAIN), diagnostica [label-wait] */
+    /* s.46: cache dei salti indiretti di spu_indirect_branch. Il registro
+     * delle funzioni e' riempito solo all'avvio, quindi (pc, immagine,
+     * overlay) -> funzione non scade mai. fn NULL = vuota (spu_context_init
+     * azzera tutto). Chiave: pc | image_id<<32 | resident_ovl<<48. */
+#define SPU_IB_CACHE 256
+    struct { uint64_t key; void (*fn)(struct spu_context*); } ib_cache[SPU_IB_CACHE];
 } spu_context;
 
 /* Reserved LS addresses (inside the kernel area, below the 0xA00 policy-module

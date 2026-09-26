@@ -313,6 +313,55 @@ static inline void spu_wring_dump(void)
 static inline int mfc_do_transfer(spu_context* spu, uint32_t lsa, uint64_t ea,
                                    uint32_t size, uint32_t cmd)
 {
+#ifndef SPU_DMA_LOG
+    /* Via veloce (s.46): senza variabili diagnostiche il trasferimento fa solo
+     * cio' che ha effetto sul gioco. Il percorso completo qui sotto passa ~35
+     * sonde a ogni DMA, e il rilevatore POISON-DMA scandiva parola per parola
+     * ogni PUT (fino a 16 KB). Un trasferimento malformato o fuori memoria
+     * scende nel percorso completo, che lo rifiuta e lo stampa. SPU_DMA_FULL=1
+     * per l'A/B. */
+    { static int s_fast = -1;
+      extern uint32_t g_barrier_sync_watch;
+      if (s_fast < 0) {
+          static const char* const vars[] = { "SPU_DMA_FULL", "SPU_DMA_WATCH", "SPU_DMA_LSWATCH",
+              "SPU_PALETTE_PUT", "SPU_PALETTE_CHECK", "SPU_NANSCAN", "SPU_PUT_VAL", "SPU_DMA_EAWIN",
+              "SPU_DMA_PUTVAL", "SPU_DMA_DUMP_EA", "SPU_DMA_LAX", "SPU_DMACHK", "SPU_GETHIST",
+              "SPU_PUTHIST", "LBP_MFC_TRACE", "SPU_STACKEA_WATCH", "YDKJ_DMATRACE",
+              "LBP_SKIP_NULL_DMA", "LBP_OVL_DIAG", "SPU_SMC_WATCH", NULL };
+          int n = 0; spu_ls_watch_list(&n);
+          s_fast = !n && !spu_wring_on();
+          for (int i = 0; vars[i]; i++) if (getenv(vars[i])) s_fast = 0;
+      }
+      const uint32_t l = lsa & SPU_LS_MASK;
+      if (s_fast && !g_barrier_sync_watch &&
+          size != 0 && size <= MFC_MAX_DMA_SIZE && !(size >= 16 && (size & 15)) &&
+          !((lsa ^ (uint32_t)ea) & 15) && !(mfc_is_put(cmd) && (uint32_t)ea < 0x10000u) &&
+          l + size <= SPU_LS_SIZE && mfc_ea_range_committed(ea, size)) {
+          uint8_t* ls_ptr = &spu->ls[l];
+          uint8_t* ea_ptr = vm_base + (uint32_t)ea;
+          if (mfc_is_get(cmd)) {
+              { extern int g_cri_video_dma;
+                if (spu->image_id == 22 && size > 0x100) g_cri_video_dma = 1; }
+              memcpy(ls_ptr, ea_ptr, size);
+              { extern void spu_overlay_note_get(spu_context*, uint32_t, const uint8_t*, uint32_t);
+                spu_overlay_note_get(spu, (uint32_t)ea, (const uint8_t*)ls_ptr, size); }
+              /* report RSX "in ritardo": v. il percorso completo */
+              if (size == 16 && ((uint32_t)ea & 15) == 0 &&
+                  ls_ptr[8] == 0xFF && ls_ptr[9] == 0xFF && ls_ptr[10] == 0xFF && ls_ptr[11] == 0xFF) {
+                  extern int rsx_report_shadow_get(uint32_t ea, uint32_t* val);
+                  uint32_t v;
+                  if (rsx_report_shadow_get((uint32_t)ea, &v)) {
+                      ls_ptr[8] = (uint8_t)(v >> 24); ls_ptr[9] = (uint8_t)(v >> 16);
+                      ls_ptr[10] = (uint8_t)(v >> 8); ls_ptr[11] = (uint8_t)v; } }
+          } else if (mfc_is_put(cmd)) {
+              /* park dei pacchetti RSX: v. il percorso completo */
+              if (size >= 4) { uint32_t w0 = ((uint32_t)ls_ptr[0] << 24) | ((uint32_t)ls_ptr[1] << 16) | ((uint32_t)ls_ptr[2] << 8) | ls_ptr[3];
+                  if ((w0 >> 29) == 1u) { extern void cellGcm_note_park_put(uint32_t ea, uint32_t word); cellGcm_note_park_put((uint32_t)ea, w0); } }
+              memcpy(ea_ptr, ls_ptr, size);
+          }
+          return 0;
+      } }
+#endif
     /* SPU_DMA_WATCH=<hex>: report any transfer whose destination RANGE covers
      * this guest address. A DMA landing in the loaded ELF image is always a
      * bug, and it is invisible to the sampling traces -- YDKJ had an SPU job
@@ -1520,7 +1569,10 @@ static inline int mfc_submit(mfc_engine* mfc, spu_context* spu, uint32_t cmd)
          * sequence is exactly what the pipeline diagnosis needs. */
         extern uint32_t g_barrier_sync_watch;
         static _Atomic int _post = 0;
-        int pn = atomic_fetch_add(&_pn, 1);
+        /* s.46: oltre il tetto solo una lettura: l'incremento a ogni DMA del
+         * PM (sei lane, decine di migliaia al secondo) era una riga contesa */
+        int pn = atomic_load_explicit(&_pn, memory_order_relaxed);
+        if (pn <= 96) pn = atomic_fetch_add(&_pn, 1);
         int open = (pn < 96) || (g_barrier_sync_watch && atomic_load(&_post) < 256);
         if (open) {
             if (pn >= 96) atomic_fetch_add(&_post, 1);

@@ -1710,9 +1710,19 @@ void spu_indirect_branch(spu_context* ctx)
       if (s_fast < 0) s_fast = !(getenv("SPU_IB_FULL") || getenv("YDKJ_IBTRACE") || getenv("LBP_IBCOV") ||
                                  getenv("YDKJ_POLLTRACE") || getenv("SPU_IBREGS") || getenv("YDKJ_POLTRACE") ||
                                  getenv("SPU_JOBTRACE") || getenv("LBP_HLE_JOBDONE") || getenv("SPU_JOBEXEC"));
+      /* s.46: cache per contesto davanti alle due ricerche (v. ib_cache in
+       * spu_context.h); SPU_IB_NOCACHE=1 per l'A/B */
+      static int s_ibc = -1; if (s_ibc < 0) s_ibc = getenv("SPU_IB_NOCACHE") ? 0 : 1;
       if (s_fast && (ctx->policy_mode || ctx->pc != SPU_JOB_RETURN_LS)) {
-          spu_fn f = ctx->resident_ovl ? spu_lookup(ctx->pc, ctx->resident_ovl) : NULL;
-          if (!f) f = spu_lookup(ctx->pc, ctx->image_id);
+          const uint64_t key = ctx->pc | ((uint64_t)(uint16_t)ctx->image_id << 32)
+                                       | ((uint64_t)(uint16_t)ctx->resident_ovl << 48);
+          __typeof__(ctx->ib_cache[0])* c = &ctx->ib_cache[(ctx->pc >> 2) & (SPU_IB_CACHE - 1)];
+          spu_fn f = (s_ibc && c->key == key) ? c->fn : NULL;
+          if (!f) {
+              f = ctx->resident_ovl ? spu_lookup(ctx->pc, ctx->resident_ovl) : NULL;
+              if (!f) f = spu_lookup(ctx->pc, ctx->image_id);
+              if (f && s_ibc) { c->key = key; c->fn = f; }
+          }
           if (f) {
 #if defined(__clang__)
               __attribute__((musttail)) return f(ctx);
