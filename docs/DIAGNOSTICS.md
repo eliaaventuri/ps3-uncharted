@@ -1112,6 +1112,8 @@ not changed while a title runs.
 - **`SPU_DEC_CACHE`** — Il clock host si legge una volta ogni 64 letture: fra due letture consecutive il guest non puo' aver visto passare piu' di qualche tick (il job 215 di Uncharted fa `rdch Dec` 25 volte di fila per pausa), e Instruments dava mach_absolute_time (isb + mrs) come il 58% del tempo della lane (sessione 28). Le letture intermedie avanzano di 13 ns l'una. */
 - **`SPU_ATOMIC_LOCKALL`** — `=1`: GETLLAR e PUTLLC riprendono sempre il lock globale degli atomici (prima della s.45: niente seqlock in lettura, niente fallimento anticipato del PUTLLC). Per l'A/B.
 - **`SPU_HOST_NS_MACH`** — `=1`: il decrementer SPU legge l'orologio con `mach_absolute_time` invece di `cntvct_el0` diretto (macOS arm64, s.45). Per l'A/B.
+- **`SPU_ATOMIC_STRIPES`** — `=1`: un solo lock per tutti gli atomici SPU invece di 64 strisce per riga (s.45). Per l'A/B.
+- **`SPU_ATOM_STAT`** — `=1`: ogni 5 s le 8 righe da 128 byte con piu' GETLLAR, con PUTLLC riusciti / falliti senza lock / falliti sotto lock (`[atom-stat]`).
   `runtime/spu/spu_channels.c:851`
 - **`SPU_DMACHK`** — SPU_DMACHK=1: report transfers that break the MFC rules the guest's own dma.h asserts on -- size 0 or > 16 KB, size not a multiple of 16 for transfers of 16+ bytes, or LSA/EA not sharing 16-byte alignment. */
   `runtime/spu/spu_dma.h:611`

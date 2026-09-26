@@ -285,8 +285,8 @@ typedef struct {
 } spu_mfc_slot;
 
 static spu_mfc_slot s_mfc_slots[SPU_MAX_CONTEXTS];
-static void resv_lock(void);
-static void resv_unlock(void);
+static void resv_lock_ea(uint32_t ea);
+static void resv_unlock_ea(uint32_t ea);
 
 static mfc_engine* mfc_for(spu_context* ctx)
 {
@@ -295,7 +295,7 @@ static mfc_engine* mfc_for(spu_context* ctx)
      * insieme, e senza lock due contesti si prendevano lo stesso slot. */
     mfc_engine* m = NULL;
     spu_mfc_slot* free_slot = NULL;
-    resv_lock();
+    resv_lock_ea(0);   /* s.45: basta escludere gli altri mfc_for */
     for (int i = 0; i < SPU_MAX_CONTEXTS; i++) {
         if (s_mfc_slots[i].ctx == ctx) { m = &s_mfc_slots[i].mfc; break; }
         if (!free_slot && s_mfc_slots[i].ctx == NULL)
@@ -306,7 +306,7 @@ static mfc_engine* mfc_for(spu_context* ctx)
         mfc_engine_init(&free_slot->mfc);
         m = &free_slot->mfc;
     }
-    resv_unlock();
+    resv_unlock_ea(0);
     if (!m) {
         /* Out of slots: fall back to a shared engine (correct for single-SPU).
          * Mai in silenzio: e' esattamente il caso che ha nascosto lo stallo. */
@@ -342,41 +342,60 @@ extern uint8_t* vm_base;
 static volatile long g_resv_lock = 0;
 static void resv_lock(void)   { while (_InterlockedExchange(&g_resv_lock, 1)) { } }
 static void resv_unlock(void) { _InterlockedExchange(&g_resv_lock, 0); }
+static void resv_lock_ea(uint32_t ea)   { (void)ea; resv_lock(); }
+static void resv_unlock_ea(uint32_t ea) { (void)ea; resv_unlock(); }
 #else
 #include <stdatomic.h>
-static _Atomic int g_resv_lock = 0;
+/* s.45: un lock per gruppo di righe (64 strisce, ognuna nella sua riga di
+ * cache) invece di uno solo per tutti gli atomici. Con SPU_ATOM_STAT: una riga
+ * del job manager fa ~140.000 GETLLAR/PUTLLC al secondo e altre sei ~50.000
+ * ciascuna -- con un lock unico ognuna aspettava anche le altre.
+ * Ogni striscia ha il suo contatore di sequenza (seqlock), dispari mentre
+ * qualcuno la tiene e scrive: GETLLAR legge la riga senza prendere il lock e
+ * riprova se la sequenza e' cambiata nel frattempo.
+ * SPU_ATOMIC_STRIPES=1 torna a un lock solo (A/B). */
+#define RESV_NSTRIPE 64
+typedef struct { _Atomic int lock; _Atomic unsigned seq; } __attribute__((aligned(128))) resv_stripe;
+static resv_stripe g_resv[RESV_NSTRIPE];
+static unsigned resv_nstripe(void)
+{
+    static unsigned n = 0;
+    if (!n) { const char* e = getenv("SPU_ATOMIC_STRIPES"); n = (e && *e == '1' && !e[1]) ? 1 : RESV_NSTRIPE; }
+    return n;
+}
+static resv_stripe* resv_for(uint32_t ea) { return &g_resv[(ea >> 7) & (resv_nstripe() - 1)]; }
 /* s.42: l'attesa fuori linea (nei profili la contesa si vede come
  * resv_lock_spin invece di sparire dentro spu_wrch: 1.058 campioni su 17.000
  * delle lane) e test-and-test-and-set: chi aspetta LEGGE la riga finche' non
  * e' libera, invece di scriverla a ogni giro strappandola a chi tiene il lock
  * (sei lane sulle stesse righe del kernel SPURS). */
-__attribute__((noinline)) static void resv_lock_spin(void)
+__attribute__((noinline)) static void resv_lock_spin(resv_stripe* r)
 {
     do {
-        while (atomic_load_explicit(&g_resv_lock, memory_order_relaxed)) {
+        while (atomic_load_explicit(&r->lock, memory_order_relaxed)) {
 #if defined(__aarch64__)
             __asm__ __volatile__("yield");
 #endif
         }
-    } while (atomic_exchange_explicit(&g_resv_lock, 1, memory_order_acquire));
+    } while (atomic_exchange_explicit(&r->lock, 1, memory_order_acquire));
 }
-/* s.45: contatore di sequenza (seqlock) sopra il lock: dispari mentre qualcuno
- * lo tiene e scrive. GETLLAR legge la riga senza prendere il lock e riprova se
- * la sequenza e' cambiata nel frattempo: il job 0089df80 (allocatore ad anello
- * GETLLAR/PUTLLC su una riga sola, sei lane) dava da solo il 60% di
- * resv_lock_spin, e meta' delle prese erano letture. */
-static _Atomic unsigned g_resv_seq = 0;
-static void resv_lock(void)
+static void resv_lock_s(resv_stripe* r)
 {
-    if (atomic_exchange_explicit(&g_resv_lock, 1, memory_order_acquire)) resv_lock_spin();
-    atomic_store_explicit(&g_resv_seq, atomic_load_explicit(&g_resv_seq, memory_order_relaxed) + 1, memory_order_relaxed);
+    if (atomic_exchange_explicit(&r->lock, 1, memory_order_acquire)) resv_lock_spin(r);
+    atomic_store_explicit(&r->seq, atomic_load_explicit(&r->seq, memory_order_relaxed) + 1, memory_order_relaxed);
     atomic_thread_fence(memory_order_release);
 }
-static void resv_unlock(void)
+static void resv_unlock_s(resv_stripe* r)
 {
-    atomic_store_explicit(&g_resv_seq, atomic_load_explicit(&g_resv_seq, memory_order_relaxed) + 1, memory_order_release);
-    atomic_store_explicit(&g_resv_lock, 0, memory_order_release);
+    atomic_store_explicit(&r->seq, atomic_load_explicit(&r->seq, memory_order_relaxed) + 1, memory_order_release);
+    atomic_store_explicit(&r->lock, 0, memory_order_release);
 }
+static void resv_lock_ea(uint32_t ea)   { resv_lock_s(resv_for(ea)); }
+static void resv_unlock_ea(uint32_t ea) { resv_unlock_s(resv_for(ea)); }
+/* Tutte le strisce, sempre nello stesso ordine (niente stallo fra due che le
+ * prendono tutte; chi ne prende una sola non ne prende altre). */
+static void resv_lock(void)   { for (unsigned i = 0; i < resv_nstripe(); i++) resv_lock_s(&g_resv[i]); }
+static void resv_unlock(void) { for (unsigned i = resv_nstripe(); i-- > 0; ) resv_unlock_s(&g_resv[i]); }
 #endif
 
 /* Copia atomica di una riga da 128 byte rispetto a chi scrive sotto il lock.
@@ -387,12 +406,13 @@ static int spu_atomic_lockall(void)
     if (s < 0) { const char* e = getenv("SPU_ATOMIC_LOCKALL"); s = (e && *e && *e != '0') ? 1 : 0; }
     return s;
 }
-static void resv_read_line(uint8_t* dst, const uint8_t* src)
+static void resv_read_line(uint8_t* dst, const uint8_t* src, uint32_t ea)
 {
 #if !defined(_MSC_VER)
     if (!spu_atomic_lockall()) {
+        resv_stripe* r = resv_for(ea);
         for (;;) {
-            unsigned s1 = atomic_load_explicit(&g_resv_seq, memory_order_acquire);
+            unsigned s1 = atomic_load_explicit(&r->seq, memory_order_acquire);
             if (s1 & 1) {
 #if defined(__aarch64__)
                 __asm__ __volatile__("yield");
@@ -401,20 +421,21 @@ static void resv_read_line(uint8_t* dst, const uint8_t* src)
             }
             memcpy(dst, src, MFC_ATOMIC_LINE);
             atomic_thread_fence(memory_order_acquire);
-            if (atomic_load_explicit(&g_resv_seq, memory_order_relaxed) == s1) return;
+            if (atomic_load_explicit(&r->seq, memory_order_relaxed) == s1) return;
         }
     }
 #endif
-    resv_lock();
+    resv_lock_ea(ea);
     memcpy(dst, src, MFC_ATOMIC_LINE);
-    resv_unlock();
+    resv_unlock_ea(ea);
 }
 
 /* The PPU-side HLE of a lock-free queue does its read-modify-write on the SAME
  * 128-byte guest line the SPU reaches with GETLLAR/PUTLLC. Holding this lock for
  * the whole RMW serialises it against each SPU atomic; an SPU commit that
  * straddled our write fails on its own, because PUTLLC compares the line with
- * the snapshot taken at GETLLAR. Exported for libs/sync/cellSyncLFQueue.c. */
+ * the snapshot taken at GETLLAR. Exported for libs/sync/cellSyncLFQueue.c.
+ * (s.45: senza indirizzo, quindi prende tutte le strisce.) */
 void spu_atomic_line_lock(void)   { resv_lock(); }
 void spu_atomic_line_unlock(void) { resv_unlock(); }
 
@@ -446,6 +467,50 @@ volatile unsigned g_spu_putllc_sync_hit = 0;
  * itself; we have no manager, so we pass this and treat arriving here as job
  * completion. Chosen above the context/descriptor we park near the top of LS. */
 #define SPU_JOB_RETURN_LS   0x3FF00u
+
+/* SPU_ATOM_STAT=1 (s.45): conteggi per riga degli atomici -- GETLLAR, PUTLLC
+ * riusciti, falliti senza lock, falliti sotto il lock -- stampati ogni 5 s
+ * (le 8 righe piu' usate). Per capire se la contesa e' una riga sola. */
+enum { ATS_GET, ATS_OK, ATS_FAST_FAIL, ATS_LOCK_FAIL, ATS_N };
+static int spu_atom_stat_on(void)
+{
+    static int s = -1;
+    if (s < 0) s = getenv("SPU_ATOM_STAT") ? 1 : 0;
+    return s;
+}
+static void spu_atom_stat(uint32_t ea, int kind, int img)
+{
+    static struct { _Atomic uint32_t ea; _Atomic int img; _Atomic unsigned long long n[ATS_N]; } t[256];
+    static _Atomic unsigned long long s_next = 0;
+    uint32_t h = ((ea >> 7) * 2654435761u) >> 24;
+    for (int k = 0; k < 256; k++, h = (h + 1) & 255) {
+        uint32_t e = atomic_load(&t[h].ea);
+        if (e == 0) { uint32_t z = 0; if (!atomic_compare_exchange_strong(&t[h].ea, &z, ea) && z != ea) continue;
+                      atomic_store(&t[h].img, img); e = ea; }
+        if (e != ea) continue;
+        atomic_fetch_add(&t[h].n[kind], 1);
+        break;
+    }
+    extern unsigned long long ps3_ms_now(void);
+    unsigned long long now = ps3_ms_now(), nx = atomic_load(&s_next);
+    if (now < nx || !atomic_compare_exchange_strong(&s_next, &nx, now + 5000)) return;
+    if (nx == 0) return;   /* primo passaggio: arma solo il timer */
+    int idx[8] = {-1,-1,-1,-1,-1,-1,-1,-1}; unsigned long long best[8] = {0};
+    for (int i = 0; i < 256; i++) {
+        unsigned long long g = atomic_load(&t[i].n[ATS_GET]);
+        for (int j = 0; j < 8; j++) if (g > best[j]) {
+            for (int q = 7; q > j; q--) { best[q] = best[q-1]; idx[q] = idx[q-1]; }
+            best[j] = g; idx[j] = i; break; }
+    }
+    char buf[1400]; int p = snprintf(buf, sizeof buf, "[atom-stat] 5 s, per riga: get/ok/fail-veloce/fail-lock img\n");
+    for (int j = 0; j < 8 && idx[j] >= 0; j++) {
+        int i = idx[j]; unsigned long long v[ATS_N];
+        for (int k = 0; k < ATS_N; k++) v[k] = atomic_exchange(&t[i].n[k], 0);
+        p += snprintf(buf + p, sizeof buf - p, "  ea=%08X img=%d %llu/%llu/%llu/%llu\n",
+                      atomic_load(&t[i].ea), atomic_load(&t[i].img), v[0], v[1], v[2], v[3]);
+    }
+    fputs(buf, stderr);
+}
 
 /* Returns 1 if `cmd` is an atomic line op and was handled here, else 0. */
 static int spu_mfc_atomic(spu_context* ctx, uint32_t cmd)
@@ -587,7 +652,8 @@ static int spu_mfc_atomic(spu_context* ctx, uint32_t cmd)
          * peer that must WRITE the line waits for it (canersaka ticks the
          * GETLLAR fast+slow paths for exactly this reason). */
         yz_lockstep_tick(ctx);
-        resv_read_line(ls, mem);                       /* line -> local store */
+        resv_read_line(ls, mem, ea);                   /* line -> local store */
+        if (spu_atom_stat_on()) spu_atom_stat(ea, ATS_GET, ctx->image_id);
         /* Snapshot from `ls`, NOT a second read of `mem`. Hardware GETLLAR is a
          * single atomic 128-byte read, so the reserved data and the reservation
          * come from the same instant. Reading guest memory twice lets a PPU store
@@ -604,7 +670,8 @@ static int spu_mfc_atomic(spu_context* ctx, uint32_t cmd)
         return 1;
 
     case MFC_PUTLLC_CMD:
-        g_spu_putllc_count++;   /* run-scoped delta read by the PM flow trace */
+        /* g_spu_putllc_count non si incrementa piu' (s.45): nessuno lo legge
+         * (spurs_policy.c fa solo (void)), e sei lane sulla stessa riga costano. */
         { extern uint32_t g_barrier_sync_watch;
           uint32_t b = g_barrier_sync_watch;
           if (b && (ea & ~127u) == (b & ~127u)) g_spu_putllc_sync_hit++; }
@@ -614,9 +681,10 @@ static int spu_mfc_atomic(spu_context* ctx, uint32_t cmd)
             (!ctx->resv_valid || ctx->resv_ea != ea ||
              memcmp(mem, ctx->resv_line, MFC_ATOMIC_LINE) != 0)) {
             ctx->atomic_stat = 1; ctx->resv_valid = 0;
+            if (spu_atom_stat_on()) spu_atom_stat(ea, ATS_FAST_FAIL, ctx->image_id);
             return 1;
         }
-        resv_lock();
+        resv_lock_ea(ea);
         if (ctx->resv_valid && ctx->resv_ea == ea &&
             memcmp(mem, ctx->resv_line, MFC_ATOMIC_LINE) == 0) {
             /* Commit ONLY the bytes the SPU changed since GETLLAR. The PPU
@@ -659,16 +727,17 @@ static int spu_mfc_atomic(spu_context* ctx, uint32_t cmd)
               }
           } }
         ctx->resv_valid = 0;                           /* reservation consumed */
-        resv_unlock();
+        resv_unlock_ea(ea);
+        if (spu_atom_stat_on()) spu_atom_stat(ea, ctx->atomic_stat ? ATS_LOCK_FAIL : ATS_OK, ctx->image_id);
         return 1;
 
     case MFC_PUTLLUC_CMD:
     case MFC_PUTQLLUC_CMD:
-        resv_lock();
+        resv_lock_ea(ea);
         memcpy(mem, ls, MFC_ATOMIC_LINE);              /* unconditional store */
         spu_wring_note(ctx, "PUTLLUC", (uint32_t)ea, MFC_ATOMIC_LINE, ls);
         ctx->resv_valid = 0; ctx->atomic_stat = 0;
-        resv_unlock();
+        resv_unlock_ea(ea);
         return 1;
 
     default:

@@ -899,6 +899,25 @@ Prossimi bersagli: la contesa vera sulla riga dell'allocatore di 0089df80
 che legge l'orologio (143 campioni), `mfc_for` che prende il lock per il PM
 a ogni esecuzione (contesto rinfrescato: mfc_cache azzerato).
 
+**Lock degli atomici diviso per riga (64 strisce)** (sessione 45, dopo).
+Nuova diagnostica `SPU_ATOM_STAT=1` (conteggi per riga ogni 5 s: GETLLAR /
+PUTLLC riusciti / falliti senza lock / falliti sotto lock). Nel livello: la
+riga 0x10184B00 (img 2) fa ~142.000 GETLLAR/s, 114.000 PUTLLC riusciti/s,
+~22.000 falliti sotto il lock/s; altre 4-5 righe (0x106C8F00, 0x106AFE80,
+0x10696E80, 0x1057BF80) ~50.000/s ciascuna. Con un lock unico ognuna
+aspettava anche le altre. Ora `g_resv[64]` (lock + sequenza, 128 byte
+ciascuno, indice (ea>>7)&63); `spu_atomic_line_lock` (HLE PPU, senza
+indirizzo) le prende tutte in ordine (non compare nel profilo); `mfc_for` usa
+la striscia 0. Tolto anche `g_spu_putllc_count++` (nessuno lo legge, riga
+condivisa da sei lane). A/B: `SPU_ATOMIC_STRIPES=1` = un lock solo.
+Profilo (10 s a 100 s): `resv_lock_spin` 638 -> 238 campioni, `spu_wrch`
+1.124 -> 504, con una scena piu' pesante (3.200 draw/fotogramma).
+cpufoto 8+8 alternate, retta comune CPU~draw: **-5,4 +- 5,4 ms/fotogramma,
+dentro il rumore** (pendenza 4,8 ms ogni 100 draw). Stabilita': lotto
+alternato 7 corse da 160 s (3 nuove + 4 `STRIPES=1`, l'ottava interrotta dal
+riavvio del Mac) tutte OK. I 224 campioni di attesa che restano sono la
+contesa vera sulla riga 0x10184B00 (job 0089df80 `func_000075F0`).
+
 ## Storico
 
 Sessioni fino alla 37 e la vecchia "Dove siamo", verbatim, in
