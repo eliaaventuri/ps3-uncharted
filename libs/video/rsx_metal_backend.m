@@ -102,6 +102,7 @@ typedef struct {
      * attributi letti dal programma in s_vpd; cblock = blocco di costanti. */
     int vp;
     u32 vbase, vstride, cblock;
+    u32 ibase, icount;             /* s.46: draw indicizzato su s_vidx (byte, indici); icount 0 = drawPrimitives */
     u32 fpc_off, fpc_n;            /* costanti del FP (sessione 28): offset in s_fpc, numero di float4 */
     /* Le texture legate al momento del draw (sessione 27): prima venivano
      * legate al present, cioe' TUTTI i draw del fotogramma usavano le ultime.
@@ -250,6 +251,14 @@ static dispatch_semaphore_t s_inflight;
 static id<MTLBuffer> s_vpd_ring[MTL_VPD_RING];
 static id<MTLBuffer> s_cbs_ring[MTL_VPD_RING];   /* blocchi di costanti: fino a ~20 MB a fotogramma */
 static u32           s_vpd_slot, s_vpd_slots = MTL_MAX_INFLIGHT + 1;
+/* s.46: indici dei draw indicizzati (u32, relativi a vbase), stesso anello.
+ * Un draw indicizzato legge ogni vertice UNA volta e passa a Metal gli
+ * indici: misurato nel livello 2,5 letture per vertice unico (2,26 miliardi
+ * di indici, 0,89 miliardi di vertici diversi in 100 s). */
+#define MTL_VIDX_MAX (32u * 1024u * 1024u)
+static id<MTLBuffer> s_vidx_ring[MTL_VPD_RING];
+static u32*          s_vidx;
+static u32           s_vidx_used;
 /* Alloca gli slot dell'anello (mmap: pagine toccate solo se usate) e torna la
  * memoria del primo; NULL (e ring[0] = nil) se Metal non li accetta. */
 static void* ring_alloc(id<MTLBuffer> __strong* ring, size_t bytes)
@@ -269,6 +278,8 @@ static void vpd_next_slot(void)
     s_vpd_slot = (s_vpd_slot + 1) % s_vpd_slots;
     s_vpd = (float*)[s_vpd_ring[s_vpd_slot] contents];
     s_cbs = (u8*)[s_cbs_ring[s_vpd_slot] contents];
+    if (s_vidx_ring[0]) s_vidx = (u32*)[s_vidx_ring[s_vpd_slot] contents];
+    s_vidx_used = 0;
 }
 
 /* PSO cache. Keyed on the blend state, which is all the built-in shader path
@@ -650,6 +661,13 @@ static MTLPrimitiveType topo_to_metal(rsx_topology t)
  * serves both array and indexed draws. Returns vertices written. */
 typedef u32 (*IndexResolver)(const rsx_state*, u32 /*seq*/, void* /*ctx*/);
 
+/* s.46: draw indicizzato (s_idx_draw): cache dei vertici gia' letti nel draw,
+ * a mappa diretta, invalidata dal numero del draw (s_vc_cur). Una collisione
+ * rilegge il vertice in uno slot nuovo: giusto, solo meno risparmio. */
+#define MTL_VCACHE 4096
+static int s_idx_draw;
+typedef struct { u32 key, gen, slot, pad; } VcEnt;
+static VcEnt s_vc[MTL_VCACHE]; static u32 s_vc_cur, s_idx_nv;
 static u32 emit_vertices(const rsx_state* st, u32 prim, u32 count,
                          IndexResolver resolve, void* ctx)
 {
@@ -659,7 +677,13 @@ static u32 emit_vertices(const rsx_state* st, u32 prim, u32 count,
      * copiare nel buffer a ogni fotogramma) serve solo alla via incorporata. */
     #define PUSH(seq) do {                                                     \
         u32 _vi = resolve(st, (seq), ctx);                                     \
-        if (s_fast_draw) fetch_vp_vertex_fast(_vi);                            \
+        if (s_idx_draw) {                                                      \
+            VcEnt* _c = &s_vc[_vi & (MTL_VCACHE - 1)];                         \
+            if (_c->gen != s_vc_cur || _c->key != _vi) {                       \
+                _c->gen = s_vc_cur; _c->key = _vi;                             \
+                _c->slot = s_idx_nv++; fetch_vp_vertex_fast(_vi); }            \
+            s_vidx[s_vidx_used++] = _c->slot;                                  \
+        } else if (s_fast_draw) fetch_vp_vertex_fast(_vi);                     \
         else {                                                                 \
             if (s_vert_count >= MTL_MAX_VERTS) return wrote;                   \
             fetch_vertex(st, _vi, &s_verts[s_vert_count++]);                   \
@@ -962,10 +986,20 @@ static void record_draw(const rsx_state* st, u32 prim, u32 base, u32 count,
     s_fast_draw = (tmp.vp >= 0 && vfetch_fast() &&
                    s_vpd_used + (u64)count * 3u * 4u * (u32)__builtin_popcount(s_cur_mask) <= MTL_VP_FLOATS) ? 1 : 0;
     if (s_fast_draw) vplan_build(st, s_cur_mask);
+    /* s.46: indicizzato solo senza le sonde che rileggono s_vpd in ordine di
+     * vertice emesso (RSX_VA_WATCH/GARBAGE/GIANT/VP_DBG/VPD_CHECK). RSX_VIDX=0 per l'A/B. */
+    { static int s_vx = -1;
+      if (s_vx < 0) { const char* e = getenv("RSX_VIDX"); s_vx = !(e && *e == '0') && !getenv("RSX_VA_WATCH") && !getenv("RSX_GARBAGE") &&
+                      !getenv("RSX_GIANT") && !getenv("RSX_VP_DBG") && !getenv("RSX_VPD_CHECK"); }
+      s_idx_draw = (s_vx && s_fast_draw && s_vidx && resolve == resolve_indexed &&
+                    s_vidx_used + (u64)count * 3u <= MTL_VIDX_MAX) ? 1 : 0; }
+    const u32 first_idx = s_vidx_used;
+    if (s_idx_draw) { s_vc_cur++; s_idx_nv = 0; }
     u32 first_vert = s_vert_count;
     s_idx_pg = 0xFFFFFFFFu;
     u32 wrote = emit_vertices(st, prim, count, resolve, &base);
     s_fast_draw = 0;
+    if (s_idx_draw) { tmp.ibase = first_idx * 4u; tmp.icount = s_vidx_used - first_idx; s_idx_draw = 0; }
     vp_end_draw(&tmp);
     if (wrote == 0) { s_dropped_draws++; return; }
 
@@ -2475,6 +2509,7 @@ int rsx_metal_backend_init(u32 width, u32 height, const char* title)
             s_vpd = (float*)ring_alloc(s_vpd_ring, sizeof(float) * MTL_VP_FLOATS);
             s_cbs = s_vpd ? (u8*)ring_alloc(s_cbs_ring, (size_t)MTL_CB_BYTES * MTL_CB_MAX) : NULL;
             if (!s_cbs) { fprintf(stderr, "[RSX metal] anello NoCopy non disponibile: copia per fotogramma\n"); s_vpd_ring[0] = nil; s_vpd = NULL; }
+            if (s_cbs) s_vidx = (u32*)ring_alloc(s_vidx_ring, sizeof(u32) * MTL_VIDX_MAX);   /* NULL: niente draw indicizzati */
           } }
         if (!s_vpd) s_vpd = (float*)malloc(sizeof(float) * MTL_VP_FLOATS);
         s_fpc = (u8*)malloc(MTL_FPC_BYTES);
@@ -2967,6 +3002,10 @@ static void rsx_metal_backend_present_impl(void)
                         [enc setFragmentBuffer:s_alpha_buf offset:0 atIndex:2];
                 }
                 if (vis) [enc setVisibilityResultMode:MTLVisibilityResultModeCounting offset:(NSUInteger)i * 8];
+                if (d->icount && d->vp >= 0 && vpb && cbb && s_vidx_ring[0])
+                    [enc drawIndexedPrimitives:d->topology indexCount:d->icount indexType:MTLIndexTypeUInt32
+                                   indexBuffer:s_vidx_ring[s_vpd_slot] indexBufferOffset:d->ibase];
+                else
                 [enc drawPrimitives:d->topology vertexStart:(d->vp >= 0 && vpb && cbb) ? 0 : d->base
                         vertexCount:d->count];
             }

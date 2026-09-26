@@ -950,6 +950,32 @@ Build: il runtime va ricompilato con `cmake --build build` PRIMA di
 Restano in cima: job 008dc900 (codice del gioco), fetch_vp_vertex_fast,
 memmove, spu_wrch (atomici), mfc_for (~200).
 
+**Draw indicizzati nel backend Metal** (sessione 46, dopo). `memmove` NON e'
+del walker: ~85% sono le copie DMA delle SPU (lavoro vero), il walker ne fa
+~40 campioni. Il bersaglio era `fetch_vp_vertex_fast` (~1.150 campioni):
+sonda temporanea nel livello, 100 s: tutti i draw sono indicizzati (84%
+triangoli, 16% quad), 2,26 miliardi di indici per 0,89 miliardi di vertici
+diversi (2,5 letture per vertice; l'intervallo min..max sarebbe 1,67
+miliardi, quindi leggere l'intervallo renderebbe poco). Ora (via veloce,
+indicizzati) ogni vertice si legge UNA volta per draw (cache a mappa diretta
+di 4.096 voci invalidata dal numero del draw, `s_vc`), gli indici (u32,
+relativi a vbase) vanno in un terzo anello NoCopy (`s_vidx_ring`, 32M
+indici/fotogramma) e la codifica usa `drawIndexedPrimitives`. Spento con
+`RSX_VIDX=0` (A/B) e da solo con le sonde che rileggono s_vpd in ordine di
+vertice (RSX_VA_WATCH/GARBAGE/GIANT/VP_DBG/VPD_CHECK). Screenshot a 110 s:
+scena corretta.
+Profilo: `fetch_vp_vertex_fast` 1.146 -> ~480, `record_draw` 97 -> ~330 (la
+cache nel PUSH; compattarla in una struct non cambia nulla): netto ~-400.
+cpufoto 6+6 alternate: **-6,9 +- 5,0 ms/fotogramma** a parita' di draw
+(esclusa cvx_2_on, ferma).
+**Stabilita' (dubbio aperto)**: fermi tipo B (PPU in `func_00742838`/
+`func_0074073C` che aspetta la job list, walker innocente) con RSX_VIDX
+acceso 4 su 22 corse (cvx_2_on, l46vx_4, l46vx_7, abvx_4_v1), spento 0 su
+14 (cvx off, abvx v0). Fisher p = 0,12: non significativo, frequenza storica
+~13% (12 su 92 nei lotti s.44). Anche prima degli indici, nella s.46, un
+fermo (c46_1_on) su 15 corse. Se i fermi sembrano piu' frequenti,
+`RSX_VIDX=0` e' la prima prova; un lotto 20+20 alternato lo decide.
+
 ## Storico
 
 Sessioni fino alla 37 e la vecchia "Dove siamo", verbatim, in
