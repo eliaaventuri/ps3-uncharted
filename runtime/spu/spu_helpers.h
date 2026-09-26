@@ -672,6 +672,8 @@ static inline u128 spu_ilh(uint16_t imm) { return spu_splat_u16(imm); }
 static inline u128 spu_ilhu(uint16_t imm){ return spu_splat_u32((uint32_t)imm << 16); }
 static inline u128 spu_iohl(u128 a, uint16_t imm){ u128 r; for(int i=0;i<4;i++) r._u32[i]=a._u32[i]|(uint32_t)imm; return r; }
 
+#include "spu_helpers_neon_arith.h"   /* s.47: le operazioni per corsia qui sopra in NEON, via macro */
+
 #ifdef __cplusplus
 }
 #endif

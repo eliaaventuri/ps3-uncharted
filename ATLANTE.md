@@ -35,6 +35,7 @@ runtime/spu/spu_interp.c     interprete SPU di riserva (blocchi non liftati)
 runtime/spu/spu_lockstep.c   esecuzione lockstep per i poll GETLLAR/PUTLLC
 runtime/spu/spu_helpers.h    helper delle istruzioni SPU (scalari; float CBEA con via veloce NEON)
 runtime/spu/spu_helpers_neon.h  versioni NEON di cntb, byte-shift, cbd/cwd, fcgt, cflts (s.36)
+runtime/spu/spu_helpers_neon_arith.h  55 operazioni per corsia in NEON via macro (s.47; -DSPU_NEON_ARITH_OFF)
 runtime/spu/spu_neon_tables.h   tabelle di indici per vqtbl1q (GENERATO da tools/gen_spu_neon_tables.py)
 runtime/syscalls/            lv2: sys_event, sys_cond, sys_mutex, sys_ppu_thread, sys_fs, ...
 runtime/memory/vm.h          layout memoria guest
@@ -64,10 +65,10 @@ tools/check_ppu_scaffold.py  ratchet del boot
 tools/spu_disasm.py, ppu_disasm.py  disassemblatori
 tools/gen_spu_neon_tables.py  genera runtime/spu/spu_neon_tables.h
 scratchpad/winid.swift       id della finestra del port per screencapture -l (CGWindowList .optionAll)
-scratchpad/misura/           fps.sh/fpsmed.sh (fps da RSX_FRAMESTAT), tl*.py (timeline GCM_TIMELINE), present.py (durata del present per fascia di draw), runshots.sh/shots2.sh (screenshot a tempo), classify.py/classify2.py (difetti dagli screenshot; classify2 aggiunge il cielo sparito), memshots.sh (screenshot + vmmap a tempo, s.40), shotframe.py (fotogramma di ogni screenshot), ringan.py (sorpassi nell'anello SPU da GCM_RING_TRACE), prof2.sh (s.37), selfunder.py/incl.py/callers.py (analisi dei profili di sample, s.42), framecatch.sh (corsa che campiona il processo e legge memoria guest quando i fotogrammi si fermano, s.43), cpufoto.sh (ms di CPU per fotogramma e core medi: il numero del calore, 24/09), lotto.sh / ablotto.sh / stress_lotto.sh (lotti di framecatch: semplice, A/B alternato, sotto carico CPU; s.44)
+scratchpad/misura/           fps.sh/fpsmed.sh (fps da RSX_FRAMESTAT), tl*.py (timeline GCM_TIMELINE), present.py (durata del present per fascia di draw), runshots.sh/shots2.sh (screenshot a tempo), classify.py/classify2.py (difetti dagli screenshot; classify2 aggiunge il cielo sparito), memshots.sh (screenshot + vmmap a tempo, s.40), shotframe.py (fotogramma di ogni screenshot), ringan.py (sorpassi nell'anello SPU da GCM_RING_TRACE), prof2.sh (s.37), selfunder.py/incl.py/callers.py (analisi dei profili di sample, s.42), framecatch.sh (corsa che campiona il processo e legge memoria guest quando i fotogrammi si fermano, s.43), cpufoto.sh (ms di CPU per fotogramma e core medi: il numero del calore, 24/09), lotto.sh / ablotto.sh / stress_lotto.sh (lotti di framecatch: semplice, A/B alternato, sotto carico CPU; s.44), abbin.sh + abfit.py (A/B di due eseguibili con cpufoto e retta CPU~draw, s.47)
 tools/lldb_guest_bp.py       breakpoint lldb sui func_XXXX del port vivo (r3-r5, f1, catena)
 tools/stallcatch.sh          corsa Uncharted che campiona il processo se il caricamento si ferma
-tests/                       torture e conformance del runtime
+tests/                       torture e conformance del runtime; spu_helpers_audit.c (helper vs CBEA), spu_neon_arith_diff.c (NEON vs scalari, s.47)
 uncharted/                   ricetta del port nel repo: prepare.sh (analisi+lift PPU+NID+immagini SPU), relift_spu.sh, build.sh, run.sh, runfor.sh, iterate.sh, extra_targets.txt; dati in ../uncharted-data (UNCHARTED_DATA)
 lbp/, wave/                  altri port (riferimento, non toccare)
 fw_spu/                      job/prx firmware liftati (audio, sre)

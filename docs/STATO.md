@@ -1,6 +1,6 @@
 # Stato del progetto
 
-Ultimo aggiornamento: **24 settembre 2026** — sessione 44.
+Ultimo aggiornamento: **26 settembre 2026** — sessione 47.
 
 ## Dove siamo
 
@@ -980,6 +980,31 @@ fermo (c46_1_on) su 15 corse. Se i fermi sembrano piu' frequenti,
 20; fotogrammi medi delle corse OK 6.572 contro 6.460. Contando solo i lotti
 alternati (abvx + ab20): 2/28 contro 0/28 (p ~ 0,25), sotto la frequenza
 storica del tipo B (~13%). Gli indici restano accesi.
+
+**Operazioni SPU per corsia in NEON** (sessione 47, 26/09). Profilo per
+indirizzo (xctrace Time Profiler, 8 s a 100 s; `leaf.py` nello scratchpad
+della sessione): `jobmod_008dc900..._spu_func_00010300` = 7.366 su 45.662
+campioni in esecuzione (16%), profilo PIATTO dentro la funzione (blocco da
+64 byte piu' caldo 2%). Il disassemblato mostrava perche': i cicli
+`for(i<4) r._u32[i]=a._u32[i]+b._u32[i]` di spu_a/ai/andi/... diventavano
+aritmetica scalare a coppie di parole su registri x con maschere
+0xffffffff00000000 (1.198 add e 992 and scalari su 15.690 istruzioni), e
+spu_rotqbyi era ancora un ciclo di byte (chiamato fuori linea). Nuovo
+`runtime/spu/spu_helpers_neon_arith.h`, incluso in fondo a spu_helpers.h:
+55 operazioni (a/sf/ah/ai/sfi, logiche, selb, confronti con immediato,
+scorrimenti/rotazioni con immediato, rotqbyi, mpy*, xshw/xsbh) in NEON e
+sostituite con macro omonime (le scalari restano: `(spu_a)(x,y)` le chiama).
+Spento con `SPU_DEFS="-DSPU_LS_NODIAG -DSPU_NEON_ARITH_OFF" ./uncharted/build.sh`.
+Verifica: `tests/spu_neon_arith_diff.c` 11,6 M confronti, 0 differenze;
+`tests/spu_helpers_audit.c` identico con e senza (le sue 1.710 differenze
+su cflts/cfltu sono preesistenti). Funzione calda 15.690 -> 13.279
+istruzioni. Screenshot a 110 s corretto.
+**A/B di due eseguibili 7+7 alternate** (`scratchpad/misura/abbin.sh`, 160 s,
+retta comune con `abfit.py`): **-9,0 +- 3,1 ms CPU/fotogramma** (a 2.200 draw
+167 -> 158), 14/14 corse OK, 0 assert, ~31 fps. Restano: spu_shufb non in
+linea in 39 siti della funzione calda, spu_fma_slow (~320 campioni: la via
+esatta scatta davvero, probabilmente le sentinelle della tavolozza),
+ls_read/write con rev32 (~500 per funzione: cambiare rappresentazione u128).
 
 ## Storico
 
