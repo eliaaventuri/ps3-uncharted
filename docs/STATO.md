@@ -1006,6 +1006,14 @@ linea in 39 siti della funzione calda, spu_fma_slow (~320 campioni: la via
 esatta scatta davvero, probabilmente le sentinelle della tavolozza),
 ls_read/write con rev32 (~500 per funzione: cambiare rappresentazione u128).
 
+**spu_shufb sempre in linea: NESSUN effetto, tolto** (s.47, dopo). Con
+`__attribute__((always_inline))` spariscono le 751 chiamate fuori linea di
+spu_shufb dal binario (39 nella funzione calda, che passa 13.279 -> 13.743
+istruzioni), ma l'A/B 7+7 (c47s) da' **+1,4 +- 3,6 ms/fotogramma** (13 corse;
+esclusa c47s_5_off, fermo tipo B a #3829 nella versione SENZA la modifica).
+La chiamata non era il costo: non riprovare. Il fermo conferma che il tipo B
+non dipende dalle modifiche di questa sessione.
+
 ## Storico
 
 Sessioni fino alla 37 e la vecchia "Dove siamo", verbatim, in
