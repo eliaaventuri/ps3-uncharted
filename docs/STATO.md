@@ -975,6 +975,11 @@ acceso 4 su 22 corse (cvx_2_on, l46vx_4, l46vx_7, abvx_4_v1), spento 0 su
 ~13% (12 su 92 nei lotti s.44). Anche prima degli indici, nella s.46, un
 fermo (c46_1_on) su 15 corse. Se i fermi sembrano piu' frequenti,
 `RSX_VIDX=0` e' la prima prova; un lotto 20+20 alternato lo decide.
+**Lotto 20+20 alternato (ab20, 160 s, framecatch)**: RSX_VIDX=1 1 fermo su
+20 (ab20_12_v1 a #4042, stesso tipo B: PPU in func_00742838), RSX_VIDX=0 0 su
+20; fotogrammi medi delle corse OK 6.572 contro 6.460. Contando solo i lotti
+alternati (abvx + ab20): 2/28 contro 0/28 (p ~ 0,25), sotto la frequenza
+storica del tipo B (~13%). Gli indici restano accesi.
 
 ## Storico
 
