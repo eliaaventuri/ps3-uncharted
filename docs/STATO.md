@@ -1060,6 +1060,17 @@ Senza interruttori a runtime: A/B di binari (`uncharted_s47` = fine s.47).
 (c48_1_off, c48_2_on: tipo B noto, niente assert), una lenta (c48_4_on,
 24,9 fps) esclusa come nella s.47.
 
+**Trampolino nel contesto invece che `__thread`: PEGGIORA, tolto** (s.48,
+dopo). Su macOS `g_spu_trampoline_fn` (__thread dell'eseguibile) passa da
+`_tlv_get_addr` a ogni salto (156 campioni). Prova: campo `tramp_fn` in coda a
+spu_context e `#define g_spu_trampoline_fn ((ctx)->tramp_fn)`. Profilo:
+_tlv_get_addr 156 -> 30, resto invariato. Ma abbin 7+7 (c48t, contro il
+commit 21bf4fd): **+9,9 +- 2,1 ms/fotogramma** su 10 corse a regime, e 2 fermi
+muti contro 1 (c48t_5_on, c48t_6_on; c48t_3_off). Causa non capita (il campo
+sta a >256 KB dall'inizio del contesto: ogni accesso materializza l'offset;
+forse il compilatore non tiene piu' in registro qualcosa dopo le scritture
+via ctx). Non riprovare in questa forma; se mai, campo in TESTA al contesto.
+
 ## Storico
 
 Sessioni fino alla 37 e la vecchia "Dove siamo", verbatim, in
