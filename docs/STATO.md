@@ -1,6 +1,6 @@
 # Stato del progetto
 
-Ultimo aggiornamento: **26 settembre 2026** — sessione 47.
+Ultimo aggiornamento: **27 settembre 2026** — sessione 48.
 
 ## Dove siamo
 
@@ -1034,6 +1034,31 @@ ms/fotogramma** (159 -> 155 a 2.200 draw). Meno della sonda: le barriere asm
 gonfiavano il costo. Fermi (fps 2-10) in entrambe le versioni: 5 col formato
 vecchio, 3-4 col nuovo, su 42 corse -- frequenza alta dopo il riavvio del Mac
 (lotto c47y: 6/14), non legata alla modifica. Screenshot a 110 s corretti.
+
+**Tre costi del runtime SPU** (s.48, 27/09). Profilo `sample` 10 s a 100 s
+(24.172 campioni attivi): `spu_ls_copy_in` 971 (4%, la copia DMA->LS con
+rev32 della s.47), `_platform_memset` 349 (azzeramento del PM a ogni corsa),
+`spu_frest` 237, `mfc_for` 217, `spu_lookup` 197. xctrace dentro copy_in:
+i campioni stanno sulla load (memoria), ma il giro da 16 byte rendeva poco.
+1. `spu__ls_xcopy` (spu_context.h): corpo a 64 byte per giro (ld1/st1 x4 +
+   4 rev32) fino al bordo della LS. Test differenziale 200.000 casi (anche
+   avvolgimento a 256 KB) = 0 errori; banco a L1 calda uguale fino a 512 B,
+   16 KB 53 -> 82 GB/s. Nel gioco copy_in / job caldo 0,22 -> 0,16.
+2. Azzeramento parziale del PM (spurs_policy.c): la coda del contesto si
+   azzera tranne irq_gpr (8 KB, letti solo sotto irq_save_valid), ib_cache
+   (4 KB, chiavi valide per sempre: prima il PM la perdeva a ogni corsa) e
+   mfc_cache. memset 349 -> 134-162, spu_lookup 197 -> 86.
+3. `mfc_for` con il caso comune in linea (spu_channels.c): 217 -> 0.
+4. `spu_frest` in NEON (spu_helpers.h): una vdivq_f32 per le 4 corsie, via
+   esatta (`spu_frest_slow`) per ingressi con esponente 0/255 o risultato
+   denormale. Equivalente perche' l'FPCR delle lane e' verso lo zero:
+   troncare 1/x in float = troncare in double e poi a float. Test 80 M
+   corsie con FPCR FZ+RZ: 0 differenze. 237 -> ~10.
+Senza interruttori a runtime: A/B di binari (`uncharted_s47` = fine s.47).
+**abbin 7+7 (c48)**: **-11,0 +- 3,3 ms CPU/fotogramma** (a 2.200 draw 158 ->
+147), 11 corse a regime. Due corse ferme mute a ~#2670, UNA PER VERSIONE
+(c48_1_off, c48_2_on: tipo B noto, niente assert), una lenta (c48_4_on,
+24,9 fps) esclusa come nella s.47.
 
 ## Storico
 

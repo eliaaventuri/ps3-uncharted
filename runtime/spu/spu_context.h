@@ -451,6 +451,17 @@ static inline void spu__ls_xcopy(uint8_t* ls, uint32_t lsa, uint8_t* buf, uint32
         if (to_ls) ls[SPU_LSB((lsa + i) & SPU_LS_MASK)] = buf[i]; else buf[i] = ls[SPU_LSB((lsa + i) & SPU_LS_MASK)];
         i++; }
 #if defined(__aarch64__) && defined(__ARM_NEON)
+    {   /* corpo a 64 byte per giro fino al bordo della LS (s.48: il giro da 16
+         * costava 8 istruzioni ogni 16 byte, spu_ls_copy_in 4% della CPU) */
+        uint32_t o = (lsa + i) & SPU_LS_MASK, k = n - i;
+        if (k > SPU_LS_SIZE - o) k = SPU_LS_SIZE - o;
+        uint8_t* l = ls + o; uint8_t* b = buf + i; uint8_t* e = l + (k & ~63u);
+        for (; l < e; l += 64, b += 64) {
+            uint8x16x4_t v = vld1q_u8_x4(to_ls ? b : l);
+            v.val[0] = vrev32q_u8(v.val[0]); v.val[1] = vrev32q_u8(v.val[1]);
+            v.val[2] = vrev32q_u8(v.val[2]); v.val[3] = vrev32q_u8(v.val[3]);
+            vst1q_u8_x4(to_ls ? l : b, v); }
+        i += k & ~63u; }
     for (; i + 16 <= n && ((lsa + i) & SPU_LS_MASK) + 16 <= SPU_LS_SIZE; i += 16) {
         uint8_t* l = ls + ((lsa + i) & SPU_LS_MASK);
         if (to_ls) vst1q_u8(l, vrev32q_u8(vld1q_u8(buf + i))); else vst1q_u8(buf + i, vrev32q_u8(vld1q_u8(l))); }

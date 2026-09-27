@@ -196,8 +196,16 @@ int spu_run_policy_module(spu_lifted_entry_fn entry, int image_id,
         if (s_fresh_ls >= SPU_LS_SIZE) spu_context_init(ctx, 0);
         else {
             memset(ctx, 0, offsetof(spu_context, ls) + (size_t)s_fresh_ls);
+            /* s.48: la coda si azzera tranne irq_gpr (letti solo sotto
+             * irq_save_valid, che torna 0), ib_cache (chiavi valide per sempre)
+             * e mfc_cache (mfc_for ritroverebbe lo stesso slot, ma sotto lock):
+             * 14 KB in meno per corsa, memset e mfc_for nel profilo del PM. */
+            void* mfc_keep = ctx->mfc_cache;
             memset((uint8_t*)ctx + offsetof(spu_context, ls) + SPU_LS_SIZE, 0,
-                   sizeof(*ctx) - offsetof(spu_context, ls) - SPU_LS_SIZE);
+                   offsetof(spu_context, irq_gpr) - offsetof(spu_context, ls) - SPU_LS_SIZE);
+            memset(&ctx->dec_cache_ns, 0,
+                   offsetof(spu_context, ib_cache) - offsetof(spu_context, dec_cache_ns));
+            ctx->mfc_cache = mfc_keep;
             ctx->spu_id = 0;
             ctx->status = SPU_STATUS_STOPPED;
         }

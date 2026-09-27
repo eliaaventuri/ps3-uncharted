@@ -507,7 +507,22 @@ static inline u128 spu_fcmgt(u128 a, u128 b){ u128 r; for(int i=0;i<4;i++){ doub
 static inline u128 spu_frsqest(u128 a){ u128 r; for(int i=0;i<4;i++){ double x=fabs(SPU__F(a,i)); r._u32[i]= x>0.0 ? spu__d2f(1.0/sqrt(x)) : 0x7F800000u; } return r; }
 /* frest: reciprocal estimate; exact 1/x (fi is then the identity). Zero ->
  * largest float with the sign of the input, as the hardware saturates. */
+#if defined(__aarch64__) && defined(__ARM_NEON)
+static __attribute__((noinline)) u128 spu_frest_slow(u128 a){ u128 r; for(int i=0;i<4;i++){ double x=SPU__F(a,i); r._u32[i]= x!=0.0 ? spu__d2f(1.0/x) : ((a._u32[i]&0x80000000u)|0x7F800000u); } return r; }
+/* s.48: una divisione NEON per le 4 corsie (erano 4 divisioni in double,
+ * ~1% della CPU). Nelle lane l'FPCR e' verso lo zero (spu_host_fp_enter), e
+ * troncare 1/x in float o in double e poi a float da' lo stesso valore; la
+ * via esatta resta per ingressi con esponente 0/255 e risultati denormali. */
+static inline u128 spu_frest(u128 a){
+    uint32x4_t w = vld1q_u32(a._u32), m = vdupq_n_u32(0x7F800000u);
+    float32x4_t q = vdivq_f32(vdupq_n_f32(1.0f), vreinterpretq_f32_u32(w));
+    uint32x4_t ei = vandq_u32(w, m), eq = vandq_u32(vreinterpretq_u32_f32(q), m);
+    uint32x4_t bad = vorrq_u32(vorrq_u32(vceqzq_u32(ei), vceqq_u32(ei, m)), vceqzq_u32(eq));
+    if (__builtin_expect(vmaxvq_u32(bad) == 0, 1)) { u128 r; vst1q_u32(r._u32, vreinterpretq_u32_f32(q)); return r; }
+    return spu_frest_slow(a); }
+#else
 static inline u128 spu_frest(u128 a){ u128 r; for(int i=0;i<4;i++){ double x=SPU__F(a,i); r._u32[i]= x!=0.0 ? spu__d2f(1.0/x) : ((a._u32[i]&0x80000000u)|0x7F800000u); } return r; }
+#endif
 
 /* ---- Phase 3: sign extension ----
  * LE host: low sub-lane = _u8[2i] / _s16[2i] / _s32[2i] (the byte/half/word

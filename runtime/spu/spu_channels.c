@@ -287,9 +287,16 @@ static spu_mfc_slot s_mfc_slots[SPU_MAX_CONTEXTS];
 static void resv_lock_ea(uint32_t ea);
 static void resv_unlock_ea(uint32_t ea);
 
-static mfc_engine* mfc_for(spu_context* ctx)
+static mfc_engine* mfc_for_slow(spu_context* ctx);
+/* s.48: il caso comune in linea (mfc_for fuori linea = ~150 campioni su 10 s) */
+static inline mfc_engine* mfc_for(spu_context* ctx)
 {
-    if (ctx->mfc_cache) return (mfc_engine*)ctx->mfc_cache;
+    if (__builtin_expect(ctx->mfc_cache != NULL, 1)) return (mfc_engine*)ctx->mfc_cache;
+    return mfc_for_slow(ctx);
+}
+
+static mfc_engine* mfc_for_slow(spu_context* ctx)
+{
     /* Ricerca/assegnazione sotto lock: le lane di un workload partono
      * insieme, e senza lock due contesti si prendevano lo stesso slot. */
     mfc_engine* m = NULL;
