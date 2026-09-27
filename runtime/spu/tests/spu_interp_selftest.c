@@ -45,7 +45,7 @@ int main(void) {
     assert(ctx.status == SPU_STATUS_STOPPED_BY_STOP);
 
     /* stqd $4,0($1): LS[0x100] holds 112 big-endian in the preferred word. */
-    const unsigned char* q = &ctx.ls[0x100];
+    const unsigned char* q = spu_ls_be(ctx.ls, 0x100, 64);
     unsigned w = ((unsigned)q[0]<<24)|((unsigned)q[1]<<16)|((unsigned)q[2]<<8)|q[3];
     assert(w == 112);
 

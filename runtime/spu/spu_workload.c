@@ -143,9 +143,9 @@ int spu_elf_load_to_ls(const uint8_t* image, size_t image_size, uint8_t* ls, uin
         if ((uint64_t)p_vaddr + p_memsz > SPU_LS_SIZE)            return 0;
         if ((uint64_t)p_offset + p_filesz > image_size)          return 0;
 
-        if (p_filesz) memcpy(ls + p_vaddr, image + p_offset, p_filesz);
+        if (p_filesz) spu_ls_copy_in(ls, p_vaddr, image + p_offset, p_filesz);
         if (p_memsz > p_filesz)
-            memset(ls + p_vaddr + p_filesz, 0, p_memsz - p_filesz);
+            spu_ls_zero(ls, p_vaddr + p_filesz, p_memsz - p_filesz);
     }
     if (entry_out) *entry_out = e_entry;
     return 1;
@@ -401,7 +401,7 @@ static void spu_async_run(spu_async_job* j)
                  * + r80=0x100 context base, mirroring the kernel->policy handoff. */
                 extern uint8_t* vm_base;
                 extern void tsp_spu_func_00000A00(spu_context*);
-                if (vm_base) memcpy(ls + 0xA00, vm_base + 0x30023680, 0x2200);
+                if (vm_base) spu_ls_copy_in(ls, 0xA00, vm_base + 0x30023680, 0x2200);
                 /* Build the REAL SpursTasksetContext at LS 0x2700 (taskset ptr @0x27B8,
                  * TaskInfo @0x2780, syscallAddr @0x27C4) from the actual game taskset,
                  * so the policy's DMAs read valid data instead of garbage. The instance
@@ -412,10 +412,8 @@ static void spu_async_run(spu_async_job* j)
                 if (g_ydkj_real_taskset_ea)
                     spurs_pm_build_context(ls, g_ydkj_real_taskset_ea, g_ydkj_real_taskid, 0, 0);
                 uint32_t inst = g_ydkj_real_spurs_ea ? g_ydkj_real_spurs_ea : 0x40009D00u;
-                uint8_t* p = ls + 0x1C0;
-                p[0]=0; p[1]=0; p[2]=0; p[3]=0;                 /* hi32 of u64 */
-                p[4]=(uint8_t)(inst>>24); p[5]=(uint8_t)(inst>>16);
-                p[6]=(uint8_t)(inst>>8);  p[7]=(uint8_t)inst;   /* lo32 */
+                spu_ls_put32(ls, 0x1C0, 0);                     /* hi32 of u64 */
+                spu_ls_put32(ls, 0x1C4, inst);                  /* lo32 */
                 fprintf(stderr, "[cri] YDKJ_CRI_TASKSET: loaded taskset policy@0xA00, LS[0x1C0]=inst, running policy entry (img23)\n");
                 fflush(stderr);
                 /* Run the taskset policy entry instead of the cri task entry.
@@ -439,7 +437,7 @@ static void spu_async_run(spu_async_job* j)
             if (j->image_id == 22 && !getenv("YDKJ_NO_CRI_CTX")) {
                 extern uint64_t spurs_pm_build_context(uint8_t*, uint32_t, uint32_t, uint32_t, uint32_t);
                 extern uint32_t g_ydkj_real_taskset_ea, g_ydkj_real_taskid;
-                #define LSBE32(o,v) do{uint32_t _v=(v);ls[(o)+0]=(uint8_t)(_v>>24);ls[(o)+1]=(uint8_t)(_v>>16);ls[(o)+2]=(uint8_t)(_v>>8);ls[(o)+3]=(uint8_t)_v;}while(0)
+                #define LSBE32(o,v) spu_ls_put32(ls, (o), (v))
                 if (g_ydkj_real_taskset_ea && !getenv("YDKJ_MINIMAL_CTX")) {
                     /* REAL taskset context: build the SpursTasksetContext at LS 0x2700
                      * from the actual BE CellSpursTaskset (spurs ptr, args, TaskInfo)
@@ -583,8 +581,7 @@ static void spu_async_run(spu_async_job* j)
                                                             (uint64_t)ts, 3, real2700, sizeof real2700);
                     fprintf(stderr, "[real-pm] status=0x%X -- LS 0x2700 diff (build_context vs real policy):\n", st);
                     for (uint32_t o = 0; o < sizeof real2700; o += 4) {
-                        uint32_t bc = ((uint32_t)ls[0x2700+o]<<24)|((uint32_t)ls[0x2700+o+1]<<16)|
-                                      ((uint32_t)ls[0x2700+o+2]<<8)|ls[0x2700+o+3];
+                        uint32_t bc = spu_ls_get32(ls, 0x2700+o);
                         uint32_t rp = ((uint32_t)real2700[o]<<24)|((uint32_t)real2700[o+1]<<16)|
                                       ((uint32_t)real2700[o+2]<<8)|real2700[o+3];
                         if (bc != rp)
@@ -597,7 +594,7 @@ static void spu_async_run(spu_async_job* j)
                      * green, the frame-output gate is Bink-layer (H2). Keeps the
                      * build_context 0x100 kernel ctx (moduleId "TK") intact. */
                     if (getenv("LBP_POLICY_CTX")) {
-                        memcpy(ls + 0x2700, real2700, sizeof real2700);
+                        spu_ls_copy_in(ls, 0x2700, real2700, sizeof real2700);
                         fprintf(stderr, "[real-pm] OVERLAID policy ctx onto binkspu LS 0x2700 (LBP_POLICY_CTX)\n");
                     }
                     fflush(stderr);

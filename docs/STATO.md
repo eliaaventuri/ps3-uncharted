@@ -1014,6 +1014,27 @@ esclusa c47s_5_off, fermo tipo B a #3829 nella versione SENZA la modifica).
 La chiamata non era il costo: non riprovare. Il fermo conferma che il tipo B
 non dipende dalle modifiche di questa sessione.
 
+**Local store in ordine di parola dell'host** (s.47, 27/09). Sonda: due rev32
+in piu' per accesso lqd/stqd (con barriere asm) = +16,1 +- 3,7 ms/fotogramma,
+quindi la rev32 esistente valeva fino a ~8 ms. Ora `SPU_LS_XOR` (nuovo
+`runtime/spu/spu_ls_order.h`, default 3 su aarch64+NEON, 0 altrove): il byte
+SPU `a` sta all'indice fisico `a ^ 3`, i quadword si leggono con una load
+semplice (rev32 nella funzione calda 518 -> 3, istruzioni 13.279 -> 12.699).
+Tutti i ~130 accessi del runtime alla LS passano da accessori in
+spu_context.h: `spu_ls_get8/set8/get32/put32`, `spu_ls_copy_in/out` (DMA,
+atomici, caricatori ELF/job, contesto del PM), `spu_ls_zero`, `spu_ls_be`
+(vista big-endian in un buffer del thread per sonde e dump). Toccati anche
+lv2_register.c (sys_spu_thread_read/write_ls, caricamento immagini) e
+libs/spurs/spurs_pm.c. Regola: nessuno tocca `ctx->ls[...]` o fa memcpy
+da/verso la LS se non attraverso questi. A/B: runtime e SPU con
+-DSPU_LS_XOR=0 (`cmake -B build_x0 -DCMAKE_C_FLAGS=-DSPU_LS_XOR=0 ...`,
+`SPU_DEFS="-DSPU_LS_NODIAG -DSPU_LS_XOR=0" RT_BUILD=build_x0 ./uncharted/build.sh`).
+Tre lotti 7+7 (c47x/y/z), 32 corse a regime (>= 30,5 fps): **-3,6 +- 1,6
+ms/fotogramma** (159 -> 155 a 2.200 draw). Meno della sonda: le barriere asm
+gonfiavano il costo. Fermi (fps 2-10) in entrambe le versioni: 5 col formato
+vecchio, 3-4 col nuovo, su 42 corse -- frequenza alta dopo il riavvio del Mac
+(lotto c47y: 6/14), non legata alla modifica. Screenshot a 110 s corretti.
+
 ## Storico
 
 Sessioni fino alla 37 e la vecchia "Dove siamo", verbatim, in

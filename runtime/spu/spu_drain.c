@@ -134,13 +134,10 @@ void spu_task_launch_check(spu_context* ctx, void* fn)
      * record that is non-empty and not already done. */
     int marked = 0;
     for (int i = 0; i < 16; i++) {
-        uint8_t* r = &ctx->ls[0xDF0 + i * 4];
-        uint32_t w = ((uint32_t)r[0] << 24) | ((uint32_t)r[1] << 16) |
-                     ((uint32_t)r[2] << 8) | r[3];
+        uint32_t w = spu_ls_get32(ctx->ls, 0xDF0 + i * 4);
         if (w == 0 || (w & 0x80000000u)) continue;
         w |= 0x80000000u;
-        r[0] = (uint8_t)(w >> 24); r[1] = (uint8_t)(w >> 16);
-        r[2] = (uint8_t)(w >> 8);  r[3] = (uint8_t)w;
+        spu_ls_put32(ctx->ls, 0xDF0 + i * 4, w);
         marked++;
     }
     static int _n = 0;
@@ -265,9 +262,7 @@ void (*spu_take_interrupt(spu_context* ctx,
         if (--g_sn_defer == 0) g_sn_defer_ctx = 0;
         return tf;
     }
-    const uint8_t* v = ctx->ls;      /* vector word at LS 0, big-endian */
-    uint32_t w = ((uint32_t)v[0] << 24) | ((uint32_t)v[1] << 16) |
-                 ((uint32_t)v[2] << 8) | v[3];
+    uint32_t w = spu_ls_get32(ctx->ls, 0);   /* vector word at LS 0 */
     uint32_t op9 = w >> 23;          /* top 9 opcode bits */
     uint32_t target;
     if (op9 == 0x060) {              /* bra i16 (absolute) */
@@ -302,7 +297,7 @@ void (*spu_take_interrupt(spu_context* ctx,
            * (a) the ch25 stall mask has tag 0 (kLoadJob_readCommands) AND
            * (b) loadJobState's HALFWORDS compare equal to 1 (ceqhi).
            * Log both at interrupt entry so we can see which test fails. */
-          const uint8_t* js = ctx->ls + 0x12A0;   /* g_WwsJob_loadJobState quadword */
+          const uint8_t* js = spu_ls_be(ctx->ls, 0x12A0, 16);   /* g_WwsJob_loadJobState quadword */
           fprintf(stderr, "[spu-int] TAKEN img=%d events=0x%X&0x%X vector->0x%05X "
                   "(srr0=0x%05X) stallstat=0x%X parked=0x%X loadJobState@12A0=%02X%02X%02X%02X "
                   "%02X%02X%02X%02X %02X%02X%02X%02X %02X%02X%02X%02X\n", ctx->image_id,

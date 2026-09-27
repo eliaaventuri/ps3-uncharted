@@ -65,12 +65,11 @@ static uint64_t g64(uint32_t ea)
 /* ---- local-store writes (big-endian) ----------------------------------- */
 static void ls32(uint8_t* ls, uint32_t o, uint32_t v)
 {
-    ls[o] = (uint8_t)(v >> 24); ls[o+1] = (uint8_t)(v >> 16);
-    ls[o+2] = (uint8_t)(v >> 8); ls[o+3] = (uint8_t)v;
+    spu_ls_put32(ls, o, v);
 }
 static void ls16(uint8_t* ls, uint32_t o, uint16_t v)
 {
-    ls[o] = (uint8_t)(v >> 8); ls[o+1] = (uint8_t)v;
+    spu_ls_set8(ls, o, (uint8_t)(v >> 8)); spu_ls_set8(ls, o + 1, (uint8_t)v);
 }
 
 /* CellSpursJobHeader, 48 B — job_descriptor.h */
@@ -173,7 +172,7 @@ int spu_run_spurs_job(spu_lifted_entry_fn entry, int image_id,
     if (!ls) return -1;
 
     /* ---- binary at LS 0 (PIC, so delta 0 keeps the lifted addresses) ---- */
-    memcpy(ls, vm_base + ea_bin, size_bin);
+    spu_ls_copy_in(ls, 0, vm_base + ea_bin, size_bin);
 
     /* ---- regions, following _cellSpursCheckJob's own arithmetic --------- */
     uint32_t p         = ALIGN1024(size_bin);
@@ -209,7 +208,7 @@ int spu_run_spurs_job(spu_lifted_entry_fn entry, int image_id,
         if (!sz || !eal) continue;
         if (p + sz > SPU_LS_SIZE) break;
         cache_ls[i] = p;
-        memcpy(ls + p, vm_base + eal, sz);
+        spu_ls_copy_in(ls, p, vm_base + eal, sz);
         p += ALIGN1024(sz);
     }
 
@@ -221,7 +220,7 @@ int spu_run_spurs_job(spu_lifted_entry_fn entry, int image_id,
         uint32_t eal = (uint32_t)e;
         if (!sz || !eal) continue;
         if (!io_ls || io_cur + sz > SPU_LS_SIZE) break;
-        memcpy(ls + io_cur, vm_base + eal, sz);
+        spu_ls_copy_in(ls, io_cur, vm_base + eal, sz);
         io_cur  += (sz + 15u) & ~15u;
         io_used += (sz + 15u) & ~15u;
     }
@@ -236,7 +235,7 @@ int spu_run_spurs_job(spu_lifted_entry_fn entry, int image_id,
     if (p > ctx_ls)
         fprintf(stderr, "[spurs-job] job 0x%08X: WARNING regions reach 0x%X, "
                         "past the context at 0x%X\n", job_ea, p, ctx_ls);
-    memcpy(ls + desc_ls, vm_base + job_ea, dsz);
+    spu_ls_copy_in(ls, desc_ls, vm_base + job_ea, dsz);
 
     ls32(ls, ctx_ls + JC_IO_BUFFER, io_ls);
     for (int i = 0; i < 4; i++)

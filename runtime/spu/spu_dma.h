@@ -276,17 +276,17 @@ static inline void spu_adma_dump(spu_context* spu)
         uint32_t sz = e->size, nd = 0, first = ~0u;
         if (e->lsa + sz > SPU_LS_SIZE) sz = SPU_LS_SIZE - e->lsa;
         for (uint32_t k = 0; k < sz; k++)
-            if (spu->ls[e->lsa + k] != vm_base[e->ea + k]) { if (first == ~0u) first = k; nd++; }
+            if (spu_ls_get8(spu->ls, e->lsa + k) != vm_base[e->ea + k]) { if (first == ~0u) first = k; nd++; }
         p += snprintf(b + p, sizeof b - p, "[adma]   run=%u pc=0x%05X cmd=0x%02X lsa=0x%05X ea=0x%08X size=0x%X  LS!=mem ora: %u byte",
                       e->run, e->pc, e->cmd, e->lsa, e->ea, e->size, nd);
         if (nd) p += snprintf(b + p, sizeof b - p, " (primo a +0x%X: LS %02X mem %02X)", first,
-                              spu->ls[e->lsa + first], vm_base[e->ea + first]);
+                              spu_ls_get8(spu->ls, e->lsa + first), vm_base[e->ea + first]);
         p += snprintf(b + p, sizeof b - p, "\n");
     }
     for (uint32_t a = 0xC00; a < 0xD20 && p < (int)sizeof b - 80; a += 32) {
         p += snprintf(b + p, sizeof b - p, "[adma]   LS %05X:", a);
         for (uint32_t k = 0; k < 32; k += 4)
-            p += snprintf(b + p, sizeof b - p, " %02X%02X%02X%02X", spu->ls[a+k], spu->ls[a+k+1], spu->ls[a+k+2], spu->ls[a+k+3]);
+            p += snprintf(b + p, sizeof b - p, " %08X", spu_ls_get32(spu->ls, a+k));
         p += snprintf(b + p, sizeof b - p, "\n");
     }
     fputs(b, stderr); fflush(stderr);
@@ -337,27 +337,25 @@ static inline int mfc_do_transfer(spu_context* spu, uint32_t lsa, uint64_t ea,
           size != 0 && size <= MFC_MAX_DMA_SIZE && !(size >= 16 && (size & 15)) &&
           !((lsa ^ (uint32_t)ea) & 15) && !(mfc_is_put(cmd) && (uint32_t)ea < 0x10000u) &&
           l + size <= SPU_LS_SIZE && mfc_ea_range_committed(ea, size)) {
-          uint8_t* ls_ptr = &spu->ls[l];
+          uint8_t* ls_ptr = &spu->ls[l];     /* solo come base: i byte passano da spu_ls_* (s.47) */
           uint8_t* ea_ptr = vm_base + (uint32_t)ea;
           if (mfc_is_get(cmd)) {
               { extern int g_cri_video_dma;
                 if (spu->image_id == 22 && size > 0x100) g_cri_video_dma = 1; }
-              memcpy(ls_ptr, ea_ptr, size);
+              spu_ls_copy_in(spu->ls, l, ea_ptr, size);
               { extern void spu_overlay_note_get(spu_context*, uint32_t, const uint8_t*, uint32_t);
                 spu_overlay_note_get(spu, (uint32_t)ea, (const uint8_t*)ls_ptr, size); }
               /* report RSX "in ritardo": v. il percorso completo */
               if (size == 16 && ((uint32_t)ea & 15) == 0 &&
-                  ls_ptr[8] == 0xFF && ls_ptr[9] == 0xFF && ls_ptr[10] == 0xFF && ls_ptr[11] == 0xFF) {
+                  spu_ls_get32(spu->ls, l + 8) == 0xFFFFFFFFu) {
                   extern int rsx_report_shadow_get(uint32_t ea, uint32_t* val);
                   uint32_t v;
-                  if (rsx_report_shadow_get((uint32_t)ea, &v)) {
-                      ls_ptr[8] = (uint8_t)(v >> 24); ls_ptr[9] = (uint8_t)(v >> 16);
-                      ls_ptr[10] = (uint8_t)(v >> 8); ls_ptr[11] = (uint8_t)v; } }
+                  if (rsx_report_shadow_get((uint32_t)ea, &v)) spu_ls_put32(spu->ls, l + 8, v); }
           } else if (mfc_is_put(cmd)) {
               /* park dei pacchetti RSX: v. il percorso completo */
-              if (size >= 4) { uint32_t w0 = ((uint32_t)ls_ptr[0] << 24) | ((uint32_t)ls_ptr[1] << 16) | ((uint32_t)ls_ptr[2] << 8) | ls_ptr[3];
+              if (size >= 4) { uint32_t w0 = spu_ls_get32(spu->ls, l);
                   if ((w0 >> 29) == 1u) { extern void cellGcm_note_park_put(uint32_t ea, uint32_t word); cellGcm_note_park_put((uint32_t)ea, w0); } }
-              memcpy(ea_ptr, ls_ptr, size);
+              spu_ls_copy_out(spu->ls, l, ea_ptr, size);
           }
           return 0;
       } }
@@ -383,13 +381,14 @@ static inline int mfc_do_transfer(spu_context* spu, uint32_t lsa, uint64_t ea,
         /* la nota va formattata solo con SPU_WRING acceso: la snprintf a ogni
          * PUT era il 2% del tempo delle lane (s.38, `sample`) */
         if (spu_wring_on()) { char kb[12]; snprintf(kb, sizeof kb, "P%02X@%X", cmd & 0xFF, lsa >> 4);
-            spu_wring_note(spu, kb, (uint32_t)ea, size, &spu->ls[lsa]); }
+            static __thread uint8_t tb[MFC_MAX_DMA_SIZE]; spu_ls_copy_out(spu->ls, lsa, tb, size <= MFC_MAX_DMA_SIZE ? size : MFC_MAX_DMA_SIZE);
+            spu_wring_note(spu, kb, (uint32_t)ea, size <= MFC_MAX_DMA_SIZE ? size : MFC_MAX_DMA_SIZE, tb); }
         /* Park dei pacchetti RSX (s.31): un PUT la cui prima parola e' un JUMP
          * (tipo 1) puo' essere il "JUMP-a-se-stesso" con cui il job 217
          * parcheggia un pacchetto CALLato; cellGcmSys decide (mappa IO->EA) e
          * conta le generazioni, cosi' il walker non consuma un pacchetto
          * vecchio prima che sia stato riparcheggiato e ripatchato. */
-        if (size >= 4) { const uint8_t* q = &spu->ls[lsa]; uint32_t w0 = ((uint32_t)q[0] << 24) | ((uint32_t)q[1] << 16) | ((uint32_t)q[2] << 8) | q[3];
+        if (size >= 4) { uint32_t w0 = spu_ls_get32(spu->ls, lsa);
             if ((w0 >> 29) == 1u) { extern void cellGcm_note_park_put(uint32_t ea, uint32_t word); cellGcm_note_park_put((uint32_t)ea, w0); } } }
     else if (mfc_is_get(cmd) && spu_wring_on()) { extern uint8_t* vm_base; char kb[12]; snprintf(kb, sizeof kb, "G%02X@%X", cmd & 0xFF, lsa >> 4);
         spu_wring_note(spu, kb, (uint32_t)ea, size, vm_base + (uint32_t)ea); }   /* le letture: dicono la base che il codice SPU usa */
@@ -418,7 +417,7 @@ static inline int mfc_do_transfer(spu_context* spu, uint32_t lsa, uint64_t ea,
     { static long s_pp = -2; if (s_pp == -2) { const char* e = getenv("SPU_PALETTE_PUT"); s_pp = e ? atol(e) : -1; }
       extern unsigned rsx_backend_frame_no(void);
       if (s_pp >= 0 && spu->resident_ovl == (int)s_pp && mfc_is_put(cmd) && size >= 0x300u && (size % 48u) == 0 && (long)rsx_backend_frame_no() >= s_pfrom) {
-          const uint8_t* q = &spu->ls[lsa & SPU_LS_MASK]; unsigned nb = size / 48, nn = 0, nz = 0; char lst[160]; int lp = 0; lst[0] = 0;
+          const uint8_t* q = spu_ls_be(spu->ls, lsa, size); unsigned nb = size / 48, nn = 0, nz = 0; char lst[160]; int lp = 0; lst[0] = 0;
           for (unsigned b = 0; b < nb; b++) { int an = 0, az = 1;
               for (int k = 0; k < 12; k++) { uint32_t w = ((uint32_t)q[b*48+k*4] << 24) | ((uint32_t)q[b*48+k*4+1] << 16) | ((uint32_t)q[b*48+k*4+2] << 8) | q[b*48+k*4+3]; if ((w & 0x7F800000u) == 0x7F800000u && (w & 0x007FFFFFu)) an = 1; if (w) az = 0; }
               if (an) { nn++; if (lp < 140) lp += snprintf(lst + lp, sizeof lst - lp, " %u", b); } if (az) nz++; }
@@ -491,7 +490,7 @@ static inline int mfc_do_transfer(spu_context* spu, uint32_t lsa, uint64_t ea,
       if (s_v == -2) { const char* e = getenv("SPU_PUT_VAL"); s_v = (e && *e) ? (long)strtoul(e, 0, 16) : -1;
                        const char* c = e ? strchr(e, ':') : 0; if (c) s_m = (uint32_t)strtoul(c + 1, 0, 16); }
       if (s_v >= 0 && (mfc_is_put(cmd) || (mfc_is_get(cmd) && (uint64_t)(uint32_t)ea + size <= 0xC0000000ull)) && size >= 4) { static int _n = 0;
-          const uint8_t* q = mfc_is_put(cmd) ? &spu->ls[lsa & SPU_LS_MASK] : vm_base + (uint32_t)ea;
+          const uint8_t* q = mfc_is_put(cmd) ? spu_ls_be(spu->ls, lsa, size) : vm_base + (uint32_t)ea;
           for (uint32_t k = 0; k + 4 <= size && _n < 200; k += 2) {
               uint32_t w = ((uint32_t)q[k] << 24) | ((uint32_t)q[k+1] << 16) | ((uint32_t)q[k+2] << 8) | q[k+3];
               if ((w & s_m) == ((uint32_t)s_v & s_m)) { _n++;
@@ -555,7 +554,7 @@ static inline int mfc_do_transfer(spu_context* spu, uint32_t lsa, uint64_t ea,
                     for (int k = 0; k < 4; k++) { w[k] = ((uint32_t)q[k*4] << 24) | ((uint32_t)q[k*4+1] << 16) | ((uint32_t)q[k*4+2] << 8) | q[k*4+3]; memcpy(&f[k], &w[k], 4); }
                     fprintf(stderr, "  %08lX: %08X %08X %08X %08X  %9.4f %9.4f %9.4f %9.4f\n", s_md + o, w[0], w[1], w[2], w[3], f[0], f[1], f[2], f[3]); } } }
           if (_n <= 100000 && mfc_is_put(cmd)) {
-              const unsigned char* _p = &spu->ls[lsa & SPU_LS_MASK];
+              const unsigned char* _p = spu_ls_be(spu->ls, lsa, size);
               fprintf(stderr, "            dati: %02X%02X%02X%02X %02X%02X%02X%02X",
                       _p[0], _p[1], _p[2], _p[3], _p[4], _p[5], _p[6], _p[7]);
               /* SPU_DMA_EAWIN_FULL=1: tutto il trasferimento (max 64 parole) */
@@ -570,7 +569,7 @@ static inline int mfc_do_transfer(spu_context* spu, uint32_t lsa, uint64_t ea,
     { static long s_pv = -1;
       if (s_pv < 0) { const char* e = getenv("SPU_DMA_PUTVAL"); s_pv = e ? (long)strtoul(e, 0, 16) : 0; }
       if (s_pv && mfc_is_put(cmd) && size >= 4) {
-          const unsigned char* _p = &spu->ls[lsa & SPU_LS_MASK];
+          const unsigned char* _p = spu_ls_be(spu->ls, lsa, size);
           for (uint32_t i = 0; i + 4 <= size && i < 0x4000; i += 4) {
               uint32_t w = ((uint32_t)_p[i] << 24) | ((uint32_t)_p[i+1] << 16) | ((uint32_t)_p[i+2] << 8) | _p[i+3];
               if (w == (uint32_t)s_pv) { static int _n = 0; if (_n++ < 40)
@@ -696,7 +695,7 @@ static inline int mfc_do_transfer(spu_context* spu, uint32_t lsa, uint64_t ea,
            * are both in there. */
           if (tot == 1 && (uint32_t)ea == 0) {
               FILE* f = fopen("spu_ls_nullput.bin", "wb");
-              if (f) { fwrite(spu->ls, 1, 0x40000, f); fclose(f);
+              if (f) { fwrite(spu_ls_be(spu->ls, 0, SPU_LS_SIZE), 1, 0x40000, f); fclose(f);
                   fprintf(stderr, "[put] wrote spu_ls_nullput.bin (pc=0x%05X)%c",
                           (uint32_t)spu->pc & SPU_LS_MASK, 10); }
           }
@@ -704,7 +703,7 @@ static inline int mfc_do_transfer(spu_context* spu, uint32_t lsa, uint64_t ea,
             u32 k = (uint32_t)ea & ~0xFFFFu;       /* 64 KB granularity */
             int f = 0; for (int i = 0; i < ns; i++) if (seen[i] == k) f = 1;
             if (!f && ns < 48) { seen[ns++] = k;
-                { u32 nzs = 0; const uint8_t* sp2 = &spu->ls[lsa & SPU_LS_MASK];
+                { u32 nzs = 0; const uint8_t* sp2 = spu_ls_be(spu->ls, lsa, size);
                   for (uint32_t i6 = 0; i6 < size && i6 < 0x4000u; i6 += 7)
                       if (sp2[i6]) nzs++;
                   fprintf(stderr, "[putea] spu=0x%X 0x%08X size=%u srcNonZero=%u%c",
@@ -750,9 +749,9 @@ static inline int mfc_do_transfer(spu_context* spu, uint32_t lsa, uint64_t ea,
               for (int r = 0; r < 336; r += 16) {
                   fprintf(stderr, "[mfc-null]  LS[0x25200+%03X]:", r);
                   for (int k = 0; k < 16; k += 4)
-                      fprintf(stderr, " %02X%02X%02X%02X", spu->ls[(0x25200+r+k)&SPU_LS_MASK],
-                              spu->ls[(0x25200+r+k+1)&SPU_LS_MASK], spu->ls[(0x25200+r+k+2)&SPU_LS_MASK],
-                              spu->ls[(0x25200+r+k+3)&SPU_LS_MASK]);
+                      fprintf(stderr, " %02X%02X%02X%02X", spu_ls_get8(spu->ls, 0x25200+r+k),
+                              spu_ls_get8(spu->ls, 0x25200+r+k+1), spu_ls_get8(spu->ls, 0x25200+r+k+2),
+                              spu_ls_get8(spu->ls, 0x25200+r+k+3));
                   if (vm_base && last_node_ea) {
                       fprintf(stderr, "  | RAM[0x%08X+%03X]:", last_node_ea, r);
                       for (int k = 0; k < 16; k += 4)
@@ -809,7 +808,7 @@ static inline int mfc_do_transfer(spu_context* spu, uint32_t lsa, uint64_t ea,
          * actual complaint -- far more useful than the address it failed at. */
         { static int s_d = -1; if (s_d < 0) s_d = getenv("SPU_DMA_SKIP_DUMP") ? 1 : 0;
           if (s_d && s_warned <= 2) {
-            const uint8_t* q = spu->ls + (lsa & SPU_LS_MASK);
+            const uint8_t* q = spu_ls_be(spu->ls, lsa, 128);
             fprintf(stderr, "  LS[0x%05X] ascii: ", lsa);
             for (uint32_t i = 0; i < 128; i++)
                 fputc((q[i] >= 32 && q[i] < 127) ? q[i] : 46, stderr);
@@ -834,7 +833,7 @@ static inline int mfc_do_transfer(spu_context* spu, uint32_t lsa, uint64_t ea,
             (e32 & 0xFFFF0000u) == 0x470A0000u) {   /* ...or the completion-word POOL */
             static int _n = 0; if (_n++ < 60) {
                 uint32_t v0 = mfc_is_put(cmd) && size>=4 ?
-                    ((ls_ptr[0]<<24)|(ls_ptr[1]<<16)|(ls_ptr[2]<<8)|ls_ptr[3]) : 0;
+                    spu_ls_get32(spu->ls, lsa) : 0;
                 fprintf(stderr, "[stackea] %s ea=0x%08X lsa=0x%05X size=%u img=%d pc=0x%05X"
                         " ls_word0=0x%08X\n", mfc_is_get(cmd)?"GET":"PUT", e32, lsa, size,
                         spu->image_id, (uint32_t)spu->pc & SPU_LS_MASK, v0);
@@ -883,7 +882,7 @@ static inline int mfc_do_transfer(spu_context* spu, uint32_t lsa, uint64_t ea,
             static int _n = 0; if (_n++ < 20)
                 fprintf(stderr, "[nulldma] img%u GET ea=0x%08X size=%u -> ZEROED (skipped)\n",
                         spu->image_id, (uint32_t)ea, size);
-            memset(ls_ptr, 0, size);
+            spu_ls_zero(spu->ls, lsa, size);
             return 0;
         }
     }
@@ -917,13 +916,13 @@ static inline int mfc_do_transfer(spu_context* spu, uint32_t lsa, uint64_t ea,
               }
           } }
         /* GET: main memory -> local store */
-        memcpy(ls_ptr, ea_ptr, size);
+        spu_ls_copy_in(spu->ls, lsa, ea_ptr, size);
         /* SPU_STACKEA_WATCH (b): scan the just-loaded payload for a 0xD00Cxxxx
          * dword = the completion-word EA arriving in a job buffer. */
         { static int s_se = -1; if (s_se < 0) s_se = getenv("SPU_STACKEA_WATCH") ? 1 : 0;
           if (s_se && size >= 4) { static int _n = 0;
             for (uint32_t o = 0; o + 4 <= size && _n < 60; o += 4) {
-                uint32_t w = (ls_ptr[o]<<24)|(ls_ptr[o+1]<<16)|(ls_ptr[o+2]<<8)|ls_ptr[o+3];
+                uint32_t w = spu_ls_get32(spu->ls, lsa + o);
                 if ((w & 0xFFFF0000u) == 0xD00C0000u ||
                     (w & 0xFFFF0000u) == 0x470A0000u) { _n++;   /* completion-pool EA in payload */
                     fprintf(stderr, "[stackea] GET-payload has EA 0x%08X at LS 0x%05X"
@@ -960,16 +959,16 @@ static inline int mfc_do_transfer(spu_context* spu, uint32_t lsa, uint64_t ea,
          * lo spegne). */
         if (size == 16 && ((uint32_t)ea & 15) == 0) {
             extern int rsx_report_shadow_get(uint32_t ea, uint32_t* val);
-            uint8_t* q = (uint8_t*)ls_ptr; uint32_t v;
-            if (q[8] == 0xFF && q[9] == 0xFF && q[10] == 0xFF && q[11] == 0xFF && rsx_report_shadow_get((uint32_t)ea, &v)) {
-                q[8] = (uint8_t)(v >> 24); q[9] = (uint8_t)(v >> 16); q[10] = (uint8_t)(v >> 8); q[11] = (uint8_t)v;
+            uint32_t v;
+            if (spu_ls_get32(spu->ls, lsa + 8) == 0xFFFFFFFFu && rsx_report_shadow_get((uint32_t)ea, &v)) {
+                spu_ls_put32(spu->ls, lsa + 8, v);
                 { static int _n = 0; if (_n++ < 4) fprintf(stderr, "[mfc] report a 0x%08X ancora -1: consegnato l'ultimo valore RSX %u\n", (uint32_t)ea, v); } } }
         /* LBP_SPU_WATCH: a DMA GET landing on a watched LS line is how the PPU
          * delivers commands into the SPU's queue (bypasses spu_ls_write128). */
         { int _n; unsigned* _w = spu_ls_watch_list(&_n);
           for (int _i = 0; _i < _n; _i++) {
               if (_w[_i] >= lsa && _w[_i] < lsa + size) {
-                  const uint8_t* q = &spu->ls[_w[_i] & (SPU_LS_MASK & ~0xFu)];
+                  const uint8_t* q = spu_ls_be(spu->ls, _w[_i] & ~0xFu, 16);
                   fprintf(stderr, "[spu-watch DMA-GET 0x%05X <- ea=0x%08X sz=%u img=%d] "
                           "%02X%02X%02X%02X %02X%02X%02X%02X %02X%02X%02X%02X %02X%02X%02X%02X\n",
                           _w[_i], (uint32_t)ea, size, spu->image_id,
@@ -980,7 +979,7 @@ static inline int mfc_do_transfer(spu_context* spu, uint32_t lsa, uint64_t ea,
           } }
     } else if (mfc_is_put(cmd)) {
         /* PUT: local store -> main memory */
-        memcpy(ea_ptr, ls_ptr, size);
+        spu_ls_copy_out(spu->ls, lsa, ea_ptr, size);
         /* Bink sync-area watch (armed by the PPU barrier probe): log SPU PUTs
          * that touch the per-SPU lane counters. */
         { extern uint32_t g_barrier_sync_watch;
@@ -989,9 +988,8 @@ static inline int mfc_do_transfer(spu_context* spu, uint32_t lsa, uint64_t ea,
               static int _n = 0;
               if (_n++ < 64) {
                   /* spuNum lives in the kernel context at LS 0x1C8 (BE u32). */
-                  uint32_t sn = ((uint32_t)spu->ls[0x1C8]<<24)|((uint32_t)spu->ls[0x1C9]<<16)|
-                                ((uint32_t)spu->ls[0x1CA]<<8)|spu->ls[0x1CB];
-                  const uint8_t* lp = (const uint8_t*)ls_ptr;   /* the 16B being PUT */
+                  uint32_t sn = spu_ls_get32(spu->ls, 0x1C8);
+                  const uint8_t* lp = spu_ls_be(spu->ls, lsa, 16);   /* the 16B being PUT */
                   fprintf(stderr, "[sync-PUT] spuNum=%u pc=0x%05X ea=0x%08X (sync+0x%X) row={%02X%02X %02X%02X %02X%02X %02X%02X %02X%02X %02X%02X %02X%02X %02X%02X}\n",
                           sn, (uint32_t)spu->pc, (uint32_t)ea, (uint32_t)ea - b,
                           lp[0],lp[1],lp[2],lp[3],lp[4],lp[5],lp[6],lp[7],
@@ -1006,8 +1004,7 @@ static inline int mfc_do_transfer(spu_context* spu, uint32_t lsa, uint64_t ea,
           int hitregion = (e < 0x40005000u && e + size > 0x40003000u);
           int haspoison = 0;
           for (uint32_t o = 0; o + 4 <= size; o += 4) {
-              uint32_t w; memcpy(&w, (const char*)ls_ptr + o, 4);
-              if (w == 0x08C708C7u) { haspoison = 1; break; } /* 0xC708C708 BE in LS bytes */
+              if (spu_ls_get32(spu->ls, lsa + o) == 0xC708C708u) { haspoison = 1; break; }
           }
           if (hitregion || haspoison) {
               static int _n = 0;
@@ -1087,10 +1084,10 @@ static inline int mfc_run_list(spu_context* spu, uint32_t elem_lsa,
                         spu->list_stall_mask,
                         spu->int_enable, spu->event_mask, spu->event_status,
                         g_sn_defer,
-                        spu->ls[0x12A0], spu->ls[0x12A1],
-                        spu->ls[0x12A2], spu->ls[0x12A3],
-                        spu->ls[0x12A4], spu->ls[0x12A5],
-                        spu->ls[0x12A6], spu->ls[0x12A7]); }
+                        spu_ls_get8(spu->ls, 0x12A0), spu_ls_get8(spu->ls, 0x12A1),
+                        spu_ls_get8(spu->ls, 0x12A2), spu_ls_get8(spu->ls, 0x12A3),
+                        spu_ls_get8(spu->ls, 0x12A4), spu_ls_get8(spu->ls, 0x12A5),
+                        spu_ls_get8(spu->ls, 0x12A6), spu_ls_get8(spu->ls, 0x12A7)); }
             return 0;
         }
     }
@@ -1452,15 +1449,15 @@ static inline int mfc_submit(mfc_engine* mfc, spu_context* spu, uint32_t cmd)
                             (unsigned long long)ea);
                     for (uint32_t o=0x2700; o<0x27E0; o+=16)
                         fprintf(stderr, "   LS[0x%04X]: %02X%02X%02X%02X %02X%02X%02X%02X %02X%02X%02X%02X %02X%02X%02X%02X\n", o,
-                            spu->ls[o+0],spu->ls[o+1],spu->ls[o+2],spu->ls[o+3], spu->ls[o+4],spu->ls[o+5],spu->ls[o+6],spu->ls[o+7],
-                            spu->ls[o+8],spu->ls[o+9],spu->ls[o+10],spu->ls[o+11], spu->ls[o+12],spu->ls[o+13],spu->ls[o+14],spu->ls[o+15]);
+                            spu_ls_get8(spu->ls, o+0),spu_ls_get8(spu->ls, o+1),spu_ls_get8(spu->ls, o+2),spu_ls_get8(spu->ls, o+3), spu_ls_get8(spu->ls, o+4),spu_ls_get8(spu->ls, o+5),spu_ls_get8(spu->ls, o+6),spu_ls_get8(spu->ls, o+7),
+                            spu_ls_get8(spu->ls, o+8),spu_ls_get8(spu->ls, o+9),spu_ls_get8(spu->ls, o+10),spu_ls_get8(spu->ls, o+11), spu_ls_get8(spu->ls, o+12),spu_ls_get8(spu->ls, o+13),spu_ls_get8(spu->ls, o+14),spu_ls_get8(spu->ls, o+15));
                 }
             }
             /* kernel bootstrap DMA: dump LS[0x1C0] (=r17, the packed instance EA via
              * the entry's cdd/cwd/shufb) to check if the EA got byte-mangled. */
             if (cmd==0x40 && lsa==0x3FFE0) {
                 static int _k=0; if (_k++ < 3) {
-                    const uint8_t* p=&spu->ls[0x1C0];
+                    const uint8_t* p = spu_ls_be(spu->ls, 0x1C0, 16);
                     fprintf(stderr, "[DMA] LS[0x1C0] (r17, packed instance) = %02X%02X%02X%02X %02X%02X%02X%02X %02X%02X%02X%02X %02X%02X%02X%02X\n",
                         p[0],p[1],p[2],p[3],p[4],p[5],p[6],p[7],p[8],p[9],p[10],p[11],p[12],p[13],p[14],p[15]);
                     /* byte-order hypothesis: correct offset is 0xD00 (not 0xD0000).
@@ -1524,7 +1521,7 @@ static inline int mfc_submit(mfc_engine* mfc, spu_context* spu, uint32_t cmd)
             if (ea32 >= 0x00927E00u && ea32 < 0x00927F00u) {
                 extern uint8_t* vm_base;
                 static int nreq=0, nrsp=0;
-                const uint8_t* c = is_put ? (spu->ls + (lsa & SPU_LS_MASK)) : (vm_base + ea32);
+                const uint8_t* c = is_put ? spu_ls_be(spu->ls, lsa, size) : (vm_base + ea32);
                 int* cnt = is_put ? &nrsp : &nreq;
                 /* Dump the first ~40 of each + then every 400th, so we see both the
                  * steady-state command binkspu keeps re-reading AND its response --
@@ -1605,7 +1602,7 @@ static inline int mfc_submit(mfc_engine* mfc, spu_context* spu, uint32_t cmd)
         { extern volatile unsigned g_wws_batch_gets; g_wws_batch_gets++; }
         static int _n = 0;
         if (_n++ < 8) {
-            const uint8_t* p = spu->ls + 0xC00;
+            const uint8_t* p = spu_ls_be(spu->ls, 0xC00, 0x40);
             fprintf(stderr, "[wws-batch] GET 0xC00 ea=0x%09llX size=0x%X:",
                     (unsigned long long)ea, size);
             for (uint32_t i = 0; i < size && i < 0x40; i += 4)
@@ -1621,7 +1618,7 @@ static inline int mfc_submit(mfc_engine* mfc, spu_context* spu, uint32_t cmd)
           if (s_cd) { static int _c = 0; if (_c++ < 6) {
             static const char* NM[8] = {"kNop","kReserveBufSet","kUseBuffer",
                 "kUnreserveBufSets","kReqDepDec","kRunJob","kEndCommand","kInvalid"};
-            const uint8_t* p = spu->ls + 0xC00;
+            const uint8_t* p = spu_ls_be(spu->ls, 0xC00, 0x400);
             fprintf(stderr, "[cmddump] list ea=0x%09llX size=0x%X:\n", (unsigned long long)ea, size);
             for (uint32_t i = 0; i + 8 <= size && i < 0x400; i += 8) {
                 uint32_t f = ((uint32_t)p[i]<<24)|((uint32_t)p[i+1]<<16)|((uint32_t)p[i+2]<<8)|p[i+3];
@@ -1640,7 +1637,7 @@ static inline int mfc_submit(mfc_engine* mfc, spu_context* spu, uint32_t cmd)
         static int64_t dt2=-2; if (dt2==-2){ const char* e=getenv("YDKJ_DMATRACE"); dt2=e?1:0; }
         if (dt2 && spu->image_id==22 && cmd==0x40 /*GET*/ && size<=0x80) {
             static int _g=0; if (_g++ < 6) {
-                const uint8_t* p = spu->ls + (lsa & 0x3FFFF);
+                const uint8_t* p = spu_ls_be(spu->ls, lsa, 0x40);
                 fprintf(stderr, "[DMA] GET data @LS0x%05X (from ea=0x%09llX):", lsa, (unsigned long long)ea);
                 for (uint32_t i=0;i<size && i<0x40;i+=4)
                     fprintf(stderr, " %02X%02X%02X%02X", p[i],p[i+1],p[i+2],p[i+3]);

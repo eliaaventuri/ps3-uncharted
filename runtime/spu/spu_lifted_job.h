@@ -131,8 +131,7 @@ static inline int32_t spu_run_lifted_job_abi(spu_lifted_entry_fn entry,
      * syscallAddr=0xA70 at STC_SYSCALL_ADDR (0x27C4). That sentinel means "this is
      * a generic SPURS taskset task" (LBP's audio SPEEX/MultiStream tasks) -- flOw
      * jobs never plant it, so keying off it cannot change their behaviour. */
-    #define _LB(o) (((uint32_t)ctx.ls[(o)]<<24)|((uint32_t)ctx.ls[(o)+1]<<16)| \
-                    ((uint32_t)ctx.ls[(o)+2]<<8)|ctx.ls[(o)+3])
+    #define _LB(o) spu_ls_get32(ctx.ls, (o))
     int taskset_ctx = (_LB(0x27C4) == 0xA70u);
     if (spurs_task_abi) {
         if (r3_override) {

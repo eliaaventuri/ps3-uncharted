@@ -33,6 +33,8 @@ extern "C" {
 /* Local store size: 256 KB */
 #define SPU_LS_SIZE         (256 * 1024)
 #define SPU_LS_MASK         (SPU_LS_SIZE - 1)
+/* ordine dei byte della LS: vedi "Ordine dei byte della local store" sotto (s.47) */
+#include "spu_ls_order.h"   /* SPU_LS_XOR, SPU_LSB */
 
 /* ---------------------------------------------------------------------------
  * Reusable env-driven LS watchpoint (mini-debugger, no rebuild to retarget).
@@ -70,8 +72,8 @@ static inline void spu_ls_watch_hit2(uint32_t lsa, int is_write, const uint8_t* 
             fprintf(stderr, "[spu-watch %s 0x%05X pc=0x%05X lr=0x%05X] "
                 "%02X%02X%02X%02X %02X%02X%02X%02X %02X%02X%02X%02X %02X%02X%02X%02X\n",
                 is_write ? "WR" : "rd", a, pc, lr,
-                p[0],p[1],p[2],p[3], p[4],p[5],p[6],p[7],
-                p[8],p[9],p[10],p[11], p[12],p[13],p[14],p[15]);
+                p[SPU_LSB(0)],p[SPU_LSB(1)],p[SPU_LSB(2)],p[SPU_LSB(3)], p[SPU_LSB(4)],p[SPU_LSB(5)],p[SPU_LSB(6)],p[SPU_LSB(7)],
+                p[SPU_LSB(8)],p[SPU_LSB(9)],p[SPU_LSB(10)],p[SPU_LSB(11)], p[SPU_LSB(12)],p[SPU_LSB(13)],p[SPU_LSB(14)],p[SPU_LSB(15)]);
             fflush(stderr);
             break;
         }
@@ -404,24 +406,98 @@ static inline uint8_t* spu_ls_ptr(spu_context* ctx, uint32_t lsa)
     return &ctx->ls[lsa & SPU_LS_MASK];
 }
 
-static inline uint32_t spu_ls_read32(const spu_context* ctx, uint32_t lsa)
+/* Ordine dei byte della local store (sessione 47). Con SPU_LS_XOR = 3 la LS
+ * tiene ogni parola SPU di 4 byte come VALORE dell'host (little-endian): il
+ * byte SPU `a` sta all'indice fisico SPU_LSB(a) = a ^ 3, e i quadword si
+ * leggono/scrivono con una load/store semplice, senza rev32 (era una
+ * istruzione per ogni lqd/stqd del codice liftato: sonda con due rev32 in piu'
+ * = +16 ms di CPU per fotogramma). Il costo passa ai trasferimenti DMA e alle
+ * copie a blocchi (spu_ls_copy_in/out), molto piu' rari. Con SPU_LS_XOR = 0
+ * la LS e' in ordine SPU come prima (A/B: -DSPU_LS_XOR=0). Chi tocca
+ * ctx->ls DEVE passare da questi accessori o da SPU_LSB. */
+/* SPU_LS_XOR e SPU_LSB: definiti in cima al file */
+
+static inline uint8_t spu_ls_get8(const uint8_t* ls, uint32_t lsa) { return ls[SPU_LSB(lsa & SPU_LS_MASK)]; }
+static inline void spu_ls_set8(uint8_t* ls, uint32_t lsa, uint8_t v) { ls[SPU_LSB(lsa & SPU_LS_MASK)] = v; }
+
+/* parola big-endian all'indirizzo SPU lsa (anche non allineato) */
+static inline uint32_t spu_ls_get32(const uint8_t* ls, uint32_t lsa)
 {
     lsa &= SPU_LS_MASK;
-    const uint8_t* p = &ctx->ls[lsa];
-    /* SPU local store is big-endian */
-    return ((uint32_t)p[0] << 24) | ((uint32_t)p[1] << 16) |
-           ((uint32_t)p[2] << 8)  | (uint32_t)p[3];
+#if SPU_LS_XOR
+    if ((lsa & 3) == 0) { uint32_t w; memcpy(&w, ls + lsa, 4); return w; }
+#endif
+    return ((uint32_t)spu_ls_get8(ls, lsa) << 24) | ((uint32_t)spu_ls_get8(ls, lsa + 1) << 16) |
+           ((uint32_t)spu_ls_get8(ls, lsa + 2) << 8) | (uint32_t)spu_ls_get8(ls, lsa + 3);
+}
+static inline void spu_ls_put32(uint8_t* ls, uint32_t lsa, uint32_t val)
+{
+    lsa &= SPU_LS_MASK;
+#if SPU_LS_XOR
+    if ((lsa & 3) == 0) { memcpy(ls + lsa, &val, 4); return; }
+#endif
+    spu_ls_set8(ls, lsa, (uint8_t)(val >> 24)); spu_ls_set8(ls, lsa + 1, (uint8_t)(val >> 16));
+    spu_ls_set8(ls, lsa + 2, (uint8_t)(val >> 8)); spu_ls_set8(ls, lsa + 3, (uint8_t)val);
 }
 
-static inline void spu_ls_write32(spu_context* ctx, uint32_t lsa, uint32_t val)
+/* Copia fra la LS (indirizzo SPU lsa) e un buffer in ordine SPU/guest
+ * (big-endian, come la memoria principale). La conversione e' la stessa nei
+ * due versi (inversione dei byte di ogni parola), quindi un solo nucleo. */
+static inline void spu__ls_xcopy(uint8_t* ls, uint32_t lsa, uint8_t* buf, uint32_t n, int to_ls)
 {
-    lsa &= SPU_LS_MASK;
-    uint8_t* p = &ctx->ls[lsa];
-    p[0] = (uint8_t)(val >> 24);
-    p[1] = (uint8_t)(val >> 16);
-    p[2] = (uint8_t)(val >> 8);
-    p[3] = (uint8_t)(val);
+#if SPU_LS_XOR
+    uint32_t i = 0;
+    while (i < n && ((lsa + i) & 3)) {                       /* testa fino alla parola */
+        if (to_ls) ls[SPU_LSB((lsa + i) & SPU_LS_MASK)] = buf[i]; else buf[i] = ls[SPU_LSB((lsa + i) & SPU_LS_MASK)];
+        i++; }
+#if defined(__aarch64__) && defined(__ARM_NEON)
+    for (; i + 16 <= n && ((lsa + i) & SPU_LS_MASK) + 16 <= SPU_LS_SIZE; i += 16) {
+        uint8_t* l = ls + ((lsa + i) & SPU_LS_MASK);
+        if (to_ls) vst1q_u8(l, vrev32q_u8(vld1q_u8(buf + i))); else vst1q_u8(buf + i, vrev32q_u8(vld1q_u8(l))); }
+#endif
+    for (; i + 4 <= n; i += 4) {
+        uint8_t* l = ls + ((lsa + i) & SPU_LS_MASK); uint32_t w;
+        if (to_ls) { memcpy(&w, buf + i, 4); w = __builtin_bswap32(w); memcpy(l, &w, 4); }
+        else { memcpy(&w, l, 4); w = __builtin_bswap32(w); memcpy(buf + i, &w, 4); } }
+    for (; i < n; i++) {                                     /* coda */
+        if (to_ls) ls[SPU_LSB((lsa + i) & SPU_LS_MASK)] = buf[i]; else buf[i] = ls[SPU_LSB((lsa + i) & SPU_LS_MASK)]; }
+#else
+    for (uint32_t i = 0; i < n; ) {                          /* a pezzi, per l'avvolgimento a 256 KB */
+        uint32_t o = (lsa + i) & SPU_LS_MASK, k = n - i;
+        if (k > SPU_LS_SIZE - o) k = SPU_LS_SIZE - o;
+        if (to_ls) memcpy(ls + o, buf + i, k); else memcpy(buf + i, ls + o, k);
+        i += k; }
+#endif
 }
+static inline void spu_ls_copy_in(uint8_t* ls, uint32_t lsa, const void* src, uint32_t n) { spu__ls_xcopy(ls, lsa, (uint8_t*)src, n, 1); }
+static inline void spu_ls_copy_out(const uint8_t* ls, uint32_t lsa, void* dst, uint32_t n) { spu__ls_xcopy((uint8_t*)ls, lsa, (uint8_t*)dst, n, 0); }
+static inline void spu_ls_zero(uint8_t* ls, uint32_t lsa, uint32_t n)
+{
+    for (uint32_t i = 0; i < n; ) {                          /* i byte di una parola intera restano nella parola */
+        uint32_t o = (lsa + i) & SPU_LS_MASK;
+        if ((o & 3) == 0 && n - i >= 4) { uint32_t k = (n - i) & ~3u; if (k > SPU_LS_SIZE - o) k = SPU_LS_SIZE - o; memset(ls + o, 0, k); i += k; }
+        else { ls[SPU_LSB(o)] = 0; i++; } }
+}
+
+/* Vista in ordine SPU (big-endian) di n byte della LS a partire da lsa, per
+ * le sonde e i dump che leggono i byte con un puntatore: con SPU_LS_XOR e' una
+ * copia in un buffer del thread (due, alternati: al massimo due viste vive
+ * insieme), senza e' la LS stessa. In sola lettura. */
+static inline const uint8_t* spu_ls_be(const uint8_t* ls, uint32_t lsa, uint32_t n)
+{
+#if SPU_LS_XOR
+    static __thread uint8_t* b[2]; static __thread int k;
+    k ^= 1;
+    if (!b[k]) b[k] = (uint8_t*)malloc(SPU_LS_SIZE + 16);
+    if (n > SPU_LS_SIZE) n = SPU_LS_SIZE;
+    spu_ls_copy_out(ls, lsa, b[k], n);
+    return b[k];
+#else
+    (void)n; return ls + (lsa & SPU_LS_MASK);
+#endif
+}
+static inline uint32_t spu_ls_read32(const spu_context* ctx, uint32_t lsa) { return spu_ls_get32(ctx->ls, lsa); }
+static inline void spu_ls_write32(spu_context* ctx, uint32_t lsa, uint32_t val) { spu_ls_put32(ctx->ls, lsa, val); }
 
 /* Local-store quadword access.
  *
@@ -515,7 +591,11 @@ static inline u128 spu_ls_read128(const spu_context* ctx, uint32_t lsa)
     const uint8_t* p = &ctx->ls[lsa & (SPU_LS_MASK & ~0xFu)];
     u128 v;
 #if defined(__aarch64__) && defined(__ARM_NEON)
+#if SPU_LS_XOR
+    vst1q_u8(v._u8, vld1q_u8(p));
+#else
     vst1q_u8(v._u8, vrev32q_u8(vld1q_u8(p)));
+#endif
 #else
     uint32_t w0, w1, w2, w3;
     memcpy(&w0, p, 4); memcpy(&w1, p + 4, 4); memcpy(&w2, p + 8, 4); memcpy(&w3, p + 12, 4);
@@ -533,7 +613,11 @@ static inline void spu_ls_write128(spu_context* ctx, uint32_t lsa, u128 val)
 #endif
     uint8_t* p = &ctx->ls[lsa & (SPU_LS_MASK & ~0xFu)];
 #if defined(__aarch64__) && defined(__ARM_NEON)
+#if SPU_LS_XOR
+    vst1q_u8(p, vld1q_u8(val._u8));
+#else
     vst1q_u8(p, vrev32q_u8(vld1q_u8(val._u8)));
+#endif
 #else
     uint32_t w0 = SPU_BSWAP32(val._u32[0]), w1 = SPU_BSWAP32(val._u32[1]), w2 = SPU_BSWAP32(val._u32[2]), w3 = SPU_BSWAP32(val._u32[3]);
     memcpy(p, &w0, 4); memcpy(p + 4, &w1, 4); memcpy(p + 8, &w2, 4); memcpy(p + 12, &w3, 4);
@@ -601,7 +685,9 @@ static inline u128 spu_ls_read128_diag(const spu_context* ctx, uint32_t lsa)
     const uint8_t* p = &ctx->ls[lsa];
     spu_ls_watch_hit2(lsa, 0, p, (uint32_t)ctx->pc & SPU_LS_MASK,
                       ctx->gpr[0]._u32[0] & SPU_LS_MASK);
-#if SPU_LS_FAST
+#if SPU_LS_XOR
+    memcpy(v._u32, p, 16);
+#elif SPU_LS_FAST
     uint32_t w0, w1, w2, w3;
     memcpy(&w0, p,      4); memcpy(&w1, p + 4,  4);
     memcpy(&w2, p + 8,  4); memcpy(&w3, p + 12, 4);
@@ -652,8 +738,7 @@ static inline void spu_ls_write128_diag(spu_context* ctx, uint32_t lsa, u128 val
         if (g_wws_code_probe < 6) {
             g_wws_code_probe++;
             uint32_t codeLsa = val._u32[0];
-            #define _RD32(o) (((uint32_t)ctx->ls[o]<<24)|((uint32_t)ctx->ls[(o)+1]<<16)| \
-                              ((uint32_t)ctx->ls[(o)+2]<<8)|ctx->ls[(o)+3])
+            #define _RD32(o) spu_ls_get32(ctx->ls, (o))
             uint32_t loadJob = _RD32(0x12D0), nextLoad = _RD32(0x12C0), runJob = _RD32(0x12E0);
             /* GetLogicalBuffer keys the bufferSet on jobNum(=loadJobNum): row at
              * 0xDF0 + jobNum*64. Dump THAT row (and job0's) so we see which set
@@ -661,11 +746,11 @@ static inline void spu_ls_write128_diag(spu_context* ctx, uint32_t lsa, u128 val
             fprintf(stderr, "[wws-code] codeLS=0x%05X (page 0x%X) loadJobNum=0x%X nextLoad=0x%X runJobNum=0x%X\n",
                     codeLsa & 0x3FFFF, (codeLsa>>10)&0xFF, loadJob, nextLoad, runJob);
             uint32_t row = (loadJob <= 3) ? (0xDF0 + loadJob*64) : 0xDF0;
-            const uint8_t* bs = &ctx->ls[row];
+            uint8_t bs[32]; spu_ls_copy_out(ctx->ls, row, bs, 32);
             fprintf(stderr, "  bufferSetArray[job=0x%X @0x%X]:", loadJob, row);
             for (int i = 0; i < 32; i += 4)
                 fprintf(stderr, " %02X%02X%02X%02X", bs[i],bs[i+1],bs[i+2],bs[i+3]);
-            const uint8_t* lc = &ctx->ls[0xC00];
+            uint8_t lc[0x80]; spu_ls_copy_out(ctx->ls, 0xC00, lc, 0x80);
             fprintf(stderr, "\n  loadCommands[0xC00]:");
             for (int i = 0; i < 0x80; i += 4)
                 fprintf(stderr, " %02X%02X%02X%02X", lc[i],lc[i+1],lc[i+2],lc[i+3]);
@@ -673,7 +758,9 @@ static inline void spu_ls_write128_diag(spu_context* ctx, uint32_t lsa, u128 val
             #undef _RD32
         }
     }
-#if SPU_LS_FAST
+#if SPU_LS_XOR
+    memcpy(p, val._u32, 16);
+#elif SPU_LS_FAST
     uint32_t w0 = SPU_BSWAP32(val._u32[0]), w1 = SPU_BSWAP32(val._u32[1]);
     uint32_t w2 = SPU_BSWAP32(val._u32[2]), w3 = SPU_BSWAP32(val._u32[3]);
     memcpy(p,      &w0, 4); memcpy(p + 4,  &w1, 4);
@@ -903,8 +990,7 @@ static inline void spu_pcwatch(spu_context* ctx)
     if (n++ >= 4000) return;
     uint32_t sp = ctx->gpr[1]._u32[0] & SPU_LS_MASK;
     uint32_t at = (sp + 0xC0) & SPU_LS_MASK;
-    uint32_t v  = ((uint32_t)ctx->ls[at] << 24) | ((uint32_t)ctx->ls[at+1] << 16)
-                | ((uint32_t)ctx->ls[at+2] << 8) |  (uint32_t)ctx->ls[at+3];
+    uint32_t v  = spu_ls_get32(ctx->ls, at);
     fprintf(stderr, "[spu-pc] img=%d pc=0x%05X sp=0x%05X [sp+0xC0]=0x%08X\n",
             ctx->image_id, (uint32_t)w, sp, v);
 }

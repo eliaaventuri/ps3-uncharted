@@ -673,9 +673,9 @@ static uint32_t spu_load_image_to_ls(uint32_t img_ea, uint8_t* ls)
         uint32_t src_lo   = vm_read_be32(b + 0x14);
         if (ls_start + size > SPU_LS_SIZE) size = SPU_LS_SIZE - ls_start;
         if (type == 1 && src_lo)              /* COPY: guest EA -> LS */
-            memcpy(ls + ls_start, vm_base + src_lo, size);
+            spu_ls_copy_in(ls, ls_start, vm_base + src_lo, size);
         else if (type == 2)                   /* FILL: zero */
-            memset(ls + ls_start, 0, size);
+            spu_ls_zero(ls, ls_start, size);
     }
     return entry;
 }
@@ -1226,14 +1226,14 @@ static int64_t sys_spu_thread_write_ls_handler(ppu_context* ctx)
     }
     /* Big-endian store, mirroring guest convention. */
     switch (type) {
-    case 1: ls[ls_offset] = (uint8_t)value; break;
-    case 2: ls[ls_offset+0] = (uint8_t)(value >> 8);
-            ls[ls_offset+1] = (uint8_t)value; break;
+    case 1: ls[SPU_LSB(ls_offset)] = (uint8_t)value; break;
+    case 2: ls[SPU_LSB(ls_offset+0)] = (uint8_t)(value >> 8);
+            ls[SPU_LSB(ls_offset+1)] = (uint8_t)value; break;
     case 4: for (int i = 0; i < 4; i++)
-                ls[ls_offset+i] = (uint8_t)(value >> ((3-i)*8));
+                ls[SPU_LSB(ls_offset+i)] = (uint8_t)(value >> ((3-i)*8));
             break;
     case 8: for (int i = 0; i < 8; i++)
-                ls[ls_offset+i] = (uint8_t)(value >> ((7-i)*8));
+                ls[SPU_LSB(ls_offset+i)] = (uint8_t)(value >> ((7-i)*8));
             break;
     default:
         ctx->gpr[3] = (uint64_t)(int64_t)(int32_t)0x80010002;
@@ -1269,7 +1269,7 @@ static int64_t sys_spu_thread_read_ls_handler(ppu_context* ctx)
       if (jls && value_ea && vm_base && ls_offset + type <= SPU_LS_SIZE) {
           uint64_t v = 0;
           for (uint32_t k = 0; k < type && k < 8; k++)
-              v = (v << 8) | jls[ls_offset + k];
+              v = (v << 8) | jls[SPU_LSB(ls_offset + k)];
           for (int k = 0; k < 8; k++)
               vm_base[value_ea + k] = (uint8_t)(v >> (56 - 8 * k));
           { static int s_t = -1; if (s_t < 0) s_t = getenv("SPU_LSREAD_TRACE") ? 1 : 0;
@@ -1299,15 +1299,15 @@ static int64_t sys_spu_thread_read_ls_handler(ppu_context* ctx)
      * high bits. */
     uint64_t value = 0;
     switch (type) {
-    case 1: value = ls[ls_offset]; break;
-    case 2: value = ((uint64_t)ls[ls_offset] << 8) | ls[ls_offset+1]; break;
+    case 1: value = ls[SPU_LSB(ls_offset)]; break;
+    case 2: value = ((uint64_t)ls[SPU_LSB(ls_offset)] << 8) | ls[SPU_LSB(ls_offset+1)]; break;
     case 4:
         for (int i = 0; i < 4; i++)
-            value = (value << 8) | ls[ls_offset+i];
+            value = (value << 8) | ls[SPU_LSB(ls_offset+i)];
         break;
     case 8:
         for (int i = 0; i < 8; i++)
-            value = (value << 8) | ls[ls_offset+i];
+            value = (value << 8) | ls[SPU_LSB(ls_offset+i)];
         break;
     default:
         ctx->gpr[3] = (uint64_t)(int64_t)(int32_t)0x80010002;

@@ -10,6 +10,7 @@
  * round-robin starting after last_scheduled_task; task N occupies bitset bit (127-N).
  */
 #include "spurs_taskset.h"
+#include "../../runtime/spu/spu_ls_order.h"   /* s.47: SPU_LSB */
 #include <stdint.h>
 
 /* Select the next task to run: first task that is ready and not running, scanning
@@ -48,8 +49,8 @@ uint64_t spurs_pm_build_context(uint8_t* ls, uint32_t taskset_ea, uint32_t taskI
     /* SpursTasksetContext header fields (LS-local, written big-endian like guest mem). */
     /* taskset ptr @0x27B8 (be u64), spuNum @0x27CC, dmaTagId @0x27D0, taskId @0x27D4,
      * tasksetMgmtAddr @0x2FB8, x2FC0 cleared. We write directly into ls[] big-endian. */
-    #define LS_BE32(off, v) do { uint32_t _v=(v); ls[(off)+0]=(uint8_t)(_v>>24); ls[(off)+1]=(uint8_t)(_v>>16); \
-                                 ls[(off)+2]=(uint8_t)(_v>>8); ls[(off)+3]=(uint8_t)_v; } while(0)
+    #define LS_BE32(off, v) do { uint32_t _v=(v); ls[SPU_LSB((off)+0)]=(uint8_t)(_v>>24); ls[SPU_LSB((off)+1)]=(uint8_t)(_v>>16); \
+                                 ls[SPU_LSB((off)+2)]=(uint8_t)(_v>>8); ls[SPU_LSB((off)+3)]=(uint8_t)_v; } while(0)
     #define LS_BE64(off, v) do { uint64_t _w=(v); LS_BE32((off), (uint32_t)(_w>>32)); LS_BE32((off)+4,(uint32_t)_w); } while(0)
 
     /* Copy the CellSpursTaskset HEADER (first 0x80 bytes: the 6 bitsets, spurs@0x60,
@@ -94,9 +95,9 @@ uint64_t spurs_pm_build_context(uint8_t* ls, uint32_t taskset_ea, uint32_t taskI
          * (ceqh of rotqbyi(LS[0x1E0],6), select-mask bit -> word0); stamp the
          * neighboring slots too -- they are all inside the moduleId/pad area
          * the real PM owns and nothing else reads them. */
-        ls[0x1E4] = 'T'; ls[0x1E5] = 'K';
-        ls[0x1E6] = 'T'; ls[0x1E7] = 'K';
-        ls[0x1E8] = 'T'; ls[0x1E9] = 'K';
+        ls[SPU_LSB(0x1E4)] = 'T'; ls[SPU_LSB(0x1E5)] = 'K';
+        ls[SPU_LSB(0x1E6)] = 'T'; ls[SPU_LSB(0x1E7)] = 'K';
+        ls[SPU_LSB(0x1E8)] = 'T'; ls[SPU_LSB(0x1E9)] = 'K';
     }
 
     /* DMA the selected task's TaskInfo (48 bytes) into LS 0x2780 (the kernel temp area).

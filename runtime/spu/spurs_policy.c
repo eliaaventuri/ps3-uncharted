@@ -59,8 +59,8 @@ static DWORD WINAPI spurs_pm_wd_thread(LPVOID p)
             fprintf(stderr, "[spurs-wd] corsa del PM wid=%d spu=%d in ritardo di %llus: pc=0x%05X "
                     "status=0x%X LS12A0=%02X%02X LS12C0=%02X%02X LS12F0=%02X%02X ultimi salti:",
                     w, n, (now - s_pm_wd[w][n].t0) / 1000, c->pc & SPU_LS_MASK, c->status,
-                    c->ls[0x12A2], c->ls[0x12A3], c->ls[0x12C2], c->ls[0x12C3],
-                    c->ls[0x12F2], c->ls[0x12F3]);
+                    spu_ls_get8(c->ls, 0x12A2), spu_ls_get8(c->ls, 0x12A3), spu_ls_get8(c->ls, 0x12C2), spu_ls_get8(c->ls, 0x12C3),
+                    spu_ls_get8(c->ls, 0x12F2), spu_ls_get8(c->ls, 0x12F3));
             for (unsigned k = 0; k < 16; k++)
                 fprintf(stderr, " %05X", c->wd_ring[(c->wd_ring_i + k) & 15]);
             { extern uint32_t spu_mfc_tag_completed(spu_context*);
@@ -208,13 +208,11 @@ int spu_run_policy_module(spu_lifted_entry_fn entry, int image_id,
 
     /* PM image at its load base (first entry only -- LS persists). */
     if (first)
-        memcpy(ctx->ls + 0xA00, pm_host, pm_size);
+        spu_ls_copy_in(ctx->ls, 0xA00, pm_host, pm_size);
 
     /* SpursKernelContext at LS 0x100 (fields big-endian, like all guest data). */
     uint8_t* ls = ctx->ls;
-#define KBE32(off, v) do { uint32_t _v = (v); ls[(off)] = (uint8_t)(_v >> 24); \
-        ls[(off)+1] = (uint8_t)(_v >> 16); ls[(off)+2] = (uint8_t)(_v >> 8);   \
-        ls[(off)+3] = (uint8_t)_v; } while (0)
+#define KBE32(off, v) spu_ls_put32(ls, (off), (v))
     /* wklCurrentAddr is a 64-BIT pointer (vm::bcptr<void,u64>), so it occupies
      * 0x1D0..0x1D7 and everything after it sits 4 bytes higher than a u32 would
      * put it. Writing it as a u32 shifted the whole tail of the struct:
@@ -406,7 +404,7 @@ int spu_run_policy_module(spu_lifted_entry_fn entry, int image_id,
     uint32_t st_before = 0;
     if (pipe_this) {
         const uint8_t* L = ctx->ls;
-        #define HW(o) ((L[(o)+2]<<8)|L[(o)+3])   /* preferred hword (bytes 2-3) */
+        #define HW(o) (spu_ls_get32(L, (o)) & 0xFFFF)   /* preferred hword (bytes 2-3) */
         st_before = HW(0x12A0);
         (void)st_before;
         #undef HW
@@ -441,7 +439,7 @@ int spu_run_policy_module(spu_lifted_entry_fn entry, int image_id,
             static unsigned s_cl = 0;
             if (s_cl++ < 64) {
                 const uint8_t* L = ctx->ls;
-                #define W(o)  ((L[(o)]<<24)|(L[(o)+1]<<16)|(L[(o)+2]<<8)|L[(o)+3])
+                #define W(o)  spu_ls_get32(L, (o))
                 fprintf(stderr, "[pm-claim] wid=%u spu=%u first=%d claims=%u stages=%u%s halt_pc=0x%05X "
                         "nextLoad=0x%X loadJob=0x%X runJob=0x%X storeJob=0x%X q13F0=%08X q14E0=%08X\n",
                         wid, spu_num, first, claims, stages,
@@ -463,8 +461,8 @@ int spu_run_policy_module(spu_lifted_entry_fn entry, int image_id,
         unsigned long s_pn = ++s_pn_wid[wid & 15];
         if (s_pn < 300) {
             const uint8_t* L = ctx->ls;
-            #define HW(o) ((L[(o)+2]<<8)|L[(o)+3])
-            #define W(o)  ((L[(o)]<<24)|(L[(o)+1]<<16)|(L[(o)+2]<<8)|L[(o)+3])
+            #define HW(o) (spu_ls_get32(L, (o)) & 0xFFFF)
+            #define W(o)  spu_ls_get32(L, (o))
             fprintf(stderr, "[pm-pipe] wid=%u run#%lu first=%d halt_pc=0x%05X "
                     "loadState=%u->%u nextLoad=0x%X loadJob=0x%X runJob=0x%X storeJob=0x%X "
                     "lastStore=0x%X\n",
@@ -516,9 +514,9 @@ int spu_run_policy_module(spu_lifted_entry_fn entry, int image_id,
          * every run, the dump budget was being spent entirely on idle runs. */
         int has_job = 0;
         for (uint32_t _i = 0xDF0; _i < 0xE10 && !has_job; _i++)
-            if (ctx->ls[_i]) has_job = 1;
+            if (spu_ls_get8(ctx->ls, _i)) has_job = 1;
         for (uint32_t _i = 0xC00; _i < 0xC60 && !has_job; _i++)
-            if (ctx->ls[_i]) has_job = 1;
+            if (spu_ls_get8(ctx->ls, _i)) has_job = 1;
         if (has_job && s_dumps < 6) {
             s_dumps++;
             unsigned n = g_pm_flow_n; if (n > 8192) n = 8192;
@@ -547,8 +545,8 @@ int spu_run_policy_module(spu_lifted_entry_fn entry, int image_id,
                   for (uint32_t o = 0; o < R[r].len; o += 4) {
                       if (o && (o & 15) == 0) fprintf(stderr, " |");
                       fprintf(stderr, " %02X%02X%02X%02X",
-                              ctx->ls[R[r].a+o], ctx->ls[R[r].a+o+1],
-                              ctx->ls[R[r].a+o+2], ctx->ls[R[r].a+o+3]);
+                              spu_ls_get8(ctx->ls, R[r].a+o), spu_ls_get8(ctx->ls, R[r].a+o+1),
+                              spu_ls_get8(ctx->ls, R[r].a+o+2), spu_ls_get8(ctx->ls, R[r].a+o+3));
                   }
                   fprintf(stderr, "\n");
               } }
@@ -610,10 +608,10 @@ static DWORD WINAPI spurs_pm_flow_watchdog(LPVOID p)
     fprintf(stderr, "[pm-flow] HUNG-RUN PARTIAL: %u transfers, live pc=0x%05X "
             "LS12A0=%02X%02X LS12C0=%02X%02X LS12F0=%02X%02X%02X%02X LS1300=%02X%02X:",
             n, ctx->pc & SPU_LS_MASK,
-            ctx->ls[0x12A0], ctx->ls[0x12A1],
-            ctx->ls[0x12C0], ctx->ls[0x12C1],
-            ctx->ls[0x12F0], ctx->ls[0x12F1], ctx->ls[0x12F2], ctx->ls[0x12F3],
-            ctx->ls[0x1300], ctx->ls[0x1301]);
+            spu_ls_get8(ctx->ls, 0x12A0), spu_ls_get8(ctx->ls, 0x12A1),
+            spu_ls_get8(ctx->ls, 0x12C0), spu_ls_get8(ctx->ls, 0x12C1),
+            spu_ls_get8(ctx->ls, 0x12F0), spu_ls_get8(ctx->ls, 0x12F1), spu_ls_get8(ctx->ls, 0x12F2), spu_ls_get8(ctx->ls, 0x12F3),
+            spu_ls_get8(ctx->ls, 0x1300), spu_ls_get8(ctx->ls, 0x1301));
     /* Pipeline-state hex dump: batch commands (0xC00), per-slot records (0xDF0),
      * staging ring (0xEB0), FFFF markers (0x11B0), scheduler vars (0x1270-0x1340),
      * queue caches (0x13B0-0x1520). One shot -- everything the state-2 cycle's
@@ -627,8 +625,8 @@ static DWORD WINAPI spurs_pm_flow_watchdog(LPVOID p)
           for (uint32_t o = 0; o < R[r].len; o += 4) {
               if (o && (o & 15) == 0) fprintf(stderr, " |");
               fprintf(stderr, " %02X%02X%02X%02X",
-                      ctx->ls[R[r].a+o], ctx->ls[R[r].a+o+1],
-                      ctx->ls[R[r].a+o+2], ctx->ls[R[r].a+o+3]);
+                      spu_ls_get8(ctx->ls, R[r].a+o), spu_ls_get8(ctx->ls, R[r].a+o+1),
+                      spu_ls_get8(ctx->ls, R[r].a+o+2), spu_ls_get8(ctx->ls, R[r].a+o+3));
           }
       }
       fprintf(stderr, "\n"); }
@@ -668,13 +666,11 @@ int spurs_run_taskset_policy_probe(uint32_t taskset_ea, uint32_t taskid,
      * i.e. it has no lifted taskset policy image -- don't run an empty LS. */
     if (!g_taskset_policy_size ||
         g_taskset_policy_size > SPU_LS_SIZE - 0xA00) { free(ctx); return -1; }
-    memcpy(ctx->ls + 0xA00, g_taskset_policy_bytes, g_taskset_policy_size);
+    spu_ls_copy_in(ctx->ls, 0xA00, g_taskset_policy_bytes, g_taskset_policy_size);
 
     /* SpursKernelContext at LS 0x100 (same layout as spu_run_policy_module). */
     uint8_t* ls = ctx->ls;
-#define KBE32(off, v) do { uint32_t _v = (v); ls[(off)] = (uint8_t)(_v >> 24); \
-        ls[(off)+1] = (uint8_t)(_v >> 16); ls[(off)+2] = (uint8_t)(_v >> 8);   \
-        ls[(off)+3] = (uint8_t)_v; } while (0)
+#define KBE32(off, v) spu_ls_put32(ls, (off), (v))
     KBE32(0x1C0, 0);                    KBE32(0x1C4, spurs_ea);
     KBE32(0x1C8, 0);                    KBE32(0x1CC, 8);
     KBE32(0x1D0, 0);                    KBE32(0x1D4, 0xA00);
@@ -707,7 +703,7 @@ int spurs_run_taskset_policy_probe(uint32_t taskset_ea, uint32_t taskid,
     if (out_2700 && out_len) {
         uint32_t n = out_len;
         if ((uint32_t)0x2700 + n > SPU_LS_SIZE) n = SPU_LS_SIZE - 0x2700;
-        memcpy(out_2700, ctx->ls + 0x2700, n);
+        spu_ls_copy_out(ctx->ls, 0x2700, out_2700, n);
     }
     int st = (int)ctx->status;
     free(ctx);

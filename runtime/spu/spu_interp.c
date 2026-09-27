@@ -108,9 +108,7 @@ static void spu_decode1(uint32_t insn, uint32_t pc, spu_ins* d) {
 
 static int spu_step(spu_context* ctx) {
     uint32_t pc = ctx->pc, m = pc & SPU_LS_MASK;
-    const uint8_t* p = ctx->ls;
-    uint32_t insn = ((uint32_t)p[m] << 24) | ((uint32_t)p[m+1] << 16)
-                  | ((uint32_t)p[m+2] << 8) | p[m+3];
+    uint32_t insn = spu_ls_get32(ctx->ls, m & ~3u);
     spu_ins d; spu_decode1(insn, pc, &d);
     uint32_t next = pc + 4;
 
@@ -355,8 +353,7 @@ uint32_t spu_interp_run(spu_context* ctx, uint32_t start_lsa) {
          * interp'd cri task (image_id set to -1 for pure interp) resumes instead of
          * longjmp-ing out of a context that isn't wrapped for it. */
         if (ctx->pc == 0xA70u) {
-            uint32_t sc = ((uint32_t)ctx->ls[0x27C4]<<24)|((uint32_t)ctx->ls[0x27C5]<<16)
-                        | ((uint32_t)ctx->ls[0x27C6]<<8) | ctx->ls[0x27C7];
+            uint32_t sc = spu_ls_get32(ctx->ls, 0x27C4);
             if (sc == 0xA70u) {
                 extern void spu_spurs_taskset_syscall(spu_context*);
                 int _save = ctx->image_id; ctx->image_id = 22;
@@ -383,7 +380,7 @@ uint32_t spu_interp_run(spu_context* ctx, uint32_t start_lsa) {
             fprintf(stderr,"\n");
             /* dump the LS 0x2700 SpursTasksetContext the poll reads -- compare to the
              * working RPCS3 SPU0 dump (RUNNING/READY/ENABLED=0x80000000, SIGNALLED=0). */
-            #define LB(o) (((uint32_t)ctx->ls[(o)]<<24)|((uint32_t)ctx->ls[(o)+1]<<16)|((uint32_t)ctx->ls[(o)+2]<<8)|ctx->ls[(o)+3])
+            #define LB(o) spu_ls_get32(ctx->ls, (o))
             fprintf(stderr,"[spu-trace] LS ctx: RUN=%08X READY=%08X PEND=%08X ENA=%08X SIG=%08X WAIT=%08X | 2790=%08X 2794=%08X 27D8=%08X 2FB0=%08X\n",
                 LB(0x2700),LB(0x2710),LB(0x2720),LB(0x2730),LB(0x2740),LB(0x2750),LB(0x2790),LB(0x2794),LB(0x27D8),LB(0x2FB0));
             #undef LB

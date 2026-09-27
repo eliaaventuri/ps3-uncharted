@@ -137,8 +137,7 @@ void spu_dbg_e60(spu_context* ctx)
     static int s_e = -1; if (s_e < 0) s_e = getenv("YDKJ_E60") ? 1 : 0;
     if (!s_e) return;
     static int _d = 0; if (_d++ >= 6) return;
-    const uint8_t* L = ctx->ls;
-    #define RD(o) (((uint32_t)L[(o)]<<24)|((uint32_t)L[(o)+1]<<16)|((uint32_t)L[(o)+2]<<8)|L[(o)+3])
+    #define RD(o) spu_ls_get32(ctx->ls, (o))
     fprintf(stderr, "[E60] r20=%08X r24=%08X | run2700=%08X ready2710=%08X pend2720=%08X en2730=%08X sig2740=%08X wait2750=%08X x2770=%08X\n",
             ctx->gpr[20]._u32[0], ctx->gpr[24]._u32[0],
             RD(0x2700), RD(0x2710), RD(0x2720), RD(0x2730), RD(0x2740), RD(0x2750), RD(0x2770));
@@ -526,7 +525,10 @@ static int spu_mfc_atomic(spu_context* ctx, uint32_t cmd)
 
     uint32_t ea  = ctx->mfc_eal & ~(uint32_t)(MFC_ATOMIC_LINE - 1);
     uint32_t lsa = ctx->mfc_lsa & SPU_LS_MASK;
-    uint8_t* ls  = &ctx->ls[lsa];
+    /* s.47: la riga in ordine di memoria (big-endian) in un buffer locale; la
+     * LS la riceve/fornisce con spu_ls_copy_in/out (ordine SPU_LS_XOR) */
+    uint8_t ls[MFC_ATOMIC_LINE];
+    if (cmd != MFC_GETLLAR_CMD) spu_ls_copy_out(ctx->ls, lsa, ls, MFC_ATOMIC_LINE);
     uint8_t* mem = vm_base + ea;
 
     { static int s_t = -1; if (s_t < 0) s_t = getenv("YDKJ_POLLTRACE") ? 1 : 0;
@@ -581,7 +583,7 @@ static int spu_mfc_atomic(spu_context* ctx, uint32_t cmd)
             fprintf(stderr, "[spu-atomic] cmd=0x%X ea=0x%08X pc=0x%05X img=%d uncommitted -- skipped\n",
                     cmd, ea, (uint32_t)ctx->pc & SPU_LS_MASK, ctx->image_id);
         if (cmd == MFC_GETLLAR_CMD) {
-            memset(ls, 0, MFC_ATOMIC_LINE);
+            spu_ls_zero(ctx->ls, lsa, MFC_ATOMIC_LINE);
             ctx->resv_ea = ea; ctx->resv_valid = 0; ctx->atomic_stat = 0;
         } else {
             ctx->atomic_stat = 1;   /* PUTLLC failure (line "moved") */
@@ -653,6 +655,7 @@ static int spu_mfc_atomic(spu_context* ctx, uint32_t cmd)
          * GETLLAR fast+slow paths for exactly this reason). */
         yz_lockstep_tick(ctx);
         resv_read_line(ls, mem, ea);                   /* line -> local store */
+        spu_ls_copy_in(ctx->ls, lsa, ls, MFC_ATOMIC_LINE);
         if (spu_atom_stat_on()) spu_atom_stat(ea, ATS_GET, ctx->image_id);
         /* Snapshot from `ls`, NOT a second read of `mem`. Hardware GETLLAR is a
          * single atomic 128-byte read, so the reserved data and the reservation
@@ -666,7 +669,7 @@ static int spu_mfc_atomic(spu_context* ctx, uint32_t cmd)
          * stale, which is exactly what makes the lost-reservation event fire. */
         memcpy(ctx->resv_line, ls, MFC_ATOMIC_LINE);   /* snapshot for compare */
         ctx->resv_ea = ea; ctx->resv_valid = 1; ctx->atomic_stat = 0;
-        spu_adma_note(ctx, cmd, (uint32_t)(ls - ctx->ls), (uint32_t)ea, MFC_ATOMIC_LINE);
+        spu_adma_note(ctx, cmd, lsa, (uint32_t)ea, MFC_ATOMIC_LINE);
         return 1;
 
     case MFC_PUTLLC_CMD:
@@ -716,8 +719,7 @@ static int spu_mfc_atomic(spu_context* ctx, uint32_t cmd)
           if (b && ea >= (b & ~127u) && ea < ((b + 0xC0 + 127) & ~127u)) {
               static int _n = 0;
               if (_n++ < 96 && ctx->atomic_stat == 0) {
-                  uint32_t sn = ((uint32_t)ctx->ls[0x1C8]<<24)|((uint32_t)ctx->ls[0x1C9]<<16)|
-                                ((uint32_t)ctx->ls[0x1CA]<<8)|ctx->ls[0x1CB];
+                  uint32_t sn = spu_ls_get32(ctx->ls, 0x1C8);
                   extern uint8_t* vm_base;
                   const uint8_t* r = vm_base + b + 0x70;   /* row 3 (sync+0x40+16*3) */
                   fprintf(stderr, "[sync-atomic] PUTLLC-OK spuNum=%u ea=+0x%X lanes@row3={%u %u %u %u %u %u %u}\n",
@@ -1239,9 +1241,11 @@ void spu_overlay_note_get(spu_context* ctx, uint32_t ea, const uint8_t* ls, uint
 {
     /* s.42: gira a ogni GET; una GET piccola non puo' essere un modulo a firma */
     if (size < 512 && !s_ovl_ea_count) return;
+    uint8_t hdr[16]; int have_hdr = 0;   /* s.47: la testata in ordine SPU (la LS e' in ordine SPU_LS_XOR) */
     for (int i = 0; i < s_ovl_src_count; i++) {
         const spu_ovl_src* o = &s_ovl_src[i];
-        int hit = o->has_sig ? (size >= 512 && memcmp(ls, o->sig, 16) == 0)
+        if (o->has_sig && size >= 512 && !have_hdr) { spu_ls_copy_out(ctx->ls, (uint32_t)(ls - ctx->ls), hdr, 16); have_hdr = 1; }
+        int hit = o->has_sig ? (size >= 512 && memcmp(hdr, o->sig, 16) == 0)
                              : (o->src_ea == ea);
         if (hit) {
             if (ctx->resident_ovl != o->image_id) {
@@ -1327,7 +1331,7 @@ void spu_spurs_taskset_syscall(spu_context* ctx)   /* non-static: also called by
      * leftovers and hides what the task actually asked for. */
     { static int s_sa = -1; if (s_sa < 0) s_sa = getenv("YDKJ_SYSCALL_ARG") ? 1 : 0;
       if (s_sa) { static int _n = 0; if (_n++ < 40) {
-        const uint8_t* a = &ctx->ls[0x2FD0];
+        const uint8_t* a = spu_ls_be(ctx->ls, 0x2FD0, 16);
         fprintf(stderr, "[spu] syscall num=%u LS[0x2FD0]=%02X%02X%02X%02X %02X%02X%02X%02X"
                         " %02X%02X%02X%02X %02X%02X%02X%02X img=%d\n",
                 num, a[0],a[1],a[2],a[3], a[4],a[5],a[6],a[7],
@@ -1372,17 +1376,17 @@ void spu_spurs_taskset_syscall(spu_context* ctx)   /* non-static: also called by
      * work state forever -- the LBP boot deadlock. taskset/taskId come from
      * the SpursTasksetContext this runtime planted at LS 0x2700. */
     if (num == 2) {
-        uint32_t ts  = ((uint32_t)ctx->ls[0x27BC] << 24) | ((uint32_t)ctx->ls[0x27BD] << 16) |
-                       ((uint32_t)ctx->ls[0x27BE] << 8)  |  (uint32_t)ctx->ls[0x27BF];
-        uint32_t tid = ((uint32_t)ctx->ls[0x27D4] << 24) | ((uint32_t)ctx->ls[0x27D5] << 16) |
-                       ((uint32_t)ctx->ls[0x27D6] << 8)  |  (uint32_t)ctx->ls[0x27D7];
+        uint32_t ts  = ((uint32_t)spu_ls_get8(ctx->ls, 0x27BC) << 24) | ((uint32_t)spu_ls_get8(ctx->ls, 0x27BD) << 16) |
+                       ((uint32_t)spu_ls_get8(ctx->ls, 0x27BE) << 8)  |  (uint32_t)spu_ls_get8(ctx->ls, 0x27BF);
+        uint32_t tid = ((uint32_t)spu_ls_get8(ctx->ls, 0x27D4) << 24) | ((uint32_t)spu_ls_get8(ctx->ls, 0x27D5) << 16) |
+                       ((uint32_t)spu_ls_get8(ctx->ls, 0x27D6) << 8)  |  (uint32_t)spu_ls_get8(ctx->ls, 0x27D7);
         /* The guest names its wait OBJECT in the task-API argument at LS 0x2FD0
          * (low nibble is flags). It reads its received event bits from
          * object+0x30, so this is both who to wake and where to deliver. */
-        uint32_t wobj = (((uint32_t)ctx->ls[0x2FDC] << 24) |
-                         ((uint32_t)ctx->ls[0x2FDD] << 16) |
-                         ((uint32_t)ctx->ls[0x2FDE] << 8)  |
-                          (uint32_t)ctx->ls[0x2FDF]) & ~0xFu;
+        uint32_t wobj = (((uint32_t)spu_ls_get8(ctx->ls, 0x2FDC) << 24) |
+                         ((uint32_t)spu_ls_get8(ctx->ls, 0x2FDD) << 16) |
+                         ((uint32_t)spu_ls_get8(ctx->ls, 0x2FDE) << 8)  |
+                          (uint32_t)spu_ls_get8(ctx->ls, 0x2FDF)) & ~0xFu;
         /* SPURS_EF_SPU_REPLY=1 -- DIAGNOSTIC BISECT, NOT A FIX.
          *
          * The guest task is supposed to set its SPU->PPU flag (object+0x100)
@@ -1468,8 +1472,8 @@ static int spu_smc_microstep(spu_context* ctx)
 {
     uint32_t pc = ctx->pc & SPU_LS_MASK & ~3u;
     for (int steps = 0; steps < 4096; steps++) {
-        uint32_t w = ((uint32_t)ctx->ls[pc] << 24) | ((uint32_t)ctx->ls[pc+1] << 16) |
-                     ((uint32_t)ctx->ls[pc+2] << 8) | ctx->ls[pc+3];
+        uint32_t w = ((uint32_t)spu_ls_get8(ctx->ls, pc) << 24) | ((uint32_t)spu_ls_get8(ctx->ls, pc+1) << 16) |
+                     ((uint32_t)spu_ls_get8(ctx->ls, pc+2) << 8) | spu_ls_get8(ctx->ls, pc+3);
         uint32_t op11 = w >> 21, op9 = w >> 23, op8 = w >> 24, op7 = w >> 25;
         uint32_t rt = w & 0x7F, ra = (w >> 7) & 0x7F, rb = (w >> 14) & 0x7F;
         int32_t  i10 = (int32_t)(w << 8) >> 22;               /* bits 14-23 sext */
@@ -1674,8 +1678,8 @@ void spu_indirect_branch(spu_context* ctx)
      * syscall would branch into empty LS 0xA70 and halt as "branch-to-0" instead
      * of cleanly exiting. */
     if (ctx->pc == YDKJ_TASKSET_PM_SYSCALL_ADDR) {
-        uint32_t sc = ((uint32_t)ctx->ls[0x27C4] << 24) | ((uint32_t)ctx->ls[0x27C5] << 16)
-                    | ((uint32_t)ctx->ls[0x27C6] << 8)  | ctx->ls[0x27C7];
+        uint32_t sc = ((uint32_t)spu_ls_get8(ctx->ls, 0x27C4) << 24) | ((uint32_t)spu_ls_get8(ctx->ls, 0x27C5) << 16)
+                    | ((uint32_t)spu_ls_get8(ctx->ls, 0x27C6) << 8)  | spu_ls_get8(ctx->ls, 0x27C7);
         if (ctx->image_id == 22 || sc == YDKJ_TASKSET_PM_SYSCALL_ADDR) {
             spu_spurs_taskset_syscall(ctx); return;
         }
@@ -1696,8 +1700,7 @@ void spu_indirect_branch(spu_context* ctx)
              * the game's real taskset (0x45F1B000) -> policy DMA'd garbage. */
             extern uint32_t g_ydkj_real_taskset_ea;
             uint32_t ts = g_ydkj_real_taskset_ea ? g_ydkj_real_taskset_ea : 0x0F000000u;
-            ctx->ls[0x27B8]=0x00; ctx->ls[0x27B9]=0x00; ctx->ls[0x27BA]=0x00; ctx->ls[0x27BB]=0x00;
-            ctx->ls[0x27BC]=(uint8_t)(ts>>24); ctx->ls[0x27BD]=(uint8_t)(ts>>16); ctx->ls[0x27BE]=(uint8_t)(ts>>8); ctx->ls[0x27BF]=(uint8_t)ts;
+            spu_ls_put32(ctx->ls, 0x27B8, 0); spu_ls_put32(ctx->ls, 0x27BC, ts);
             if (ctx->pc == 0xA00u) { static int _n=0; if (_n++ < 4)
                 fprintf(stderr, "[cri-r4] policy entry pc=0xA00: forced ctxt->taskset LS[0x27B8]=0x0F000000\n"); }
         }
@@ -1773,7 +1776,7 @@ void spu_indirect_branch(spu_context* ctx)
                     (uint32_t)ctx->gpr[0]._u32[0], (uint32_t)ctx->gpr[1]._u32[0],
                     (uint32_t)ctx->gpr[2]._u32[0], (uint32_t)ctx->gpr[3]._u32[0]);
             /* The SpursKernelContext the PM reads its callbacks out of. */
-            const uint8_t* k = ctx->ls + 0x1C0;
+            const uint8_t* k = spu_ls_be(ctx->ls, 0x1C0, 0x30);
             char kb[256]; int kp = snprintf(kb, sizeof kb, "[ibregs] kernel ctx 0x1C0:");
             for (int i = 0; i < 0x30; i += 4)
                 kp += snprintf(kb + kp, sizeof(kb) - kp, " %02X%02X%02X%02X",
@@ -1790,7 +1793,7 @@ void spu_indirect_branch(spu_context* ctx)
         if (pt) { static int _p=0; if (_p++ < 8) {
             /* re-lifted policy entry uses r80 (kernel-set context base): r44=LS[r80+0xC0] */
             uint32_t r80=ctx->gpr[80]._u32[0] & SPU_LS_MASK;
-            const uint8_t* q = ctx->ls + ((r80+0xC0)&SPU_LS_MASK);
+            const uint8_t* q = spu_ls_be(ctx->ls, r80+0xC0, 4);
             uint32_t ctxw = ((uint32_t)q[0]<<24)|((uint32_t)q[1]<<16)|((uint32_t)q[2]<<8)|q[3];
             fprintf(stderr, "[POLTRACE] policy@0xA00 r3=%08X r4=%08X r80=%08X  LS[r80+0xC0]=%08X\n",
                 ctx->gpr[3]._u32[0], ctx->gpr[4]._u32[0], r80, ctxw);
@@ -1849,11 +1852,11 @@ void spu_indirect_branch(spu_context* ctx)
      * mark that overlay resident so the module's lifted functions dispatch. The
      * module arrives via a DMA LIST, so the single-GET note_get hook never fired. */
     if (!fn && ctx->image_id == 2 && ctx->pc >= 0x4000 && ctx->pc < 0x3E000) {
-        uint32_t codeBase = ((uint32_t)ctx->ls[0x1320] << 24) | ((uint32_t)ctx->ls[0x1321] << 16) |
-                            ((uint32_t)ctx->ls[0x1322] << 8) | ctx->ls[0x1323];
+        uint32_t codeBase = ((uint32_t)spu_ls_get8(ctx->ls, 0x1320) << 24) | ((uint32_t)spu_ls_get8(ctx->ls, 0x1321) << 16) |
+                            ((uint32_t)spu_ls_get8(ctx->ls, 0x1322) << 8) | spu_ls_get8(ctx->ls, 0x1323);
         if (codeBase + 16 <= SPU_LS_SIZE) {
             extern int spu_overlay_match_sig(const uint8_t hdr[16]);
-            int img = spu_overlay_match_sig(&ctx->ls[codeBase]);
+            int img = spu_overlay_match_sig(spu_ls_be(ctx->ls, codeBase, 16));
             /* LS[0x1320] e' dove il job manager di LBP tiene la base del buffer
              * di codice: e' una cosa di quella build, non del formato. I moduli
              * di Uncharted dichiarano la propria base nell'header (campo a
@@ -1861,7 +1864,7 @@ void spu_indirect_branch(spu_context* ctx)
              * sono stati liftati. Se il primo tentativo non riconosce nulla,
              * si guarda li'. */
             if (!img && 0x4000 + 16 <= SPU_LS_SIZE) {
-                img = spu_overlay_match_sig(&ctx->ls[0x4000]);
+                img = spu_overlay_match_sig(spu_ls_be(ctx->ls, 0x4000, 16));
                 if (img) codeBase = 0x4000;
             }
             if (img) {
@@ -1893,8 +1896,8 @@ void spu_indirect_branch(spu_context* ctx)
      * through to the null-job handling below. */
     if (!fn && ctx->image_id == 2 && ctx->policy_mode &&
         ctx->pc >= 0x4000 && ctx->pc < 0x3E000) {
-        uint32_t w0 = ((uint32_t)ctx->ls[ctx->pc] << 24) | ((uint32_t)ctx->ls[ctx->pc+1] << 16) |
-                      ((uint32_t)ctx->ls[ctx->pc+2] << 8) | ctx->ls[ctx->pc+3];
+        uint32_t w0 = ((uint32_t)spu_ls_get8(ctx->ls, ctx->pc) << 24) | ((uint32_t)spu_ls_get8(ctx->ls, ctx->pc+1) << 16) |
+                      ((uint32_t)spu_ls_get8(ctx->ls, ctx->pc+2) << 8) | spu_ls_get8(ctx->ls, ctx->pc+3);
         if (w0 != 0)
             fn = spu_lookup(ctx->pc, 1);
     }
@@ -1905,8 +1908,8 @@ void spu_indirect_branch(spu_context* ctx)
      * 0x00000000 word; this is the same outcome, quiet.) */
     if (!fn && ctx->image_id == 2 && ctx->policy_mode &&
         ctx->pc >= 0x4000 && ctx->pc < 0x3E000 &&
-        ((uint32_t)ctx->ls[ctx->pc] | ctx->ls[ctx->pc+1] |
-         ctx->ls[ctx->pc+2] | ctx->ls[ctx->pc+3]) == 0) {
+        ((uint32_t)spu_ls_get8(ctx->ls, ctx->pc) | spu_ls_get8(ctx->ls, ctx->pc+1) |
+         spu_ls_get8(ctx->ls, ctx->pc+2) | spu_ls_get8(ctx->ls, ctx->pc+3)) == 0) {
         static int _n = 0;
         if (_n++ < 8) {
             /* Ground-truth dump of the WWS code-buffer resolution at dispatch
@@ -1915,17 +1918,17 @@ void spu_indirect_branch(spu_context* ctx)
              * If the code buffer really is 0x4000 but empty -> the code LOAD is
              * the bug; if lsaJobCodeBuffer should be 0x14400 -> the RunJob
              * buffer-set resolution is. Dump both + the bufferSetArray rows. */
-            uint32_t lsaCode = (uint32_t)ctx->ls[0x1330]<<24 | ctx->ls[0x1331]<<16 |
-                               ctx->ls[0x1332]<<8 | ctx->ls[0x1333];
-            uint32_t runJob  = (uint32_t)ctx->ls[0x12E0]<<24 | ctx->ls[0x12E1]<<16 |
-                               ctx->ls[0x12E2]<<8 | ctx->ls[0x12E3];
-            const uint8_t* bs = ctx->ls + 0xDF0;   /* g_WwsJob_bufferSetArray */
+            uint32_t lsaCode = (uint32_t)spu_ls_get8(ctx->ls, 0x1330)<<24 | spu_ls_get8(ctx->ls, 0x1331)<<16 |
+                               spu_ls_get8(ctx->ls, 0x1332)<<8 | spu_ls_get8(ctx->ls, 0x1333);
+            uint32_t runJob  = (uint32_t)spu_ls_get8(ctx->ls, 0x12E0)<<24 | spu_ls_get8(ctx->ls, 0x12E1)<<16 |
+                               spu_ls_get8(ctx->ls, 0x12E2)<<8 | spu_ls_get8(ctx->ls, 0x12E3);
+            const uint8_t* bs = spu_ls_be(ctx->ls, 0xDF0, 16);   /* g_WwsJob_bufferSetArray */
             fprintf(stderr, "[pm-jobres] pc=0x%05X lsaJobCodeBuffer(0x1330)=0x%08X "
                     "runJobNum(0x12E0)=0x%08X code@14400:%02X%02X%02X%02X\n"
                     "           bufferSetArray[0xDF0]: %02X%02X%02X%02X %02X%02X%02X%02X "
                     "%02X%02X%02X%02X %02X%02X%02X%02X\n",
                     ctx->pc & SPU_LS_MASK, lsaCode, runJob,
-                    ctx->ls[0x14400],ctx->ls[0x14401],ctx->ls[0x14402],ctx->ls[0x14403],
+                    spu_ls_get8(ctx->ls, 0x14400),spu_ls_get8(ctx->ls, 0x14401),spu_ls_get8(ctx->ls, 0x14402),spu_ls_get8(ctx->ls, 0x14403),
                     bs[0],bs[1],bs[2],bs[3], bs[4],bs[5],bs[6],bs[7],
                     bs[8],bs[9],bs[10],bs[11], bs[12],bs[13],bs[14],bs[15]);
         }
@@ -1987,9 +1990,9 @@ void spu_indirect_branch(spu_context* ctx)
               for (int k = 0; k < s_dp; k++) if (p == s_dpc[k]) {
                   uint32_t base = (s_dla[k] & 0x80000000u) ? ctx->gpr[s_dla[k] & 0x7F]._u32[0] : s_dla[k];
                   for (uint32_t i = 0; i < s_dln[k] && i < 256; i += 16) {
-                      const uint32_t* q = (const uint32_t*)(ctx->ls + ((base + i) & SPU_LS_MASK & ~15u));
+                      uint32_t qa = (base + i) & SPU_LS_MASK & ~15u;
                       fprintf(stderr, "\n   LS %05X: %08X %08X %08X %08X", (base + i) & SPU_LS_MASK,
-                              __builtin_bswap32(q[0]), __builtin_bswap32(q[1]), __builtin_bswap32(q[2]), __builtin_bswap32(q[3])); } } }
+                              spu_ls_get32(ctx->ls, qa), spu_ls_get32(ctx->ls, qa + 4), spu_ls_get32(ctx->ls, qa + 8), spu_ls_get32(ctx->ls, qa + 12)); } } }
             /* JobApi entries: args r3-r5. Post-job return 0x3308: result r3 +
              * the job's saved GetBufferTag result r80. */
             if (p == 0x2F30 || p == 0x1700 || p == 0x1770 || p == 0x17C8)
@@ -2032,7 +2035,7 @@ void spu_indirect_branch(spu_context* ctx)
             extern uint8_t* vm_base;
             int wrote = 0;
             for (uint32_t o = 0xC00; o + 4 <= 0xE80 && wrote < 4; o += 4) {
-                uint32_t w = (ctx->ls[o]<<24)|(ctx->ls[o+1]<<16)|(ctx->ls[o+2]<<8)|ctx->ls[o+3];
+                uint32_t w = (spu_ls_get8(ctx->ls, o)<<24)|(spu_ls_get8(ctx->ls, o+1)<<16)|(spu_ls_get8(ctx->ls, o+2)<<8)|spu_ls_get8(ctx->ls, o+3);
                 if ((w & 0xFFFF0000u) == 0x470A0000u && vm_base) {
                     /* write nonzero to the completion word in main RAM (BE) */
                     if (vm_base[w]==0 && vm_base[w+1]==0 && vm_base[w+2]==0 && vm_base[w+3]==0) {
@@ -2053,7 +2056,7 @@ void spu_indirect_branch(spu_context* ctx)
             fprintf(stderr, "[jobexec] DISPATCH job code pc=0x%05X overlay=%d "
                     "runJobNum=0x%02X%02X%02X%02X\n",
                     ctx->pc & SPU_LS_MASK, ctx->resident_ovl,
-                    ctx->ls[0x12E0], ctx->ls[0x12E1], ctx->ls[0x12E2], ctx->ls[0x12E3]);
+                    spu_ls_get8(ctx->ls, 0x12E0), spu_ls_get8(ctx->ls, 0x12E1), spu_ls_get8(ctx->ls, 0x12E2), spu_ls_get8(ctx->ls, 0x12E3));
           /* SPU_JOBEXEC_DUMP=<path>: write the full 256KB LS the first time a job
            * entry (pc==codeBuffer+entryOffset) dispatches, to diff vs the RPCS3
            * oracle SPU4 dump (why our job bails where the oracle's runs). */
@@ -2061,7 +2064,7 @@ void spu_indirect_branch(spu_context* ctx)
           if (!s_dumped && ctx->pc == 0x4A40) {
               const char* dp = getenv("SPU_JOBEXEC_DUMP");
               if (dp) { FILE* f = fopen(dp, "wb");
-                  if (f) { fwrite(ctx->ls, 1, SPU_LS_SIZE, f); fclose(f);
+                  if (f) { fwrite(spu_ls_be(ctx->ls, 0, SPU_LS_SIZE), 1, SPU_LS_SIZE, f); fclose(f);
                       fprintf(stderr, "[jobexec] dumped LS at job entry -> %s\n", dp); }
                   s_dumped = 1; } } }
     }
@@ -2132,7 +2135,7 @@ void spu_indirect_branch(spu_context* ctx)
         static int _n = 0;
         if (_n < 12) {
             _n++;
-            const uint8_t* p = ctx->ls + (ctx->pc & SPU_LS_MASK);
+            const uint8_t* p = spu_ls_be(ctx->ls, ctx->pc, 16);
             fprintf(stderr, "[wws-jobentry] pc=0x%05X lr=0x%05X bytes:"
                     " %02X%02X%02X%02X %02X%02X%02X%02X %02X%02X%02X%02X %02X%02X%02X%02X\n",
                     ctx->pc & SPU_LS_MASK, ctx->gpr[0]._u32[0] & SPU_LS_MASK,
@@ -2142,9 +2145,9 @@ void spu_indirect_branch(spu_context* ctx)
              * loads land at 0x14400 -- possibly the actual job code, with the
              * entry computed from the wrong slot's base) + the job records
              * the entry math reads (0x1320 base block, 0x1440 batch record). */
-            { const uint8_t* q = ctx->ls + 0x14400;
-              const uint8_t* r1 = ctx->ls + 0x1320;
-              const uint8_t* r2 = ctx->ls + 0x1440;
+            { const uint8_t* r1 = spu_ls_be(ctx->ls, 0x1320, 0x14408 - 0x1320);   /* una vista per le tre */
+              const uint8_t* q = r1 + (0x14400 - 0x1320);
+              const uint8_t* r2 = r1 + (0x1440 - 0x1320);
               fprintf(stderr, "[wws-jobentry]   LS14400: %02X%02X%02X%02X %02X%02X%02X%02X"
                       "  LS1320: %02X%02X%02X%02X %02X%02X%02X%02X %02X%02X%02X%02X %02X%02X%02X%02X"
                       "  LS1440: %02X%02X%02X%02X %02X%02X%02X%02X\n",
@@ -2210,7 +2213,7 @@ void spu_indirect_branch(spu_context* ctx)
         const char* dp = getenv("YDKJ_SPU_LSDUMP");
         if (!dp || !*dp) dp = "recomp_spu_ls.bin";
         FILE* lf = fopen(dp, "wb");
-        if (lf) { fwrite(ctx->ls, 1, SPU_LS_SIZE, lf); fclose(lf);
+        if (lf) { fwrite(spu_ls_be(ctx->ls, 0, SPU_LS_SIZE), 1, SPU_LS_SIZE, lf); fclose(lf);
                   fprintf(stderr, "[SPU] dumped 256KB LS -> %s\n", dp); }
         fprintf(stderr, "[SPU] image_id=%d  GPR dump (r0..r127, hi64:lo64 of each quadword, preferred slot = _u32[0]):\n", ctx->image_id);
         for (int g = 0; g < 128; g++) {
@@ -2221,13 +2224,13 @@ void spu_indirect_branch(spu_context* ctx)
         }
         fprintf(stderr, "\n");
         /* echo the dispatch chain values the way func_00026DE0 computes them */
-        { uint32_t bec0 = ctx->ls[0xBEC0]<<24 | ctx->ls[0xBEC1]<<16 | ctx->ls[0xBEC2]<<8 | ctx->ls[0xBEC3];
+        { uint32_t bec0 = spu_ls_get8(ctx->ls, 0xBEC0)<<24 | spu_ls_get8(ctx->ls, 0xBEC1)<<16 | spu_ls_get8(ctx->ls, 0xBEC2)<<8 | spu_ls_get8(ctx->ls, 0xBEC3);
           fprintf(stderr, "[SPU] LS[0xBEC0].w0=0x%08X  LS[0x2d4e0:16]=%02X%02X%02X%02X %02X%02X%02X%02X %02X%02X%02X%02X %02X%02X%02X%02X\n",
             bec0,
-            ctx->ls[0x2d4e0],ctx->ls[0x2d4e1],ctx->ls[0x2d4e2],ctx->ls[0x2d4e3],
-            ctx->ls[0x2d4e4],ctx->ls[0x2d4e5],ctx->ls[0x2d4e6],ctx->ls[0x2d4e7],
-            ctx->ls[0x2d4e8],ctx->ls[0x2d4e9],ctx->ls[0x2d4ea],ctx->ls[0x2d4eb],
-            ctx->ls[0x2d4ec],ctx->ls[0x2d4ed],ctx->ls[0x2d4ee],ctx->ls[0x2d4ef]); }
+            spu_ls_get8(ctx->ls, 0x2d4e0),spu_ls_get8(ctx->ls, 0x2d4e1),spu_ls_get8(ctx->ls, 0x2d4e2),spu_ls_get8(ctx->ls, 0x2d4e3),
+            spu_ls_get8(ctx->ls, 0x2d4e4),spu_ls_get8(ctx->ls, 0x2d4e5),spu_ls_get8(ctx->ls, 0x2d4e6),spu_ls_get8(ctx->ls, 0x2d4e7),
+            spu_ls_get8(ctx->ls, 0x2d4e8),spu_ls_get8(ctx->ls, 0x2d4e9),spu_ls_get8(ctx->ls, 0x2d4ea),spu_ls_get8(ctx->ls, 0x2d4eb),
+            spu_ls_get8(ctx->ls, 0x2d4ec),spu_ls_get8(ctx->ls, 0x2d4ed),spu_ls_get8(ctx->ls, 0x2d4ee),spu_ls_get8(ctx->ls, 0x2d4ef)); }
     } }
     ctx->status = SPU_STATUS_STOPPED_BY_HALT;
 }
