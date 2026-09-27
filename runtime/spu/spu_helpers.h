@@ -302,14 +302,19 @@ SPU__FLOAT3(spu_fnms, fmaf(-x, y, z),  z - x * y)
  * inf/NaN non danno mai un risultato finito (inf*0 = NaN, inf+x = inf, ...),
  * quindi si vede sempre nel risultato. I denormali in ingresso li azzera il
  * ferro (FZ nell'FPCR, spu_host_fp_enter) e con RMode = verso lo zero il
- * risultato coincide col troncamento della SPU. Il massimo normale
- * (0x7F7FFFFF) va alla via esatta perche' con l'arrotondamento verso lo zero
- * e' anche il risultato di un overflow, che sulla SPU e' un valore esteso.
+ * risultato coincide col troncamento della SPU.
  * Prima: 3 flush + 4 controlli per operazione (spu__flush4/spu__noext4 erano
  * il 10% del tempo delle lane a -fno-inline). spu_fma era la funzione piu'
- * calda di tutto il port (`sample`). */
-static inline int spu__ok4(uint32x4_t w) {             /* nessuna corsia con |w| >= 0x7F7FFFFF */
-    return vmaxvq_u32(vcgeq_u32(vandq_u32(w, vdupq_n_u32(0x7FFFFFFFu)), vdupq_n_u32(0x7F7FFFFFu))) == 0; }
+ * calda di tutto il port (`sample`).
+ * s.49: il massimo normale (0x7F7FFFFF) NON va piu' alla via esatta. Era l'1,5%
+ * della CPU in spu_fma_slow (sonda: overflow come 0x7F317215 x 0xF8CD6C06 ->
+ * 0xFF7FFFFF con RMode verso lo zero), e la via esatta lo restituiva identico:
+ * un risultato max-normale viene da ingressi non estesi (un esteso per l'host e'
+ * inf/NaN e da' inf/NaN) e per quelli la via esatta rifa' lo stesso fmaf con lo
+ * stesso FPCR e tiene il risultato. Che sul ferro l'overflow sia un esteso
+ * (s.36) la via esatta non lo ha mai fatto: il comportamento non cambia. */
+static inline int spu__ok4(uint32x4_t w) {             /* nessuna corsia con |w| >= 0x7F800000 (esteso/inf/NaN) */
+    return vmaxvq_u32(vcgeq_u32(vandq_u32(w, vdupq_n_u32(0x7FFFFFFFu)), vdupq_n_u32(0x7F800000u))) == 0; }
 #define SPU__FLOAT3_NEON(NAME, NEONEXPR) \
 static inline __attribute__((always_inline)) u128 NAME(u128 a, u128 b, u128 c) { \
     float32x4_t x = vld1q_f32(a._f32), y = vld1q_f32(b._f32), z = vld1q_f32(c._f32); \
@@ -504,7 +509,23 @@ static inline u128 spu_fcmgt(u128 a, u128 b){ u128 r; for(int i=0;i<4;i++){ doub
 /* frsqest: 1/sqrt(|a|) (the sign is ignored, CBEA). The SPU has no inf: a
  * zero gives the largest float instead of inf (which would turn into NaN on
  * the first 0*inf downstream, where hardware gives a finite value). */
+#if defined(__aarch64__) && defined(__ARM_NEON)
+static __attribute__((noinline)) u128 spu_frsqest_slow(u128 a){ u128 r; for(int i=0;i<4;i++){ double x=fabs(SPU__F(a,i)); r._u32[i]= x>0.0 ? spu__d2f(1.0/sqrt(x)) : 0x7F800000u; } return r; }
+/* s.49: stesse operazioni in double, due corsie per istruzione (erano 4 sqrt e
+ * 4 divisioni scalari, ~0,7% della CPU). La conversione a float segue l'FPCR
+ * delle lane (verso lo zero) = il troncamento di spu__d2f per risultati
+ * normali, e 1/sqrt di un float normale e' sempre normale; esponenti 0/255 in
+ * ingresso -> via esatta. */
+static inline u128 spu_frsqest(u128 a){
+    uint32x4_t w = vandq_u32(vld1q_u32(a._u32), vdupq_n_u32(0x7FFFFFFFu)), m = vdupq_n_u32(0x7F800000u), ei = vandq_u32(w, m);
+    if (__builtin_expect(vmaxvq_u32(vorrq_u32(vceqzq_u32(ei), vceqq_u32(ei, m))) == 0, 1)) {
+        float32x4_t x = vreinterpretq_f32_u32(w); const float64x2_t one = vdupq_n_f64(1.0);
+        float64x2_t lo = vdivq_f64(one, vsqrtq_f64(vcvt_f64_f32(vget_low_f32(x)))), hi = vdivq_f64(one, vsqrtq_f64(vcvt_high_f64_f32(x)));
+        u128 r; vst1q_f32(r._f32, vcvt_high_f32_f64(vcvt_f32_f64(lo), hi)); return r; }
+    return spu_frsqest_slow(a); }
+#else
 static inline u128 spu_frsqest(u128 a){ u128 r; for(int i=0;i<4;i++){ double x=fabs(SPU__F(a,i)); r._u32[i]= x>0.0 ? spu__d2f(1.0/sqrt(x)) : 0x7F800000u; } return r; }
+#endif
 /* frest: reciprocal estimate; exact 1/x (fi is then the identity). Zero ->
  * largest float with the sign of the input, as the hardware saturates. */
 #if defined(__aarch64__) && defined(__ARM_NEON)

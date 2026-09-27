@@ -1,6 +1,6 @@
 # Stato del progetto
 
-Ultimo aggiornamento: **27 settembre 2026** — sessione 48.
+Ultimo aggiornamento: **27 settembre 2026** — sessione 49.
 
 ## Dove siamo
 
@@ -1104,6 +1104,44 @@ riconosce solo nella via lenta), gestore d'interrupt (irq_save_valid, PM
 0x1BDC/0x1C20), shim 0x3FEC0 -- tutti casi legittimi.
 Screenshot a 110 s corretto. **A/B 7+7 stesso binario (c48x)**: **-9,0 +-
 4,7 ms CPU/fotogramma** (a 2.200 draw 155 -> 146), 14/14 corse OK, nessun fermo.
+
+**Tre costi del runtime SPU, s.49** (27/09). Profilo `sample` 10 s a 100 s +
+xctrace per indirizzo (`leaf.py` nello scratchpad della sessione: campioni
+foglia per offset dentro un simbolo; load-addr dal tag `binary` dell'export).
+Partenza: lavoro attivo ~22.000 campioni, job 55%, runtime SPU ~18%.
+1. **spu_wrch**: 1.148 campioni foglia su 37.169 (xctrace), ~30% solo
+   prologo/epilogo (0x3B0 byte di pila + 12 registri + stack guard: gli
+   atomici GETLLAR/PUTLLC erano in linea) e altri ~330 nel prologo di
+   mfc_channel_write -- per scritture che sono semplici store (LSA/EAH/EAL/
+   Size/TagID/TagMask, 6 per DMA). Ora spu_wrch fa questi store e torna, il
+   resto in `spu_wrch_slow` (con SPU_CHHIST acceso tutto passa dalla lenta).
+   wrch+mfc_channel_write 1.026 -> ~790 (sample).
+2. **spu_fma_slow** (443, 1,5%): sonda sugli ingressi = NON era esteso x 0
+   (una "seconda possibilita'" NEON per esteso x zero, provata, prendeva
+   ~10%: tolta) ma overflow che con RMode verso lo zero da' 0x7F7FFFFF /
+   0xFF7FFFFF (es. 0x7F317215 x 0xF8CD6C06), che spu__ok4 mandava alla via
+   esatta, la quale lo restituiva identico. Ora spu__ok4 ferma solo
+   |w| >= 0x7F800000. Stesso risultato bit per bit (vedi sotto). 443 -> 42.
+   NOTA: sul ferro l'overflow e' un esteso (0x7FFFFFFF), la via esatta non lo
+   ha mai fatto (fmaf in RZ satura al max normale): semantica invariata, ma
+   se un giorno servisse l'esteso va cambiata la via esatta, non ok4.
+3. **spu_frsqest** in NEON double a due corsie (151 -> slow 40, sono gli
+   ingressi zero). Anche **note_get / match_sig**: firme dei moduli in una
+   tabella hash (erano ~95 memcmp a GET grande), voci a EA in lista a parte.
+   Stessi 24 moduli riconosciuti ("primo uso") nella corsa di prova.
+Test: `tests/spu_float_neon_diff.c` (fma/fms/fnms/fa/fs/fm/frsqest contro le
+vie esatte, FPCR FZ+RZ, estesi/zeri/denormali/overflow): 35 M confronti, 0
+differenze. Con l'FPCR di default (senza FZ) le vie veloci differiscono gia'
+da prima sui denormali: non e' un caso d'uso.
+Screenshot a 110 s corretto. **A/B contro uncharted_s48 (c49ab 7+7, c49b
+10+10), 25 corse a regime: -3,5 +- 2,4 ms CPU/fotogramma** (a 2.200 draw 145
+-> 141). Fermi/rallentamenti: vecchia 5/17 (2-19 fps), nuova 2/17 (fermi muti
+a #2828 e #3308 prima dei 60 s, nessun assert): lo stallo tipo B noto, non
+attribuito alle modifiche.
+Restano (lane, 22.000 campioni): spu_ls_copy_in ~830 (memoria), salto
+indiretto ~730 in tutto, spu_fm_slow 157 e spu_fnms_slow 63 (causa non
+sondata: prossimo passo, stessa sonda del punto 2), resv_lock_spin ~200,
+rdch ~160.
 
 ## Storico
 

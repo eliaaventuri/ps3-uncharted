@@ -779,13 +779,38 @@ static int channel_is_mfc(uint32_t ch)
 /* ===========================================================================
  * Channel write
  * ===========================================================================*/
+/* s.49: -1 = non ancora letta, 0 = spenta (abilita la via veloce di spu_wrch) */
+static int s_wrch_hist = -1;
+static __attribute__((noinline)) void spu_wrch_slow(spu_context* ctx, uint32_t channel, u128 value);
+
+/* s.49: i canali parametro dell'MFC (LSA/EAH/EAL/Size/TagID/TagMask, 6 scritture
+ * per DMA) sono semplici store; prima passavano dal prologo di spu_wrch (0x3B0
+ * byte di pila + 12 registri, per gli atomici in linea) e di mfc_channel_write:
+ * ~680 campioni su 37.000 (xctrace, s.49) di solo prologo/epilogo. */
 void spu_wrch(spu_context* ctx, uint32_t channel, u128 value)
+{
+    if (__builtin_expect(s_wrch_hist == 0, 1)) {
+        uint32_t v = value._u32[0];
+        switch (channel) {
+        case MFC_LSA:       ctx->mfc_lsa = v;         return;
+        case MFC_EAH:       ctx->mfc_eah = v;         return;
+        case MFC_EAL:       ctx->mfc_eal = v;         return;
+        case MFC_Size:      ctx->mfc_size = v;        return;
+        case MFC_TagID:     ctx->mfc_tag = v & 0x1F;  return;
+        case MFC_WrTagMask: ctx->mfc_tag_mask = v;    return;
+        default: break;
+        }
+    }
+    spu_wrch_slow(ctx, channel, value);
+}
+
+static __attribute__((noinline)) void spu_wrch_slow(spu_context* ctx, uint32_t channel, u128 value)
 {
     /* SPU_CHHIST=1: which channels a job actually touches, and how often. A
      * worker that never issues an MFC command is either not being handed its
      * work descriptor or is waiting on a channel we never satisfy; the channel
      * mix distinguishes those. */
-    { static int s_c = -1; if (s_c < 0) s_c = getenv("SPU_CHHIST") ? 1 : 0;
+    { int s_c = s_wrch_hist; if (s_c < 0) s_c = s_wrch_hist = getenv("SPU_CHHIST") ? 1 : 0;
       if (s_c) { static unsigned long long w[128]; static unsigned long long n;
           w[channel & 127]++;
           if ((++n % 2000) == 0) { fprintf(stderr, "[chw] %llu writes:%c", n, 10);
@@ -1215,11 +1240,32 @@ typedef struct { uint32_t src_ea; int image_id; uint8_t sig[16]; int has_sig; } 
 static spu_ovl_src s_ovl_src[SPU_OVL_SRC_MAX];
 static int s_ovl_src_count = 0;
 static int s_ovl_ea_count = 0;   /* s.42: voci a EA (le altre sono a firma, solo GET >= 512 byte) */
+static int s_ovl_ea_idx[SPU_OVL_SRC_MAX];   /* s.49: indici delle voci a EA (le firme stanno in s_ovl_sig_tab) */
+/* s.49: tabella hash delle firme (indice+1, 0 = vuota; a parita' di firma resta
+ * la prima registrata, come nella scansione in ordine). Prima note_get e
+ * match_sig confrontavano le ~95 firme a ogni GET grande / ingresso di job:
+ * ~225 campioni su 22.000 delle lane. */
+#define SPU_OVL_SIG_HASH 256
+static int16_t s_ovl_sig_tab[SPU_OVL_SIG_HASH];
+static unsigned spu_ovl_sig_h(const uint8_t* sig)
+{
+    uint64_t a, b; memcpy(&a, sig, 8); memcpy(&b, sig + 8, 8);
+    return (unsigned)(((a ^ (b * 0xC2B2AE3D27D4EB4Full)) * 0x9E3779B97F4A7C15ull) >> 56);
+}
+static int spu_ovl_sig_find(const uint8_t sig[16])   /* indice in s_ovl_src, o -1 */
+{
+    for (unsigned h = spu_ovl_sig_h(sig), k = 0; k < SPU_OVL_SIG_HASH; k++, h = (h + 1) & (SPU_OVL_SIG_HASH - 1)) {
+        int e = s_ovl_sig_tab[h];
+        if (!e) return -1;
+        if (memcmp(s_ovl_src[e - 1].sig, sig, 16) == 0) return e - 1;
+    }
+    return -1;
+}
 
 void spu_overlay_register_source(uint32_t content_ea, int image_id)
 {
     if (s_ovl_src_count < SPU_OVL_SRC_MAX) {
-        s_ovl_ea_count++;
+        s_ovl_ea_idx[s_ovl_ea_count++] = s_ovl_src_count;
         s_ovl_src[s_ovl_src_count].src_ea = content_ea;
         s_ovl_src[s_ovl_src_count].image_id = image_id;
         s_ovl_src[s_ovl_src_count].has_sig = 0;
@@ -1237,6 +1283,11 @@ void spu_overlay_register_sig(const uint8_t sig[16], int image_id)
         s_ovl_src[s_ovl_src_count].image_id = image_id;
         memcpy(s_ovl_src[s_ovl_src_count].sig, sig, 16);
         s_ovl_src[s_ovl_src_count].has_sig = 1;
+        if (spu_ovl_sig_find(sig) < 0) {
+            unsigned h = spu_ovl_sig_h(sig);
+            while (s_ovl_sig_tab[h]) h = (h + 1) & (SPU_OVL_SIG_HASH - 1);
+            s_ovl_sig_tab[h] = (int16_t)(s_ovl_src_count + 1);
+        }
         s_ovl_src_count++;
     }
 }
@@ -1248,25 +1299,30 @@ void spu_overlay_note_get(spu_context* ctx, uint32_t ea, const uint8_t* ls, uint
 {
     /* s.42: gira a ogni GET; una GET piccola non puo' essere un modulo a firma */
     if (size < 512 && !s_ovl_ea_count) return;
-    uint8_t hdr[16]; int have_hdr = 0;   /* s.47: la testata in ordine SPU (la LS e' in ordine SPU_LS_XOR) */
-    for (int i = 0; i < s_ovl_src_count; i++) {
-        const spu_ovl_src* o = &s_ovl_src[i];
-        if (o->has_sig && size >= 512 && !have_hdr) { spu_ls_copy_out(ctx->ls, (uint32_t)(ls - ctx->ls), hdr, 16); have_hdr = 1; }
-        int hit = o->has_sig ? (size >= 512 && memcmp(hdr, o->sig, 16) == 0)
-                             : (o->src_ea == ea);
-        if (hit) {
-            if (ctx->resident_ovl != o->image_id) {
-                ctx->resident_ovl = o->image_id;
-                { static uint8_t _seen[256]; int img = o->image_id; if (img >= 0 && img < 256 && !_seen[img]) { _seen[img] = 1;
-                      struct timespec _ts; clock_gettime(CLOCK_MONOTONIC, &_ts);
-                      fprintf(stderr, "[spu-ovl] primo uso del modulo %d (t=%ld s)\n", img, (long)_ts.tv_sec); } }
-                { static int _n = 0; if (_n++ < 32)
-                    fprintf(stderr, "[spu-ovl] img=%d streamed overlay src=0x%08X "
-                            "-> LS 0x%05X size=%u -> resident ovl image %d%s\n",
-                            ctx->image_id, ea, (uint32_t)(ls - ctx->ls), size,
-                            ctx->resident_ovl, o->has_sig ? " (sig match)" : ""); }
-            }
-            return;
+    /* s.49: voci a EA in lista, firme nella tabella hash; vince la prima
+     * registrata, come nella scansione in ordine di prima */
+    int best = -1;
+    for (int k = 0; k < s_ovl_ea_count; k++)
+        if (s_ovl_src[s_ovl_ea_idx[k]].src_ea == ea) { best = s_ovl_ea_idx[k]; break; }
+    if (size >= 512 && s_ovl_ea_count < s_ovl_src_count) {
+        uint8_t hdr[16];   /* s.47: la testata in ordine SPU (la LS e' in ordine SPU_LS_XOR) */
+        spu_ls_copy_out(ctx->ls, (uint32_t)(ls - ctx->ls), hdr, 16);
+        int j = spu_ovl_sig_find(hdr);
+        if (j >= 0 && (best < 0 || j < best)) best = j;
+    }
+    if (best < 0) return;
+    {
+        const spu_ovl_src* o = &s_ovl_src[best];
+        if (ctx->resident_ovl != o->image_id) {
+            ctx->resident_ovl = o->image_id;
+            { static uint8_t _seen[256]; int img = o->image_id; if (img >= 0 && img < 256 && !_seen[img]) { _seen[img] = 1;
+                  struct timespec _ts; clock_gettime(CLOCK_MONOTONIC, &_ts);
+                  fprintf(stderr, "[spu-ovl] primo uso del modulo %d (t=%ld s)\n", img, (long)_ts.tv_sec); } }
+            { static int _n = 0; if (_n++ < 32)
+                fprintf(stderr, "[spu-ovl] img=%d streamed overlay src=0x%08X "
+                        "-> LS 0x%05X size=%u -> resident ovl image %d%s\n",
+                        ctx->image_id, ea, (uint32_t)(ls - ctx->ls), size,
+                        ctx->resident_ovl, o->has_sig ? " (sig match)" : ""); }
         }
     }
 }
@@ -1278,12 +1334,8 @@ void spu_overlay_note_get(spu_context* ctx, uint32_t ea, const uint8_t* ls, uint
  * chunk), so resident_ovl is set at branch-in time by matching the buffer head. */
 int spu_overlay_match_sig(const uint8_t hdr[16])
 {
-    for (int i = 0; i < s_ovl_src_count; i++) {
-        const spu_ovl_src* o = &s_ovl_src[i];
-        if (o->has_sig && memcmp(hdr, o->sig, 16) == 0)
-            return o->image_id;
-    }
-    return 0;
+    int j = spu_ovl_sig_find(hdr);   /* s.49: tabella hash */
+    return j >= 0 ? s_ovl_src[j].image_id : 0;
 }
 
 /* HLE of the taskset Policy Module's task-syscall entry (LS 0xA70). A SPURS task
