@@ -1139,9 +1139,12 @@ Screenshot a 110 s corretto. **A/B contro uncharted_s48 (c49ab 7+7, c49b
 a #2828 e #3308 prima dei 60 s, nessun assert): lo stallo tipo B noto, non
 attribuito alle modifiche.
 Restano (lane, 22.000 campioni): spu_ls_copy_in ~830 (memoria), salto
-indiretto ~730 in tutto, spu_fm_slow 157 e spu_fnms_slow 63 (causa non
-sondata: prossimo passo, stessa sonda del punto 2), resv_lock_spin ~200,
-rdch ~160.
+indiretto ~730 in tutto, spu_fm_slow 157 e spu_fnms_slow 63, resv_lock_spin ~200, rdch ~160.
+**Sonda su fm/fnms/fa (s.49, dopo)**: qui sono calcoli VERI con estesi
+(0x7F800000 = 2^128 usato come "grande": fm 0x7F800000 x 0x7F800000 ->
+0x7FFFFFFF saturato, fma con c = 0x7F800000, fnms con 0x7FFFFFFF), non
+risultati identici all'host: servono davvero la via esatta. Emularli in NEON
+costerebbe molto per ~1% delle lane: lasciati. Non risondare.
 
 ## Storico
 
