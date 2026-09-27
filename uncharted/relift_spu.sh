@@ -21,7 +21,7 @@ echo "== lift dei moduli di job =="
     --jobmods spu_jobs --lifted spu_jobs/lifted \
     --register-c gen/jobmods_register.c \
     --register-fn uncharted_jobmods_register_all --image-base 200 \
-    --fallthrough-tailcall --merge-blocks
+    --fallthrough-tailcall --merge-blocks --inline-xfer
 
 # 3. Le due immagini SPU del titolo (il suo programma e il policy module SPURS)
 #    e il registry a fingerprint.
@@ -29,7 +29,8 @@ echo "== immagini SPU del titolo =="
 "$PY" "$R/tools/build_spu_workloads.py" \
     --images spu_all --lifted spu_lifted \
     --out gen/spu_workloads.c \
-    --register-fn spu_register_all --constructor --title uncharted
+    --register-fn spu_register_all --constructor --title uncharted \
+    --relift --inline-xfer
 
 # 4. Il policy module va rifatto con due ingressi in piu' e tre salti forzati.
 #
@@ -71,7 +72,7 @@ if [ -f spu_all/spurs_policy.elf ]; then
     spu_all/spurs_policy.elf --auto-functions spu_all/spurs_policy.elf \
     --symbol-prefix spurs_policy_ -o spu_lifted/spurs_policy \
     --extra-funcs 0xA2C,0x1BDC,0x30E4,0x3528 \
-    --force-indirect 0x2AD4,0x2AF4,0x2B14
+    --force-indirect 0x2AD4,0x2AF4,0x2B14 --inline-xfer
 else echo "manca spu_all/spurs_policy.elf: policy module non liftato (vedi prepare.sh)"; fi
 #
 #    --extra-funcs 0x3528 (sessione 27): ritorno del `brsl $r0, 0x3600` a
@@ -80,4 +81,8 @@ else echo "manca spu_all/spurs_policy.elf: policy module non liftato (vedi prepa
 #    senza ingresso finiva in BRANCH-TO-0 + microstep ("UNKNOWN word
 #    0x7D008102" = ceqhi): il livello dive-boat si fermava dopo il login.
 
+# --inline-xfer (s.48): i salti fra funzioni fanno in linea i controlli del
+# drain e saltano in coda al bersaglio (SPU_XJUMP/SPU_XIND); SPU_XFER_INLINE=0
+# a runtime torna al trampolino. --relift sulle immagini: il lift installato
+# dell'immagine 1 era del 13/09, prima dei ritorni di bisl come ingressi.
 echo "fatto. ora ./build.sh"

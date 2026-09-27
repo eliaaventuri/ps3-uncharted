@@ -1071,6 +1071,40 @@ sta a >256 KB dall'inizio del contesto: ogni accesso materializza l'offset;
 forse il compilatore non tiene piu' in registro qualcosa dopo le scritture
 via ctx). Non riprovare in questa forma; se mai, campo in TESTA al contesto.
 
+**Salti fra funzioni SPU in linea** (s.48, "lavoro grosso"). Sonda
+`-DSPU_HOPSTAT` (spu_drain.c, build a parte `cmake -B build_hs
+-DCMAKE_C_FLAGS=-DSPU_HOPSTAT` + `RT_BUILD=build_hs ./uncharted/build.sh`):
+istogramma dei salti per (tipo, immagine, overlay, pc). Prima: per ogni 50 M
+hop diretti ~45 M indiretti. Diretti: il ciclo dell'immagine 1
+(spu_0000_at_00845000, 0x8900->0x8908->0x8968, tradotta un blocco per
+funzione: 3 hop per giro) e il job 215; indiretti: la tabella dei gestori del
+job 215 (0x11260, 0x11298, 0x117B8, 0x13458...).
+Nuovo `--inline-xfer` nel lifter (anche in lift_jobmods.py e
+build_spu_workloads.py, acceso in uncharted/relift_spu.sh): i salti diretti
+fra funzioni diventano `SPU_XJUMP` (controlli del drain in linea: interrupt
+pendente, ritorno esatto SPU_RETLINK, flow del PM; poi musttail al bersaglio),
+`bi`/`biz` diventano `SPU_XIND` (stessi controlli + ib_cache del contesto, con
+esclusi i pc speciali di spu_indirect_branch), `bisl` usa `SPU_XCALLI`; e
+`SPU_RETR` a host_depth 0 fa lo stesso. Se un controllo scatta si ricade nel
+trampolino: il drain fa quello che faceva prima. `SPU_XFER_INLINE=0` a
+runtime = tutto come prima (stesso binario). Senza l'opzione il lifter produce
+lo stesso output di prima (verificato byte per byte sull'immagine 1).
+Anche: **ib_cache indicizzata con hash moltiplicativo** della chiave: con
+(pc>>2)&255 i bersagli 0x11298/0x11A98/0x12298/0x12A98 del job 215 stavano
+nella STESSA casella (la s.46 provo' 1.024 voci senza effetto: stessi 12 bit
+bassi, conflitto identico).
+ATTENZIONE: il lift installato dell'immagine 1 era del 13/09 (prima dei
+ritorni di bisl come ingressi, 13 funzioni in meno); relift_spu.sh ora passa
+--relift e l'immagine 1 e' rifatta col lifter attuale. Copia del lift
+precedente: uncharted-data/lifted_pre_s48.tgz.
+Profilo (10 s a 100 s): spu_drain_fast 1.264 -> 145, spu_indirect_branch
+1.015 -> 315, spu_lookup 82. Ricadute residue (sonda col motivo): ingressi
+di un job nuovo (0xBC14 con l'overlay vecchio: la firma del modulo si
+riconosce solo nella via lenta), gestore d'interrupt (irq_save_valid, PM
+0x1BDC/0x1C20), shim 0x3FEC0 -- tutti casi legittimi.
+Screenshot a 110 s corretto. **A/B 7+7 stesso binario (c48x)**: **-9,0 +-
+4,7 ms CPU/fotogramma** (a 2.200 draw 155 -> 146), 14/14 corse OK, nessun fermo.
+
 ## Storico
 
 Sessioni fino alla 37 e la vecchia "Dove siamo", verbatim, in

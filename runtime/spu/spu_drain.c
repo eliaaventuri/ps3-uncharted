@@ -364,6 +364,7 @@ int spu_retlink_enabled(void)
  * completo resta in SPU_DRAIN_FULL e si usa con qualunque variabile che
  * accenda una sonda del ciclo, con il lockstep o con SPU_TAILRET=1. */
 int g_spu_drain_mode = 0;
+int g_spu_xfer_inline = 0, g_spu_ib_inline = 0;   /* s.48, v. SPU_XJUMP */
 
 static int spu_drain_mode_init(void)
 {
@@ -383,9 +384,48 @@ void spu_drain_slow(spu_context* ctx)
         static int _n = 0;
         if (_n++ == 0) fprintf(stderr, "[spu-drain] ciclo %s\n", m == 1 ? "veloce" : "completo (diagnostica)");
         g_spu_drain_mode = m;
+        /* s.48: trasferimenti in linea solo col drain veloce */
+        { const char* e = getenv("SPU_XFER_INLINE");
+          g_spu_xfer_inline = (m == 1 && !(e && *e == '0')) ? 1 : 0;
+          fprintf(stderr, "[spu-drain] trasferimenti in linea %s\n", g_spu_xfer_inline ? "accesi" : "spenti"); }
     }
     SPU_DRAIN_FULL(ctx);
 }
+
+
+#ifdef SPU_HOPSTAT
+/* Sonda temporanea s.48 (-DSPU_HOPSTAT): istogramma dei salti per
+ * (tipo, immagine/overlay, pc). tipo 0 = hop diretto del trampolino,
+ * 1 = hop verso spu_indirect_branch, 2 = ogni ingresso in spu_indirect_branch. */
+#include <stdatomic.h>
+#define HS_N (1u << 16)
+static _Atomic uint64_t hs_key[HS_N]; static _Atomic uint64_t hs_cnt[HS_N];
+static _Atomic uint64_t hs_tot[16], hs_all;
+void spu_hopstat(int kind, spu_context* ctx)
+{
+    uint64_t k = ((uint64_t)kind << 48) | ((uint64_t)(uint16_t)ctx->image_id << 32) |
+                 ((uint64_t)(uint8_t)ctx->resident_ovl << 24) | (ctx->pc & SPU_LS_MASK);
+    k += 1;
+    uint32_t h = (uint32_t)((k * 0x9E3779B97F4A7C15ull) >> 48);
+    for (;;) { uint64_t e = atomic_load_explicit(&hs_key[h], memory_order_relaxed);
+        if (e == k) break;
+        if (e == 0) { uint64_t z = 0; if (atomic_compare_exchange_strong(&hs_key[h], &z, k) || z == k) break; }
+        h = (h + 1) & (HS_N - 1); }
+    atomic_fetch_add_explicit(&hs_cnt[h], 1, memory_order_relaxed);
+    uint64_t t = atomic_fetch_add_explicit(&hs_tot[kind], 1, memory_order_relaxed) + 1;
+    (void)t;
+    if ((atomic_fetch_add_explicit(&hs_all, 1, memory_order_relaxed) + 1) % 20000000ull == 0) {
+        fprintf(stderr, "[hopstat] tot diretti=%llu ind-hop=%llu ind-tutti=%llu\n",
+                (unsigned long long)hs_tot[0], (unsigned long long)hs_tot[1], (unsigned long long)hs_tot[2]);
+        for (int r = 0; r < 60; r++) { uint64_t best = 0; uint32_t bi = 0;
+            for (uint32_t i = 0; i < HS_N; i++) { uint64_t c = hs_cnt[i]; if (c > best) { best = c; bi = i; } }
+            if (!best) break; uint64_t kk = hs_key[bi] - 1;
+            fprintf(stderr, "[hopstat] %d img=%u ovl=%u pc=%05X %llu\n", (int)(kk >> 48), (unsigned)((kk >> 32) & 0xFFFF),
+                    (unsigned)((kk >> 24) & 0xFF), (unsigned)(kk & 0xFFFFFF), (unsigned long long)best);
+            hs_cnt[bi] = 0; }
+        memset((void*)hs_key, 0, sizeof hs_key); memset((void*)hs_cnt, 0, sizeof hs_cnt); }
+}
+#endif
 
 /* Lo stesso ciclo di SPU_DRAIN_FULL senza le sonde: ritorno esatto
  * (SPU_RETLINK), fine del job a LS 0 e anello del flow del PM come nella via
@@ -403,6 +443,21 @@ void spu_drain_fast(spu_context* ctx)
             return;
         }
         g_spu_trampoline_fn = 0;
+#ifdef SPU_HOPSTAT
+        if (tf == spu_indirect_branch) {
+            /* motivo per cui la via in linea non l'ha preso: 3 = interrupt
+             * pendente, 4 = pc speciale, 5 = irq_save_valid, 6 = cache mancata,
+             * 7 = img 23, 8 = presa adesso (sito senza XIND: stub/iret/...) */
+            uint32_t pc = (uint32_t)ctx->pc & SPU_LS_MASK & ~3u; int why;
+            if (ctx->int_enable && (ctx->event_status & ctx->event_mask)) why = 3;
+            else if (pc == 0 || pc >= 0x3FEC0u || pc == SPURS_PM_EXIT_TO_KERNEL_LS || pc == SPURS_PM_SELECT_WORKLOAD_LS || pc == 0xA70u) why = 4;
+            else if (ctx->irq_save_valid) why = 5;
+            else if (ctx->image_id == 23) why = 7;
+            else { const uint64_t key = pc | ((uint64_t)(uint16_t)ctx->image_id << 32) | ((uint64_t)(uint16_t)ctx->resident_ovl << 48);
+                   why = ctx->ib_cache[spu_ib_slot(key)].key == key ? 8 : 6; }
+            spu_hopstat(why, ctx);
+        } else spu_hopstat(0, ctx);
+#endif
         ctx->steps++;
         if (__builtin_expect((ctx->pc & SPU_LS_MASK) == 0 && ctx->steps > 1 && !ctx->policy_mode && ctx->image_id > 0, 0)) {
             static int _n = 0;

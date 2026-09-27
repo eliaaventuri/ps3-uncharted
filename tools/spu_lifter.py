@@ -599,8 +599,7 @@ class SPULifter:
                     f"SPU_TAILCALL({self.prefix}spu_func_{end:08X}(ctx)); }}")
             else:
                 func.body_lines.append(
-                    f"    {{ ctx->pc = 0x{end:X}; "
-                    f"g_spu_trampoline_fn = {self.prefix}spu_func_{end:08X}; return; }}")
+                    f"    {{ {self._xjump(end, f'{self.prefix}spu_func_{end:08X}')} }}")
 
         # Infinite no-op self-loop (the SPU `br .` halt idiom): a function whose
         # whole body is nops + an unconditional branch back into itself does
@@ -1004,8 +1003,8 @@ class SPULifter:
             self.branch_targets.add(tgt)
             # Cross-function conditional branch = conditional tail: hand the
             # target to the trampoline and unwind (enclosing SPU_DRAIN re-enters).
-            return (f"if ({cond}) {{ ctx->pc = 0x{tgt:X}; "
-                    f"g_spu_trampoline_fn = {self.prefix}spu_func_{self._owner(tgt):08X}; return; }}")
+            return (f"if ({cond}) {{ "
+                    f"{self._xjump(tgt, f'{self.prefix}spu_func_{self._owner(tgt):08X}')} }}")
         # Interrupt enable/disable bits on the bi family (bie/bid, irete/iretd,
         # bisle(d)...): bit 0x40000 = E (enable), 0x80000 = D (disable), taking
         # effect when the branch is TAKEN. The WWS jobmanager's poll loop runs
@@ -1030,6 +1029,8 @@ class SPULifter:
                 # (r78 nei ritorni `brsl $r78` del policy module), non sempre r0.
                 return f"{_ied}{self._rcf}SPU_RETR(ctx, {int(tgt_reg)});"
             # Computed indirect tail: set pc + trampoline to the dispatcher, unwind.
+            if getattr(self, "inline_xfer", False):
+                return f"{_ied}SPU_XIND(ctx, {g(tgt_reg)}._u32[0]);"
             return (f"{_ied}ctx->pc = {g(tgt_reg)}._u32[0]; "
                     f"g_spu_trampoline_fn = spu_indirect_branch; return;")
         # iret: interrupt return -> branch to the saved interrupt PC (SRR0).
@@ -1056,7 +1057,7 @@ class SPULifter:
                     f"int32_t _si = (int32_t)ctx->image_id; "
                     f"uint32_t _rl = ctx->ret_link; ctx->ret_link = 0x{addr + 4:X}u; "
                     f"{_ied}ctx->pc = _tg; {self._rcf}ctx->host_depth++; "
-                    f"spu_indirect_branch(ctx); SPU_DRAIN(ctx); "
+                    f"{'SPU_XCALLI(ctx)' if getattr(self, 'inline_xfer', False) else 'spu_indirect_branch(ctx)'}; SPU_DRAIN(ctx); "
                     f"ctx->host_depth--; ctx->ret_link = _rl; spu_img_restore(ctx, _si); {self._rcl}}}")
         # bisled: set link, branch to RA only if an external event is pending.
         if mn in ("bisled",):
@@ -1079,6 +1080,8 @@ class SPULifter:
             if (tgt_reg == "0" and addr not in self.bi_r0_jump) \
                     or addr in self.link_return:
                 return f"if ({cond}) {{ {_ied}{self._rcf}SPU_RETR(ctx, {int(tgt_reg)}); }}"
+            if getattr(self, "inline_xfer", False):
+                return f"if ({cond}) {{ {_ied}SPU_XIND(ctx, {g(tgt_reg)}._u32[0]); }}"
             return (f"if ({cond}) {{ {_ied}ctx->pc = {g(tgt_reg)}._u32[0]; "
                     f"g_spu_trampoline_fn = spu_indirect_branch; return; }}")
 
@@ -1107,6 +1110,13 @@ class SPULifter:
         }
         return table.get(mn, f"{word} != 0")
 
+    def _xjump(self, tgt: int, fn: str) -> str:
+        """Trasferimento diretto fra funzioni: trampolino, o SPU_XJUMP con
+        --inline-xfer (LS 0 resta sul trampolino: e' la fine del job)."""
+        if getattr(self, "inline_xfer", False) and tgt != 0:
+            return f"SPU_XJUMP(ctx, 0x{tgt:X}, {fn});"
+        return f"ctx->pc = 0x{tgt:X}; g_spu_trampoline_fn = {fn}; return;"
+
     def _uncond_branch(self, tgt, func: LiftedFunction) -> str:
         if tgt is None:
             return "/* TODO spu: unresolved branch */;"
@@ -1117,8 +1127,7 @@ class SPULifter:
         self.branch_targets.add(tgt)
         # Cross-function unconditional tail: hand the target to the trampoline
         # and unwind so the enclosing SPU_DRAIN re-enters (no host-stack growth).
-        return (f"{{ ctx->pc = 0x{tgt:X}; "
-                f"g_spu_trampoline_fn = {self.prefix}spu_func_{self._owner(tgt):08X}; return; }}")
+        return (f"{{ {self._xjump(tgt, f'{self.prefix}spu_func_{self._owner(tgt):08X}')} }}")
 
     # ------------------------------------------------------------------ #
     def emit_header(self) -> str:
@@ -1241,6 +1250,12 @@ def main() -> None:
                    help="La caduta in avanti nella funzione liftata successiva "
                         "e' una tail call diretta (musttail) invece di un hop "
                         "del trampolino. Solo i salti veri passano dal trampolino.")
+    p.add_argument("--inline-xfer", action="store_true",
+                   help="I salti fra funzioni (diretti e bi/biz indiretti) fanno "
+                        "in linea i controlli del drain e saltano in coda al "
+                        "bersaglio (SPU_XJUMP/SPU_XIND, s.48); se un controllo "
+                        "scatta si ricade nel trampolino. SPU_XFER_INLINE=0 a "
+                        "runtime torna al trampolino sempre.")
     p.add_argument("--reg-cache", action="store_true",
                    help="I registri di ogni funzione liftata sono variabili locali "
                         "(u128 rN), scritte in ctx->gpr prima di uscite/chiamate/"
@@ -1383,6 +1398,7 @@ def main() -> None:
               f"{', '.join(f'0x{a:X}' for a in sorted(lifter.link_return))}")
     lifter.func_starts = {s for s, e in bounds}  # for fall-through tail-call chaining
     lifter.fallthrough_tailcall = bool(args.fallthrough_tailcall)
+    lifter.inline_xfer = bool(args.inline_xfer)
     lifter.merge_blocks = bool(args.merge_blocks)
     if args.reg_cache and not args.trace:
         lifter.reg_cache = True

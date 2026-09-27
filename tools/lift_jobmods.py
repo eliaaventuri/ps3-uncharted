@@ -64,6 +64,8 @@ def main():
                     help="passa --reg-cache-min N a spu_lifter.py")
     ap.add_argument("--fallthrough-tailcall", action="store_true",
                     help="passa --fallthrough-tailcall a spu_lifter.py (caduta in avanti = tail call, s.34)")
+    ap.add_argument("--inline-xfer", action="store_true",
+                    help="passa --inline-xfer a spu_lifter.py (salti fra funzioni in linea, s.48)")
     ap.add_argument("--lifted", default=OUTDIR, help="cartella di destinazione del C liftato")
     ap.add_argument("--register-c", default=REGISTER_C, help="file di registrazione da generare")
     ap.add_argument("--register-fn", default="lbp_jobmods_register_all",
@@ -124,6 +126,8 @@ def main():
             cmd += ["--fallthrough-tailcall"]
         if a.merge_blocks:
             cmd += ["--merge-blocks"]
+        if a.inline_xfer:
+            cmd += ["--inline-xfer"]
         if a.reg_cache:
             cmd += ["--reg-cache"]
             if a.reg_cache_min is not None:

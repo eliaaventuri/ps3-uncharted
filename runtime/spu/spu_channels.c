@@ -1611,6 +1611,9 @@ void spu_indirect_branch(spu_context* ctx)
      * ignored by the hardware too: Uncharted's geometry job (ovl 215) keeps
      * a flag in bit 0 of its jump-table selector (`bi $r82` = 0x12231). */
     ctx->pc &= SPU_LS_MASK & ~3u;
+#ifdef SPU_HOPSTAT
+    { extern void spu_hopstat(int, spu_context*); spu_hopstat(2, ctx); }
+#endif
     /* Interrupt-return register restore (see spu_drain.c spu_irq_regs_save):
      * the WWS handler's save/restore shim lives at unlifted top-of-LS, so we
      * enforce the preserve-all-registers hardware contract here -- the first
@@ -1723,10 +1726,11 @@ void spu_indirect_branch(spu_context* ctx)
       /* s.46: cache per contesto davanti alle due ricerche (v. ib_cache in
        * spu_context.h); SPU_IB_NOCACHE=1 per l'A/B */
       static int s_ibc = -1; if (s_ibc < 0) s_ibc = getenv("SPU_IB_NOCACHE") ? 0 : 1;
+      if (!g_spu_ib_inline && s_fast && s_ibc && g_spu_xfer_inline) g_spu_ib_inline = 1;   /* s.48: scritta una volta sola */
       if (s_fast && (ctx->policy_mode || ctx->pc != SPU_JOB_RETURN_LS)) {
           const uint64_t key = ctx->pc | ((uint64_t)(uint16_t)ctx->image_id << 32)
                                        | ((uint64_t)(uint16_t)ctx->resident_ovl << 48);
-          __typeof__(ctx->ib_cache[0])* c = &ctx->ib_cache[(ctx->pc >> 2) & (SPU_IB_CACHE - 1)];
+          __typeof__(ctx->ib_cache[0])* c = &ctx->ib_cache[spu_ib_slot(key)];   /* s.48 */
           spu_fn f = (s_ibc && c->key == key) ? c->fn : NULL;
           if (!f) {
               f = ctx->resident_ovl ? spu_lookup(ctx->pc, ctx->resident_ovl) : NULL;

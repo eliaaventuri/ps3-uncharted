@@ -113,6 +113,8 @@ def main():
     ap.add_argument("--lifter", default=os.path.join(os.path.dirname(os.path.abspath(__file__)), "spu_lifter.py"))
     ap.add_argument("--constructor", action="store_true",
                     help="also emit an __attribute__((constructor)) that calls the register fn at startup")
+    ap.add_argument("--inline-xfer", action="store_true",
+                    help="passa --inline-xfer a spu_lifter.py (salti fra funzioni in linea, s.48)")
     ap.add_argument("--relift", action="store_true", help="re-lift even if a prior lift exists")
     ap.add_argument("--skip-lift", action="store_true",
                     help="do not run the lifter; assume --lifted already populated (still fixes includes + emits registry)")
@@ -137,6 +139,8 @@ def main():
             os.makedirs(outdir, exist_ok=True)
             cmd = [sys.executable, args.lifter, e, "--auto-functions", e,
                    "--symbol-prefix", prefix, "-o", outdir]
+            if args.inline_xfer:
+                cmd += ["--inline-xfer"]
             print(f"[build_spu_workloads] LIFT {img}  (prefix {prefix})")
             if subprocess.run(cmd).returncode != 0:
                 sys.exit(f"[build_spu_workloads] lift FAILED for {img}")

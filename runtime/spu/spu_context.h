@@ -1021,6 +1021,66 @@ void spu_drain_fast(spu_context* ctx);
         if (g_spu_trampoline_fn) spu_drain_fast(ctx);                        \
     } while (0)
 
+/* Trasferimenti in linea (s.48, lifter --inline-xfer). Un salto fra funzioni
+ * liftate passava SEMPRE dal ciclo del drain (impostare il trampolino, tornare,
+ * rileggerlo, controllare, chiamare): ~95 M salti ogni 50 M diretti nel
+ * livello, spu_drain_fast + spu_indirect_branch ~11% della CPU attiva. Qui il
+ * codice liftato fa gli stessi controlli del drain e salta in coda (musttail)
+ * al bersaglio; se uno qualunque scatta (interrupt pendente, ritorno esatto
+ * SPU_RETLINK, traccia del flow del PM, bersaglio speciale, cache mancata) si
+ * ricade nel trampolino e il drain fa esattamente cio' che faceva prima.
+ * g_spu_xfer_inline lo decide il drain al primo giro (0 con il drain completo
+ * o con SPU_XFER_INLINE=0: A/B con lo stesso binario); g_spu_ib_inline lo
+ * decide spu_indirect_branch (0 con le sue sonde o SPU_IB_NOCACHE). */
+extern int g_spu_xfer_inline, g_spu_ib_inline;
+/* Casella di ib_cache: hash moltiplicativo di tutta la chiave (s.48). Con
+ * (pc>>2)&255 i bersagli caldi del job 215 a 0x11298/0x11A98/0x12298/0x12A98
+ * cadevano nella stessa casella e si scacciavano a vicenda. */
+static inline uint32_t spu_ib_slot(uint64_t key)
+{
+    return (uint32_t)((key * 0x9E3779B97F4A7C15ull) >> 56) & (SPU_IB_CACHE - 1);
+}
+extern void* volatile g_pm_flow_ctx;
+static inline int spu_xfer_ok(spu_context* ctx)
+{
+    return g_spu_xfer_inline &&
+           !(ctx->int_enable && (ctx->event_status & ctx->event_mask)) &&
+           !(ctx->host_depth > 0 && ctx->ret_link &&
+             ((uint32_t)ctx->pc & SPU_LS_MASK) == ctx->ret_link) &&
+           g_pm_flow_ctx != (void*)ctx;
+}
+/* Bersaglio di un salto indiretto se e' gia' nella cache del contesto e non e'
+ * nessuno degli indirizzi che spu_indirect_branch tratta a parte (ritorno del
+ * job, servizi del kernel SPURS, syscall del taskset, shim in cima alla LS,
+ * LS 0, restauro dei registri d'interrupt, immagine 23). */
+static inline void (*spu_ib_inline(spu_context* ctx))(spu_context*)
+{
+    if (!g_spu_ib_inline || !spu_xfer_ok(ctx)) return 0;
+    uint32_t pc = (uint32_t)ctx->pc & SPU_LS_MASK & ~3u;
+    if (pc == 0 || pc >= 0x3FEC0u || pc == SPURS_PM_EXIT_TO_KERNEL_LS ||
+        pc == SPURS_PM_SELECT_WORKLOAD_LS || pc == 0xA70u ||
+        ctx->irq_save_valid || ctx->image_id == 23) return 0;
+    const uint64_t key = pc | ((uint64_t)(uint16_t)ctx->image_id << 32)
+                            | ((uint64_t)(uint16_t)ctx->resident_ovl << 48);
+    const __typeof__(ctx->ib_cache[0])* c = &ctx->ib_cache[spu_ib_slot(key)];
+    if (c->key != key) return 0;
+    ctx->pc = pc;
+    return c->fn;
+}
+/* SPU_TAILCALL e' definita nel preambolo del codice liftato. */
+#define SPU_XJUMP(ctx, tgt, fn) do { (ctx)->pc = (tgt);                     \
+        if (__builtin_expect(spu_xfer_ok(ctx), 1)) {                          \
+            (ctx)->hops++; (ctx)->steps++; SPU_TAILCALL(fn(ctx)); }           \
+        g_spu_trampoline_fn = fn; return; } while (0)
+/* chiamata indiretta (bisl): la stessa cache, poi il dispatcher completo */
+#define SPU_XCALLI(ctx) do { void (*_xf)(spu_context*) = spu_ib_inline(ctx);  \
+        if (__builtin_expect(_xf != 0, 1)) _xf(ctx); else spu_indirect_branch(ctx); } while (0)
+#define SPU_XIND(ctx, target) do { (ctx)->pc = (target);                    \
+        void (*_xf)(spu_context*) = spu_ib_inline(ctx);                       \
+        if (__builtin_expect(_xf != 0, 1)) {                                  \
+            (ctx)->hops++; (ctx)->steps++; SPU_TAILCALL(_xf(ctx)); }          \
+        g_spu_trampoline_fn = spu_indirect_branch; return; } while (0)
+
 #define SPU_DRAIN_FULL(ctx) do {                               \
         spu_depth_guard(ctx);                                  \
         while (g_spu_trampoline_fn) {                           \
@@ -1093,8 +1153,12 @@ static inline int spu_ret_strict(void)
 }
 #define SPU_RETR(ctx, reg) do {                                \
         (ctx)->pc = (ctx)->gpr[reg]._u32[0];                   \
-        if ((ctx)->host_depth == 0)                            \
-            g_spu_trampoline_fn = spu_indirect_branch;         \
+        if ((ctx)->host_depth == 0) {                          \
+            /* s.48: come SPU_XIND (nessun chiamante C: dispatch) */ \
+            void (*_xf)(spu_context*) = spu_ib_inline(ctx);    \
+            if (__builtin_expect(_xf != 0, 1)) {               \
+                (ctx)->hops++; (ctx)->steps++; SPU_TAILCALL(_xf(ctx)); } \
+            g_spu_trampoline_fn = spu_indirect_branch; }       \
         else if (spu_ret_strict() && (ctx)->ret_link &&        \
                  (((ctx)->pc & SPU_LS_MASK) != (ctx)->ret_link)) { \
             static int _n = 0; extern int g_hle_trace_armed;   \
