@@ -377,7 +377,7 @@ typedef struct spu_context {
      * delle funzioni e' riempito solo all'avvio, quindi (pc, immagine,
      * overlay) -> funzione non scade mai. fn NULL = vuota (spu_context_init
      * azzera tutto). Chiave: pc | image_id<<32 | resident_ovl<<48. */
-#define SPU_IB_CACHE 256
+#define SPU_IB_CACHE 2048
     struct { uint64_t key; void (*fn)(struct spu_context*); } ib_cache[SPU_IB_CACHE];
 } spu_context;
 
@@ -1038,7 +1038,7 @@ extern int g_spu_xfer_inline, g_spu_ib_inline;
  * cadevano nella stessa casella e si scacciavano a vicenda. */
 static inline uint32_t spu_ib_slot(uint64_t key)
 {
-    return (uint32_t)((key * 0x9E3779B97F4A7C15ull) >> 56) & (SPU_IB_CACHE - 1);
+    return (uint32_t)((key * 0x9E3779B97F4A7C15ull) >> 48) & (SPU_IB_CACHE - 1);
 }
 extern void* volatile g_pm_flow_ctx;
 static inline int spu_xfer_ok(spu_context* ctx)
@@ -1162,8 +1162,15 @@ static inline int spu_ret_strict(void)
         else if (spu_ret_strict() && (ctx)->ret_link &&        \
                  (((ctx)->pc & SPU_LS_MASK) != (ctx)->ret_link)) { \
             static int _n = 0; extern int g_hle_trace_armed;   \
-            if (_n++ < 60) fprintf(stderr, "[spu-ret] salto: r%d=0x%05X ret_link=0x%05X depth=%d img=%d ovl=%d\n", \
-                (reg), (ctx)->pc & SPU_LS_MASK, (ctx)->ret_link, (ctx)->host_depth, (ctx)->image_id, (ctx)->resident_ovl); \
+            if (__builtin_expect(_n < 60, 0)) { _n++; fprintf(stderr, "[spu-ret] salto: r%d=0x%05X ret_link=0x%05X depth=%d img=%d ovl=%d\n", \
+                (reg), (ctx)->pc & SPU_LS_MASK, (ctx)->ret_link, (ctx)->host_depth, (ctx)->image_id, (ctx)->resident_ovl); } \
+            /* s.50: e' un salto calcolato, come SPU_XIND. Il ciclo dei comandi \
+             * del modulo 201 (`ila $r0, testa; bi gestore`, il gestore chiude \
+             * con `bi $r0`) ci passava ~1/4 di tutte le ricadute nel trampolino; \
+             * e _n++ senza tetto era una riga condivisa scritta da tutte le lane. */ \
+            void (*_xf)(spu_context*) = spu_ib_inline(ctx);    \
+            if (__builtin_expect(_xf != 0, 1)) {               \
+                (ctx)->hops++; (ctx)->steps++; SPU_TAILCALL(_xf(ctx)); } \
             g_spu_trampoline_fn = spu_indirect_branch; }       \
         return;                                                \
     } while (0)

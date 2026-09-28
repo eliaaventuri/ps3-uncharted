@@ -1,6 +1,6 @@
 # Stato del progetto
 
-Ultimo aggiornamento: **27 settembre 2026** — sessione 49.
+Ultimo aggiornamento: **28 settembre 2026** — sessione 50.
 
 ## Dove siamo
 
@@ -1145,6 +1145,40 @@ indiretto ~730 in tutto, spu_fm_slow 157 e spu_fnms_slow 63, resv_lock_spin ~200
 0x7FFFFFFF saturato, fma con c = 0x7F800000, fnms con 0x7FFFFFFF), non
 risultati identici all'host: servono davvero la via esatta. Emularli in NEON
 costerebbe molto per ~1% delle lane: lasciati. Non risondare.
+
+**Sessione 50 (27-28/09): copia DMA->LS e salti indiretti residui.**
+1. **spu_ls_copy_in e' il codice dei job ricaricato** (sonda temporanea nella
+   via veloce di mfc_do_transfer, tolta): ~90% dei byte sono GET da 16 KB
+   del PM (pc 0x2130) che caricano il modulo del job a LS 0x4000-0x16000
+   (job 215: EA 0x1011C900..0x1012EA40, ~74 KB, 16384 x4 + 8400), ~5 GB/s.
+   Circa meta' delle volte la LS contiene gia' gli stessi byte. Causa:
+   SPURS_PM_FRESH azzera la LS bassa del PM a ogni corsa, e con essa la
+   contabilita' del job manager su quale modulo e' gia' caricato; i moduli
+   215/216/... si alternano negli stessi buffer, quindi l'altra meta' e'
+   ricarica vera. Toglierlo = PM persistente (lo stallo della s.20): NON
+   fatto, vale ~1,5% delle lane. Confrontare prima di copiare non rende
+   (legge due flussi invece di uno).
+2. **Salti indiretti**: sonda -DSPU_HOPSTAT (build_hs). Prima: ~1/4 delle
+   ricadute nel trampolino era il ciclo dei comandi del modulo 201
+   (jobmod_00872f80, func_00019480: `ila $r0,0x194D8; bi gestore`, il gestore
+   torna con `bi $r0`): SPU_RETR a host_depth > 0 con bersaglio != ret_link
+   andava sempre al trampolino. Ora fa come SPU_XIND (cache + musttail);
+   anche il contatore `_n++` senza tetto del suo log (riga condivisa fra le
+   lane) ha il tetto. Ricadute "tipo 8" 96 M -> 14 M.
+   Poi ib_cache 256 -> 2048 voci (slot = 16 bit alti dell'hash): le mancate
+   a indirizzi del PM e del job 215 (0x2430, 0x451C, 0x46E0, ... ~5,8 M
+   l'una, una per giro di job) erano capacita'; restano solo gli ingressi di
+   job 0xBBFC-0xBC14 con l'overlay vecchio (vanno alla via lenta per
+   riconoscere il modulo: legittimi).
+   Profilo lane (10 s a 100 s): indirect_branch 300 -> 174, drain_fast 145
+   -> 91, lookup 98 -> 33. Screenshot a 110 s corretto.
+   **A/B contro uncharted_s49 (c50, 8+8, fermata a 16 corse): -1,3 +- 2,4
+   ms/fotogramma**, 15 corse a regime: NON significativo (atteso ~2 ms dal
+   profilo). Tenuto perche' il meccanismo e' misurato (ricadute e campioni
+   giu') e non costa nulla; un fermo muto nella vecchia (c50_7_off, 3,7 fps).
+Prossimi candidati: resv_lock_spin ~200 (contesa vera, s.45), rdch ~160,
+le ricariche del codice dei job (serve capire la contabilita' del PM WWS:
+RPCS3 come oracolo), gli ingressi di job con overlay vecchio.
 
 ## Storico
 
