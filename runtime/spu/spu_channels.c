@@ -350,6 +350,7 @@ static void resv_lock(void)   { while (_InterlockedExchange(&g_resv_lock, 1)) { 
 static void resv_unlock(void) { _InterlockedExchange(&g_resv_lock, 0); }
 static void resv_lock_ea(uint32_t ea)   { (void)ea; resv_lock(); }
 static void resv_unlock_ea(uint32_t ea) { (void)ea; resv_unlock(); }
+static int resv_lock_unless_lost(uint32_t ea, const uint8_t* mem, const uint8_t* snap) { (void)mem; (void)snap; resv_lock_ea(ea); return 1; }
 #else
 #include <stdatomic.h>
 /* s.45: un lock per gruppo di righe (64 strisce, ognuna nella sua riga di
@@ -398,6 +399,36 @@ static void resv_unlock_s(resv_stripe* r)
 }
 static void resv_lock_ea(uint32_t ea)   { resv_lock_s(resv_for(ea)); }
 static void resv_unlock_ea(uint32_t ea) { resv_unlock_s(resv_for(ea)); }
+/* s.51: il PUTLLC che trova il lock occupato guarda la riga mentre aspetta:
+ * se e' gia' diversa dall'istantanea del GETLLAR la prenotazione e' persa
+ * (sul ferro come qui) e fallisce subito, senza fare la fila per il lock.
+ * Sulla riga dell'allocatore 0x10184B00 (sei lane) 293.000 PUTLLC ogni 5 s
+ * aspettavano il lock solo per fallire sotto di esso.
+ * SPU_PUTLLC_EARLYFAIL=0 torna all'attesa normale (A/B). */
+__attribute__((noinline)) static int resv_lock_spin_lost(resv_stripe* r, const uint8_t* mem, const uint8_t* snap)
+{
+    do {
+        while (atomic_load_explicit(&r->lock, memory_order_relaxed)) {
+            if (memcmp(mem, snap, MFC_ATOMIC_LINE) != 0) return 0;
+#if defined(__aarch64__)
+            __asm__ __volatile__("yield");
+#endif
+        }
+    } while (atomic_exchange_explicit(&r->lock, 1, memory_order_acquire));
+    return 1;
+}
+static int resv_lock_unless_lost(uint32_t ea, const uint8_t* mem, const uint8_t* snap)
+{
+    static int s_on = -1;
+    if (s_on < 0) { const char* e = getenv("SPU_PUTLLC_EARLYFAIL"); s_on = (e && *e == '0') ? 0 : 1; }
+    resv_stripe* r = resv_for(ea);
+    if (!s_on) { resv_lock_s(r); return 1; }
+    if (atomic_exchange_explicit(&r->lock, 1, memory_order_acquire) && !resv_lock_spin_lost(r, mem, snap))
+        return 0;
+    atomic_store_explicit(&r->seq, atomic_load_explicit(&r->seq, memory_order_relaxed) + 1, memory_order_relaxed);
+    atomic_thread_fence(memory_order_release);
+    return 1;
+}
 /* Tutte le strisce, sempre nello stesso ordine (niente stallo fra due che le
  * prendono tutte; chi ne prende una sola non ne prende altre). */
 static void resv_lock(void)   { for (unsigned i = 0; i < resv_nstripe(); i++) resv_lock_s(&g_resv[i]); }
@@ -694,7 +725,11 @@ static int spu_mfc_atomic(spu_context* ctx, uint32_t cmd)
             if (spu_atom_stat_on()) spu_atom_stat(ea, ATS_FAST_FAIL, ctx->image_id);
             return 1;
         }
-        resv_lock_ea(ea);
+        if (!resv_lock_unless_lost(ea, mem, ctx->resv_line)) {
+            ctx->atomic_stat = 1; ctx->resv_valid = 0;
+            if (spu_atom_stat_on()) spu_atom_stat(ea, ATS_FAST_FAIL, ctx->image_id);
+            return 1;
+        }
         if (ctx->resv_valid && ctx->resv_ea == ea &&
             memcmp(mem, ctx->resv_line, MFC_ATOMIC_LINE) == 0) {
             /* Commit ONLY the bytes the SPU changed since GETLLAR. The PPU

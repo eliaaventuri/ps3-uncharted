@@ -1178,7 +1178,8 @@ costerebbe molto per ~1% delle lane: lasciati. Non risondare.
    giu') e non costa nulla; un fermo muto nella vecchia (c50_7_off, 3,7 fps).
 Prossimi candidati: resv_lock_spin ~200 (contesa vera, s.45), rdch ~160,
 gli ingressi di job con overlay vecchio (le ricariche del codice dei job:
-chiuso in s.51, sono per progetto del PM).
+chiuso in s.51, sono per progetto del PM; resv_lock_spin: fatto in s.51,
+neutro).
 
 **Sessione 51 (28/09): la ricarica del codice dei job NON e' colpa di
 SPURS_PM_FRESH -- vicolo chiuso, non riprovare.**
@@ -1203,6 +1204,22 @@ SPURS_PM_FRESH -- vicolo chiuso, non riprovare.**
    Restano solo trucchi lato host (confronto prima di copiare: gia'
    misurato, non rende; tracciare le scritture in LS: troppo caro).
    Nessuna modifica al codice.
+
+**resv_lock_spin, s.51 (28/09).** SPU_ATOM_STAT a regime: la riga
+dell'allocatore 0x10184B00 (job 0089df80 func_000075F0, sei lane) fa
+1,07 M GETLLAR ogni 5 s, 640 k PUTLLC riusciti, 137 k falliti senza lock e
+**293 k falliti SOTTO il lock**: aspettavano il lock solo per scoprire che la
+riga era cambiata. Ora (`resv_lock_unless_lost` in spu_channels.c) chi trova
+il lock occupato guarda la riga mentre aspetta e, se e' gia' diversa
+dall'istantanea, fallisce subito (semantica invariata: la prenotazione e'
+persa comunque). `SPU_PUTLLC_EARLYFAIL=0` = come prima.
+Profilo (10 s a 100 s): attesa sul lock 128 -> 22 campioni, falliti sotto il
+lock 293 k -> 133 k / 5 s, func_000075F0 inclusivo 726 -> 529.
+**A/B stesso binario (c51, 8+8 da 160 s): -0,4 +- 2,2 ms/fotogramma, NON
+significativo** (a 2.200 draw 139 -> 139; ~31 fps in tutte le corse). 16/16
+corse senza fermi (una "off" a 24 fps). Tenuto: corretto, misurato sul
+meccanismo, costa nulla. La contesa su quella riga e' ormai rumore: non
+insistere.
 
 ## Storico
 
