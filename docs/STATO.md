@@ -1,6 +1,6 @@
 # Stato del progetto
 
-Ultimo aggiornamento: **28 settembre 2026** — sessione 50.
+Ultimo aggiornamento: **28 settembre 2026** — sessione 51.
 
 ## Dove siamo
 
@@ -1177,8 +1177,32 @@ costerebbe molto per ~1% delle lane: lasciati. Non risondare.
    profilo). Tenuto perche' il meccanismo e' misurato (ricadute e campioni
    giu') e non costa nulla; un fermo muto nella vecchia (c50_7_off, 3,7 fps).
 Prossimi candidati: resv_lock_spin ~200 (contesa vera, s.45), rdch ~160,
-le ricariche del codice dei job (serve capire la contabilita' del PM WWS:
-RPCS3 come oracolo), gli ingressi di job con overlay vecchio.
+gli ingressi di job con overlay vecchio (le ricariche del codice dei job:
+chiuso in s.51, sono per progetto del PM).
+
+**Sessione 51 (28/09): la ricarica del codice dei job NON e' colpa di
+SPURS_PM_FRESH -- vicolo chiuso, non riprovare.**
+1. RPCS3 (`cellSpursSpu.cpp`, spursKernelDispatchWorkload): il kernel vero
+   copia l'immagine del PM a 0xA00 solo se `wklCurrentAddr != wklInfo->addr`,
+   e la LS e' UNA per SPU fisica (condivisa fra i wid). Quindi sul ferro lo
+   stato del PM sopravvive fra i dispatch se il PM e' lo stesso.
+2. Contabilita' del PM WWS (disassemblato di spu_pm/spurs_policy.elf,
+   `spu_disasm.py --base 0xA00 --offset 0x60 --length 0x2f80`): tutto nella
+   zona azzerata dell'immagine. bufferSet a LS 0xDF0 (4 B: pagina iniziale
+   da 1 KB, n. pagine, n. buffer, indice; 3 gruppi da 0x40), buffer a
+   0xEB0..0x11B0 (8 B: w0 flag, w1 = EA|indice; 3 gruppi da 0x100),
+   logicalToBufferNum a 0x11B0. Le due ricerche "modulo gia' in LS"
+   (0x1DA0 e 0x1F84, prima della GET a 16 KB di 0x2130) vogliono
+   w1 == EA **e il flag 0x40000000 in w0**.
+3. Sonda temporanea (tabella stampata a fine dispatch, 40 dispatch a
+   regime, wid 8/11/12): **w0 = 0 in tutte le 120 voci**, w1 conserva l'EA
+   (es. 0x1011C900 = job 215). E' il PM stesso che invalida i buffer prima
+   di uscire: anche con la LS conservata (PM persistente, o sul ferro) il
+   dispatch successivo ricarica il modulo. Il "meta' delle volte i byte
+   sono gia' uguali" della s.50 e' coincidenza, non contabilita' persa.
+   Restano solo trucchi lato host (confronto prima di copiare: gia'
+   misurato, non rende; tracciare le scritture in LS: troppo caro).
+   Nessuna modifica al codice.
 
 ## Storico
 
