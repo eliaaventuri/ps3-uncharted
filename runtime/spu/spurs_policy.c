@@ -134,6 +134,7 @@ void spurs_pm_forget(uint32_t wid)
  * li stampa (intestazione +0x08..+0x1F delle job list WWS) quando la sonda
  * SPU_ROWWATCH vede lo stallo: dice quale lista il main aspetta. */
 static uint64_t s_seen[32]; static uint32_t s_seen_wid[32]; static int s_seen_n = 0;
+static uint32_t s_last_spurs;
 void spurs_pm_dump_lists(uint32_t pm_size)
 {
     extern uint8_t* vm_base;
@@ -146,7 +147,19 @@ void spurs_pm_dump_lists(uint32_t pm_size)
         for (int e = 0; e < 0x100; e++) { const uint8_t* v = h + 0x80 + 8 * e; if (v[0] | v[1] | v[2] | v[3] | v[4] | v[5] | v[6] | v[7]) nv = e + 1; }
         fprintf(stderr, "[rowwatch] lista wid=%u 0x%08X:", s_seen_wid[k], jl);
         for (int o = 8; o < 0x20; o += 4) fprintf(stderr, " %02X%02X%02X%02X", h[o], h[o + 1], h[o + 2], h[o + 3]);
-        fprintf(stderr, " voci=%X\n", nv);
+        fprintf(stderr, " voci=%X |", nv);
+        for (int e = 0; e < 12; e++) {   /* voci 0-11 dentro la riga d'intestazione (+0x20) */
+            const uint8_t* v = h + 0x20 + 8 * e;
+            if (v[0] | v[1] | v[2] | v[3] | v[4] | v[5] | v[6] | v[7])
+                fprintf(stderr, " %d=%02X%02X%02X%02X:%02X%02X%02X%02X", e, v[0], v[1], v[2], v[3], v[4], v[5], v[6], v[7]);
+        }
+        fprintf(stderr, "\n");
+    }
+    if (vm_base && s_last_spurs) {   /* readyCount/idle/... del SPURS: primi 0x80 byte */
+        const uint8_t* sp = vm_base + s_last_spurs;
+        fprintf(stderr, "[rowwatch] spurs 0x%08X:", s_last_spurs);
+        for (int o = 0; o < 0x80; o += 4) fprintf(stderr, "%s%02X%02X%02X%02X", (o % 16) ? " " : " | ", sp[o], sp[o + 1], sp[o + 2], sp[o + 3]);
+        fprintf(stderr, "\n");
     }
 }
 
@@ -343,6 +356,7 @@ int spu_run_policy_module(spu_lifted_entry_fn entry, int image_id,
     /* L'insieme dei `data` distinti, una riga per valore nuovo. Il dump della
      * job list sotto e' campionato, e da un campione non si sa quali liste il
      * manager veda davvero: e' la stessa trappola del conteggio per workload. */
+    s_last_spurs = spurs_ea;
     { int known = 0;
       for (int k = 0; k < s_seen_n; k++) if (s_seen[k] == wkl_data) { known = 1; break; }
       if (!known && s_seen_n < 32) {

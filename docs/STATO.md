@@ -1265,7 +1265,32 @@ s51k 7/20, s51L 3/8, s51M 2/8 -- cioe' ~1 su 3-4 corse sotto carico.
 Il job preso e poi perso (forma 1) e' raro: `col job` scattato in 1 corsa su
 ~45; `SPURS_PM_HOLD` lo copre solo se il wid non cambia lista (sonde
 "SCARTATO"/"RemoveWorkload ... tiene un job", mai viste in s51M).
-**Prossimo passo**: forma 3 (la piu' frequente senza assert) -- capire il
+**Forma 3 RISOLTA COME MECCANISMO (s51N-s51R)**: a +0x10 NON c'e' una
+seconda copia del contatore: +0x10 = job AGGIUNTI dal PPU, +0x12 = job PRESI.
+Nel fermo la lista del wid 6 (0x106F0780) ha il job successivo preceduto da
+una voce di tipo 2 = **barriera** (`00000002:106CE220`, sempre la stessa):
+il PM la prende solo quando il contatore della barriera e' 0 (0x2668: GET 16
+byte, halfword); altrimenti esce senza job (0x26B4). Il contatore della
+barriera (riga 0x106CE200, parola a +0x20 = `00NN0601`): il PPU lo porta a 8,
+ogni job che finisce lo abbassa di 1 (PM 0x26D8: GETLLAR a LS 0x80, `ahi -1`,
+PUTLLC). Nei fermi resta a **1**. Cattura s51R_3 (SPU_ROWWATCH=0x106CE200
+SPU_ROWWATCH_OFF=18 SPU_ROWWATCH_GET=1, stress 8): **la SPU 0 fa GETLLAR e
+legge 6, poi PUTLLC con istantanea 6 scrive 7** (record 4273/4274, lsa 0x80,
+t=-21 ms); poi il PPU porta a 8 e seguono 7 decrementi -> resta 1. Stessa
+figura in s51Q_5 (letto 5, scritto 6). Il codice a 0x26D8 toglie SEMPRE 1:
+quindi fra il GETLLAR e la `lqx` a 0x26F4 la LS 0x80 di quella SPU conteneva
+un valore VECCHIO (8 -> 7). Ipotesi da verificare: (a) il gestore
+d'interrupt del PM (0x1BDC/0x1C20, irq nel drain o in rdch) che usa la
+stessa LS 0x80 fra wrch MFC_Cmd e la lqx; (b) una copia in LS asincrona o
+sovrapposta (spu_ls_copy_in veloce della s.48, cache mfc) che scrive dopo il
+GETLLAR; (c) la via veloce di spu_wrch (s.49) per MFC_Cmd GETLLAR.
+**Prossimo passo**: nella sonda, a ogni PUTLLC sulla riga osservata,
+registrare anche LS[lsa..lsa+128] della SPU e il contatore di irq del
+contesto fra GETLLAR e PUTLLC; se la LS all'istante del PUTLLC non e'
+l'istantanea meno 1, trovare chi ha scritto LS 0x80 (watch sulla LS).
+Resto delle forme: forma 2 -- chi scrive le voci
+(PPU AddJob) e se il PM puo' leggerle a meta' (voce con tipo scritto ma EA
+del descrittore vecchio). Vecchio testo: forma 3 (la piu' frequente senza assert) -- capire il
 secondo u16 e perche' resta indietro; forma 2 -- chi scrive le voci
 (PPU AddJob) e se il PM puo' leggerle a meta' (voce con tipo scritto ma EA
 del descrittore vecchio).

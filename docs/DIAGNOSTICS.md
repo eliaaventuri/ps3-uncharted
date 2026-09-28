@@ -1114,7 +1114,7 @@ not changed while a title runs.
 - **`SPU_HOST_NS_MACH`** — `=1`: il decrementer SPU legge l'orologio con `mach_absolute_time` invece di `cntvct_el0` diretto (macOS arm64, s.45). Per l'A/B.
 - **`SPU_ATOMIC_STRIPES`** — `=1`: un solo lock per tutti gli atomici SPU invece di 64 strisce per riga (s.45). Per l'A/B.
 - **`SPU_ATOM_STAT`** — `=1`: ogni 5 s le 8 righe da 128 byte con piu' GETLLAR, con PUTLLC riusciti / falliti senza lock / falliti sotto lock (`[atom-stat]`).
-- **`SPU_ROWWATCH`** — `=<ea hex>` (s.51): storia dei PUTLLC/PUTLLUC della SPU sulla riga da 128 byte (spuNum, wid, pc, lr, byte +0x08..+0x1F prima/dopo); quando la riga resta ferma 3 s stampa gli ultimi 256 record, le voci della lista e l'intestazione di tutte le job list viste dal PM (`[rowwatch]`). Per l'intestazione WWS vedi STATO.md s.51.
+- **`SPU_ROWWATCH`** — `=<ea hex>` (s.51): storia dei PUTLLC/PUTLLUC della SPU sulla riga da 128 byte (spuNum, wid, pc, lr, byte +0x08..+0x1F prima/dopo); quando la riga resta ferma 3 s stampa gli ultimi 256 record, le voci della lista e l'intestazione di tutte le job list viste dal PM (`[rowwatch]`). Per l'intestazione WWS vedi STATO.md s.51. `SPU_ROWWATCH_OFF=<hex>` sposta la finestra di 24 byte registrata (default 8); `SPU_ROWWATCH_GET=1` registra anche i GETLLAR (cmd D0), con lsa.
 - **`SPU_PUTLLC_CAS`** — `=0` disattiva il commit CAS a 128 bit del PUTLLC (s.51, default acceso).
 - **`SPU_PUTLLC_EARLYFAIL`** — `=0` disattiva il fallimento anticipato del PUTLLC mentre aspetta il lock (s.51).
 - **`SPURS_PM_HOLD`** — `=0` disattiva il contesto tenuto quando il PM esce con un job preso (s.51, default acceso con SPURS_PM_FRESH).

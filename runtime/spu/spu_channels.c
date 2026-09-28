@@ -444,7 +444,7 @@ static void resv_unlock(void) { for (unsigned i = resv_nstripe(); i-- > 0; ) res
  * di qui: si vedono come "prima" diverso dal "dopo" del record precedente. */
 #if !defined(_MSC_VER)
 #include <pthread.h>
-typedef struct { uint64_t ns; uint16_t spu, wid; uint32_t pc, lr, cmd; uint8_t b[24], a[24]; } rowwatch_rec;
+typedef struct { uint64_t ns; uint16_t spu, wid; uint32_t pc, lr, cmd, lsa; uint8_t b[24], a[24]; } rowwatch_rec;
 #define ROWWATCH_N 4096
 static rowwatch_rec g_rw[ROWWATCH_N];
 static _Atomic unsigned g_rw_n;
@@ -467,8 +467,8 @@ static void* rowwatch_thread(void* arg)
         fprintf(stderr, "[rowwatch] riga 0x%08X ferma da 3 s dopo %u scritture; ultime:\n", rowwatch_ea(), n);
         for (unsigned i = (n > 256 ? n - 256 : 0); i < n; i++) {
             const rowwatch_rec* r = &g_rw[i % ROWWATCH_N];
-            char b[400]; int p = snprintf(b, sizeof b, "[rowwatch] %u t=%+.3f spu=%u wid=%u cmd=%X pc=0x%05X lr=0x%05X",
-                                         i, ((double)r->ns - (double)t0) / 1e6, r->spu, r->wid, r->cmd, r->pc, r->lr);
+            char b[400]; int p = snprintf(b, sizeof b, "[rowwatch] %u t=%+.3f spu=%u wid=%u cmd=%X lsa=0x%05X pc=0x%05X lr=0x%05X",
+                                         i, ((double)r->ns - (double)t0) / 1e6, r->spu, r->wid, r->cmd, r->lsa, r->pc, r->lr);
             p += snprintf(b + p, sizeof b - p, " prima=");
             for (int k = 0; k < 24; k++) p += snprintf(b + p, sizeof b - p, "%02X%s", r->b[k], (k % 4 == 3) ? " " : "");
             p += snprintf(b + p, sizeof b - p, "dopo=");
@@ -489,14 +489,17 @@ static void* rowwatch_thread(void* arg)
         if (++dumps >= 8) return 0;
     }
 }
-static void rowwatch_note(spu_context* ctx, uint32_t cmd, const uint8_t* before, const uint8_t* after)
+static void rowwatch_note(spu_context* ctx, uint32_t cmd, uint32_t lsa, const uint8_t* before, const uint8_t* after)
 {
+    
     unsigned i = atomic_fetch_add(&g_rw_n, 1);
     rowwatch_rec* r = &g_rw[i % ROWWATCH_N];
-    r->ns = spu_host_ns(); r->cmd = cmd;
+    r->ns = spu_host_ns(); r->cmd = cmd; r->lsa = lsa;
     r->spu = (uint16_t)spu_ls_get32(ctx->ls, 0x1C8); r->wid = (uint16_t)spu_ls_get32(ctx->ls, 0x1DC);
     r->pc = (uint32_t)ctx->pc & SPU_LS_MASK; r->lr = ctx->gpr[0]._u32[0] & SPU_LS_MASK;
-    memcpy(r->b, before + 8, 24); memcpy(r->a, after + 8, 24);
+    static int s_off = -1;   /* SPU_ROWWATCH_OFF=<hex>: i 24 byte registrati partono da qui (default 8) */
+    if (s_off < 0) { const char* e = getenv("SPU_ROWWATCH_OFF"); s_off = e ? (int)(strtoul(e, 0, 16) & 0x78) : 8; if (s_off > 0x68) s_off = 0x68; }
+    memcpy(r->b, before + s_off, 24); memcpy(r->a, after + s_off, 24);
     atomic_store(&g_rw_last_ns, r->ns);
     { static _Atomic int started; if (!atomic_exchange(&started, 1)) { pthread_t t; pthread_create(&t, 0, rowwatch_thread, 0); pthread_detach(t); } }
 }
@@ -773,6 +776,10 @@ static int spu_mfc_atomic(spu_context* ctx, uint32_t cmd)
          * wakes anybody. Snapshotting from `ls` makes a later store leave BOTH
          * stale, which is exactly what makes the lost-reservation event fire. */
         memcpy(ctx->resv_line, ls, MFC_ATOMIC_LINE);   /* snapshot for compare */
+#if !defined(_MSC_VER)
+        if (rowwatch_ea() && ((uint32_t)ea & ~127u) == rowwatch_ea() && getenv("SPU_ROWWATCH_GET"))
+            rowwatch_note(ctx, cmd, lsa, ls, ls);
+#endif
         ctx->resv_ea = ea; ctx->resv_valid = 1; ctx->atomic_stat = 0;
         spu_adma_note(ctx, cmd, lsa, (uint32_t)ea, MFC_ATOMIC_LINE);
         return 1;
@@ -851,7 +858,7 @@ static int spu_mfc_atomic(spu_context* ctx, uint32_t cmd)
             } else {
             spu_wring_note(ctx, "PUTLLC", (uint32_t)ea, MFC_ATOMIC_LINE, ls);
 #if !defined(_MSC_VER)
-            if (rowwatch_ea() && ((uint32_t)ea & ~127u) == rowwatch_ea()) rowwatch_note(ctx, cmd, ctx->resv_line, mem);
+            if (rowwatch_ea() && ((uint32_t)ea & ~127u) == rowwatch_ea()) rowwatch_note(ctx, cmd, lsa, ctx->resv_line, mem);
 #endif
             ctx->atomic_stat = 0;                      /* PUTLLC_SUCCESS */
             }
@@ -884,7 +891,7 @@ static int spu_mfc_atomic(spu_context* ctx, uint32_t cmd)
         if (rowwatch_ea() && ((uint32_t)ea & ~127u) == rowwatch_ea()) {
             uint8_t b[MFC_ATOMIC_LINE]; memcpy(b, mem, MFC_ATOMIC_LINE);
             memcpy(mem, ls, MFC_ATOMIC_LINE);
-            rowwatch_note(ctx, cmd, b, mem);
+            rowwatch_note(ctx, cmd, lsa, b, mem);
         }
 #endif
         memcpy(mem, ls, MFC_ATOMIC_LINE);              /* unconditional store */
