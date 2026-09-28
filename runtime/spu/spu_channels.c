@@ -435,6 +435,73 @@ static void resv_lock(void)   { for (unsigned i = 0; i < resv_nstripe(); i++) re
 static void resv_unlock(void) { for (unsigned i = resv_nstripe(); i-- > 0; ) resv_unlock_s(&g_resv[i]); }
 #endif
 
+/* SPU_ROWWATCH=<ea hex> (s.51, diagnostica): storia delle scritture atomiche
+ * della SPU sulla riga d'intestazione di una job list (0x10695C80 = wid 8,
+ * lo stallo tipo B): per ogni PUTLLC riuscito / PUTLLUC tiene in un anello
+ * spuNum, wid, pc, lr e i byte +0x08..+0x1F prima e dopo (contatori per SPU a
+ * +0x10). Un thread stampa gli ultimi 256 record quando la riga non viene piu'
+ * scritta da 3 s (lo stallo), fino a 8 volte (anche le pause del caricamento). Le scritture del PPU non passano
+ * di qui: si vedono come "prima" diverso dal "dopo" del record precedente. */
+#if !defined(_MSC_VER)
+#include <pthread.h>
+typedef struct { uint64_t ns; uint16_t spu, wid; uint32_t pc, lr, cmd; uint8_t b[24], a[24]; } rowwatch_rec;
+#define ROWWATCH_N 4096
+static rowwatch_rec g_rw[ROWWATCH_N];
+static _Atomic unsigned g_rw_n;
+static _Atomic uint64_t g_rw_last_ns;
+static uint32_t rowwatch_ea(void)
+{
+    static int s = -1; static uint32_t ea;
+    if (s < 0) { const char* e = getenv("SPU_ROWWATCH"); ea = e ? (uint32_t)strtoul(e, 0, 16) & ~127u : 0; s = 1; }
+    return ea;
+}
+static void* rowwatch_thread(void* arg)
+{
+    (void)arg; int dumps = 0; unsigned dumped_at = 0;
+    for (;;) {
+        struct timespec ts = { 0, 250000000 }; nanosleep(&ts, 0);
+        unsigned n = atomic_load(&g_rw_n);
+        if (n == dumped_at || spu_host_ns() - atomic_load(&g_rw_last_ns) < 3000000000ull) continue;
+        dumped_at = n;
+        uint64_t t0 = g_rw[(n - 1) % ROWWATCH_N].ns;
+        fprintf(stderr, "[rowwatch] riga 0x%08X ferma da 3 s dopo %u scritture; ultime:\n", rowwatch_ea(), n);
+        for (unsigned i = (n > 256 ? n - 256 : 0); i < n; i++) {
+            const rowwatch_rec* r = &g_rw[i % ROWWATCH_N];
+            char b[400]; int p = snprintf(b, sizeof b, "[rowwatch] %u t=%+.3f spu=%u wid=%u cmd=%X pc=0x%05X lr=0x%05X",
+                                         i, ((double)r->ns - (double)t0) / 1e6, r->spu, r->wid, r->cmd, r->pc, r->lr);
+            p += snprintf(b + p, sizeof b - p, " prima=");
+            for (int k = 0; k < 24; k++) p += snprintf(b + p, sizeof b - p, "%02X%s", r->b[k], (k % 4 == 3) ? " " : "");
+            p += snprintf(b + p, sizeof b - p, "dopo=");
+            for (int k = 0; k < 24; k++) p += snprintf(b + p, sizeof b - p, "%02X%s", r->a[k], (k % 4 == 3) ? " " : "");
+            fprintf(stderr, "%s\n", b);
+        }
+        { extern uint8_t* vm_base; const uint8_t* m = vm_base + rowwatch_ea();
+          fprintf(stderr, "[rowwatch] ora:"); for (int k = 0; k < 32; k++) fprintf(stderr, "%s%02X", (k % 4) ? "" : " ", m[k]);
+          fprintf(stderr, "\n[rowwatch] voci:");
+          for (int k = 0; k < 0x100; k++) {
+              const uint8_t* v = m + 0x80 + 8 * k;
+              if (v[0] | v[1] | v[2] | v[3] | v[4] | v[5] | v[6] | v[7])
+                  fprintf(stderr, " %X=%02X%02X%02X%02X:%02X%02X%02X%02X", k, v[0], v[1], v[2], v[3], v[4], v[5], v[6], v[7]);
+          }
+          fprintf(stderr, "\n"); }
+        { extern void spurs_pm_dump_lists(uint32_t); spurs_pm_dump_lists(0x2F80); }
+        fflush(stderr);
+        if (++dumps >= 8) return 0;
+    }
+}
+static void rowwatch_note(spu_context* ctx, uint32_t cmd, const uint8_t* before, const uint8_t* after)
+{
+    unsigned i = atomic_fetch_add(&g_rw_n, 1);
+    rowwatch_rec* r = &g_rw[i % ROWWATCH_N];
+    r->ns = spu_host_ns(); r->cmd = cmd;
+    r->spu = (uint16_t)spu_ls_get32(ctx->ls, 0x1C8); r->wid = (uint16_t)spu_ls_get32(ctx->ls, 0x1DC);
+    r->pc = (uint32_t)ctx->pc & SPU_LS_MASK; r->lr = ctx->gpr[0]._u32[0] & SPU_LS_MASK;
+    memcpy(r->b, before + 8, 24); memcpy(r->a, after + 8, 24);
+    atomic_store(&g_rw_last_ns, r->ns);
+    { static _Atomic int started; if (!atomic_exchange(&started, 1)) { pthread_t t; pthread_create(&t, 0, rowwatch_thread, 0); pthread_detach(t); } }
+}
+#endif
+
 /* Copia atomica di una riga da 128 byte rispetto a chi scrive sotto il lock.
  * SPU_ATOMIC_LOCKALL=1 torna al lock anche per le letture (A/B). */
 static int spu_atomic_lockall(void)
@@ -745,14 +812,49 @@ static int spu_mfc_atomic(spu_context* ctx, uint32_t cmd)
              * the reservation instead. SPU_PUTLLC_FULL=1 restores the copy. */
             static int s_full = -1;
             if (s_full < 0) { const char* e = getenv("SPU_PUTLLC_FULL"); s_full = (e && *e && *e != '0') ? 1 : 0; }
-            if (s_full) memcpy(mem, ls, MFC_ATOMIC_LINE);   /* commit local store */
+            /* s.51: se la SPU ha cambiato un solo blocco allineato da 16 byte
+             * (il caso del job manager: contatore + casella della SPU a
+             * +0x10..+0x1F dell'intestazione della job list) il commit e' un
+             * compare-and-swap a 128 bit contro l'istantanea. Il PPU scrive
+             * queste righe senza lock (ResetList): uno store che cadeva fra
+             * il confronto qui sopra e la copia veniva cancellato dal valore
+             * vecchio della SPU -- sul ferro avrebbe fatto fallire il PUTLLC.
+             * Col CAS il PUTLLC fallisce e la SPU riprova sulla riga nuova.
+             * SPU_PUTLLC_CAS=0 torna alla copia per byte (A/B). */
+            int cas_done = 0;
+#if !defined(_MSC_VER)
+            static int s_cas = -1;
+            if (s_cas < 0) { const char* e = getenv("SPU_PUTLLC_CAS"); s_cas = (e && *e == '0') ? 0 : 1; }
+            if (s_cas && !s_full) {
+                int nchg = 0, c1 = 0;
+                for (int c = 0; c < MFC_ATOMIC_LINE; c += 16)
+                    if (memcmp(ls + c, ctx->resv_line + c, 16)) { nchg++; c1 = c; }
+                if (nchg == 1) {
+                    __int128 exp, des;
+                    memcpy(&exp, ctx->resv_line + c1, 16); memcpy(&des, ls + c1, 16);
+                    cas_done = __atomic_compare_exchange_n((__int128*)(mem + c1), &exp, des, 0,
+                                                           __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST) ? 1 : -1;
+                } else if (nchg == 0) cas_done = 1;
+            }
+#endif
+            if (cas_done) { /* gia' fatto (1) o fallito (-1) */ }
+            else if (s_full) memcpy(mem, ls, MFC_ATOMIC_LINE);   /* commit local store */
             else for (int w = 0; w < MFC_ATOMIC_LINE; w += 8) {   /* s.45: 8 byte per volta, meno tempo sotto il lock */
                 uint64_t a, b; memcpy(&a, ls + w, 8); memcpy(&b, ctx->resv_line + w, 8);
                 if (a != b) for (int i = w; i < w + 8; i++)
                     if (ls[i] != ctx->resv_line[i]) mem[i] = ls[i];
             }
+            if (cas_done < 0) {
+                static int _n = 0;
+                if (_n++ < 16) fprintf(stderr, "[putllc-cas] ea=0x%08X: il PPU ha scritto la riga durante il commit, PUTLLC fallito\n", (uint32_t)ea);
+                ctx->atomic_stat = 1;                  /* PUTLLC_FAILURE -> retry */
+            } else {
             spu_wring_note(ctx, "PUTLLC", (uint32_t)ea, MFC_ATOMIC_LINE, ls);
+#if !defined(_MSC_VER)
+            if (rowwatch_ea() && ((uint32_t)ea & ~127u) == rowwatch_ea()) rowwatch_note(ctx, cmd, ctx->resv_line, mem);
+#endif
             ctx->atomic_stat = 0;                      /* PUTLLC_SUCCESS */
+            }
         } else {
             ctx->atomic_stat = 1;                      /* PUTLLC_FAILURE -> retry */
         }
@@ -778,6 +880,13 @@ static int spu_mfc_atomic(spu_context* ctx, uint32_t cmd)
     case MFC_PUTLLUC_CMD:
     case MFC_PUTQLLUC_CMD:
         resv_lock_ea(ea);
+#if !defined(_MSC_VER)
+        if (rowwatch_ea() && ((uint32_t)ea & ~127u) == rowwatch_ea()) {
+            uint8_t b[MFC_ATOMIC_LINE]; memcpy(b, mem, MFC_ATOMIC_LINE);
+            memcpy(mem, ls, MFC_ATOMIC_LINE);
+            rowwatch_note(ctx, cmd, b, mem);
+        }
+#endif
         memcpy(mem, ls, MFC_ATOMIC_LINE);              /* unconditional store */
         spu_wring_note(ctx, "PUTLLUC", (uint32_t)ea, MFC_ATOMIC_LINE, ls);
         ctx->resv_valid = 0; ctx->atomic_stat = 0;

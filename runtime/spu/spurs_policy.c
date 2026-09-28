@@ -108,6 +108,9 @@ uint64_t g_spu_hops_total = 0;
  * SPU virtuale) e' stato avviato l'ultima volta: se cambiano, LS fresco. */
 enum { SPURS_PM_MAX_WKL_ = 16 };
 static uint64_t s_pm_data[SPURS_PM_MAX_WKL_][6];
+/* s.51: il PM e' uscito tenendo un job (casella di questa SPU nella job list
+ * != 0xFFFF): la prossima corsa sullo stesso (wid, SPU) NON riparte fresca. */
+static uint8_t s_pm_hold[SPURS_PM_MAX_WKL_][6];
 
 /* cellSpursRemoveWorkload: il kernel vero scarica il policy module; il
  * prossimo AddWorkload sullo stesso wid (Uncharted lo fa ~700 volte, edge
@@ -117,7 +120,34 @@ static uint64_t s_pm_data[SPURS_PM_MAX_WKL_][6];
 void spurs_pm_forget(uint32_t wid)
 {
     if (wid >= SPURS_PM_MAX_WKL_) return;
-    for (int i = 0; i < 6; i++) s_pm_data[wid][i] = ~0ull;
+    for (int i = 0; i < 6; i++) {
+        if (s_pm_hold[wid][i]) {   /* SONDA s.51 */
+            static int _n = 0;
+            if (_n++ < 16) fprintf(stderr, "[spurs-pm] RemoveWorkload wid=%u con spu=%d che tiene un job (lista 0x%llX)\n",
+                                   wid, i, (unsigned long long)s_pm_data[wid][i]);
+        }
+        s_pm_data[wid][i] = ~0ull;
+    }
+}
+
+/* I `data` (job list) distinti visti dal PM, col wid. s.51: spurs_pm_dump_lists
+ * li stampa (intestazione +0x08..+0x1F delle job list WWS) quando la sonda
+ * SPU_ROWWATCH vede lo stallo: dice quale lista il main aspetta. */
+static uint64_t s_seen[32]; static uint32_t s_seen_wid[32]; static int s_seen_n = 0;
+void spurs_pm_dump_lists(uint32_t pm_size)
+{
+    extern uint8_t* vm_base;
+    for (int k = 0; k < s_seen_n; k++) {
+        uint32_t jl = (uint32_t)s_seen[k];
+        if (!vm_base || !jl) continue;
+        const uint8_t* h = vm_base + jl;
+        if (((uint32_t)h[4] << 24 | h[5] << 16 | h[6] << 8 | h[7]) != pm_size) continue;
+        int nv = 0;
+        for (int e = 0; e < 0x100; e++) { const uint8_t* v = h + 0x80 + 8 * e; if (v[0] | v[1] | v[2] | v[3] | v[4] | v[5] | v[6] | v[7]) nv = e + 1; }
+        fprintf(stderr, "[rowwatch] lista wid=%u 0x%08X:", s_seen_wid[k], jl);
+        for (int o = 8; o < 0x20; o += 4) fprintf(stderr, " %02X%02X%02X%02X", h[o], h[o + 1], h[o + 2], h[o + 3]);
+        fprintf(stderr, " voci=%X\n", nv);
+    }
 }
 
 int spu_run_policy_module(spu_lifted_entry_fn entry, int image_id,
@@ -170,7 +200,12 @@ int spu_run_policy_module(spu_lifted_entry_fn entry, int image_id,
         first = 1;
         memset(ctx, 0, sizeof(*ctx));
         spu_context_init(ctx, 0);
-    } else if (s_fresh || s_pm_data[wid][spu_num] != wkl_data) {
+    } else if ((s_fresh && !s_pm_hold[wid][spu_num]) || s_pm_data[wid][spu_num] != wkl_data) {
+        if (s_pm_hold[wid][spu_num]) {   /* SONDA s.51 */
+            static int _h = 0;
+            if (_h++ < 16) fprintf(stderr, "[spurs-pm] wid=%u spu=%u contesto col job preso SCARTATO: lista 0x%llX -> 0x%llX\n",
+                                   wid, spu_num, (unsigned long long)s_pm_data[wid][spu_num], (unsigned long long)wkl_data);
+        }
         if (!s_fresh) {
             static int _n = 0;
             if (_n++ < 8)
@@ -308,10 +343,10 @@ int spu_run_policy_module(spu_lifted_entry_fn entry, int image_id,
     /* L'insieme dei `data` distinti, una riga per valore nuovo. Il dump della
      * job list sotto e' campionato, e da un campione non si sa quali liste il
      * manager veda davvero: e' la stessa trappola del conteggio per workload. */
-    { static uint64_t s_seen[32]; static int s_seen_n = 0;
-      int known = 0;
+    { int known = 0;
       for (int k = 0; k < s_seen_n; k++) if (s_seen[k] == wkl_data) { known = 1; break; }
       if (!known && s_seen_n < 32) {
+          s_seen_wid[s_seen_n] = wid;
           s_seen[s_seen_n++] = wkl_data;
           if (s_trace) {
               fprintf(stderr, "[spurs-pm] nuova job list: wid=%u data=0x%llX\n",
@@ -574,6 +609,37 @@ int spu_run_policy_module(spu_lifted_entry_fn entry, int image_id,
                 g_spurs_pm_polls, g_spurs_pm_exited);
         fflush(stderr);
     }
+
+    /* s.51, lo stallo tipo B: l'intestazione della job list WWS ha a +0x10 il
+     * contatore dei job assegnati (due copie u16) e a +0x14 una casella u16
+     * per spuNum col job che quella SPU sta lavorando (0xFFFF = libera; la
+     * scrive il PM: presa a 0x263C, rilascio a 0x36B0). Il PM puo' uscire
+     * verso il kernel con un job ancora preso: sul ferro la LS resta (il
+     * kernel ricarica il PM solo se cambia immagine, RPCS3
+     * spursKernelDispatchWorkload) e la corsa dopo lo finisce. Con
+     * SPURS_PM_FRESH la corsa dopo lo dimenticava: casella ferma, il PPU
+     * aspetta per sempre la fine della lista (misurato con SPU_ROWWATCH:
+     * `0050 0050 0001` = SPU 0 ancora sul job 1 con tutti gli 80 assegnati).
+     * Qui: se la casella di questa SPU non e' libera, il contesto resta per
+     * la prossima corsa. SPURS_PM_HOLD=0 torna a sempre fresco (A/B). */
+    { static int s_hold_on = -1;
+      if (s_hold_on < 0) { const char* e = getenv("SPURS_PM_HOLD"); s_hold_on = (e && *e == '0') ? 0 : 1; }
+      extern uint8_t* vm_base;
+      uint32_t jl = (uint32_t)wkl_data;
+      int hold = 0;
+      /* solo job list WWS: la loro intestazione ha a +4 la taglia del PM */
+      if (s_hold_on && s_fresh && vm_base && jl && spu_num < 6 &&
+          ((uint32_t)vm_base[jl + 4] << 24 | vm_base[jl + 5] << 16 | vm_base[jl + 6] << 8 | vm_base[jl + 7]) == pm_size) {
+          const uint8_t* h = vm_base + jl + 0x14 + 2 * spu_num;
+          hold = ((h[0] << 8) | h[1]) != 0xFFFF;
+      }
+      if (hold && !s_pm_hold[wid][spu_num]) {
+          static int _n = 0;
+          if (_n++ < 16)
+              fprintf(stderr, "[spurs-pm] wid=%u spu=%u esce col job 0x%X preso: contesto tenuto\n",
+                      wid, spu_num, (vm_base[jl + 0x14 + 2 * spu_num] << 8) | vm_base[jl + 0x15 + 2 * spu_num]);
+      }
+      s_pm_hold[wid][spu_num] = (uint8_t)hold; }
 
     __atomic_fetch_add(&g_spu_hops_total, ctx->hops - hops0, __ATOMIC_RELAXED);
     return g_spurs_pm_exited ? 0 : -2;

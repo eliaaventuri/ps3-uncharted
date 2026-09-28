@@ -1,6 +1,6 @@
 # Stato del progetto
 
-Ultimo aggiornamento: **28 settembre 2026** — sessione 51.
+Ultimo aggiornamento: **28 settembre 2026** — sessione 51 (stallo intermittente in corso).
 
 ## Dove siamo
 
@@ -1220,6 +1220,60 @@ significativo** (a 2.200 draw 139 -> 139; ~31 fps in tutte le corse). 16/16
 corse senza fermi (una "off" a 24 fps). Tenuto: corretto, misurato sul
 meccanismo, costa nulla. La contesa su quella riga e' ormai rumore: non
 insistere.
+
+**Stallo intermittente, s.51 (28/09) -- lavoro in corso.**
+Formato dell'intestazione di una job list WWS (misurato con la nuova sonda
+`SPU_ROWWATCH=<ea>`, spu_channels.c: storia dei PUTLLC/PUTLLUC sulla riga,
+stampata quando la riga resta ferma 3 s, con lo stato di tutte le job list
+viste dal PM, `spurs_pm_dump_lists`):
+`+0x00` EA del PM (0x1008EB00), `+0x04` taglia del PM (0x2F80), `+0x10` due
+u16 = contatore dei job assegnati, `+0x14` un u16 per spuNum = job che quella
+SPU sta lavorando (0xFFFF = libera). Il PM prende un job a pc 0x263C
+(contatore+1, casella = indice) e lo rilascia a 0x36B0 (casella = FFFF).
+Voci dei job a +0x80, 8 byte (`00400001 <EA descrittore>`).
+**La lettura della s.44 era sbagliata**: `0050 0050 0001` = contatore 0x50 e
+SPU 0 ancora sul job 1, non "riga della SPU 2 ferma".
+Il main aspetta un job preciso (func_0074086C -> func_0074073C: finito se
+indice < contatore e nessuna casella <= indice).
+Tre forme di fermo viste sotto carico (stress_lotto.sh 8):
+1. **Job preso e mai rilasciato**: s51c_5_c0 (wid 8, SPU 2 sul job 0x24),
+   s51L_7 (wid 8, SPU 4 sul job 0), s51L_3 (wid 12 lista 0x10696E80: SPU 1-3
+   sui job 0x315-0x317 con contatore a 0x42F). Nessuna lane e' ferma dentro un
+   job (sample): il PM e' USCITO verso il kernel tenendo il job, e la corsa
+   dopo, fresca (SPURS_PM_FRESH), se lo e' dimenticato. Sul ferro la LS resta.
+   Prova in corso: `SPURS_PM_HOLD` (spurs_policy.c) tiene il contesto se la
+   casella della SPU non e' libera a fine corsa. In s51L_3 e' scattato (3 volte,
+   wid 12) ma il fermo c'e' stato lo stesso: il wid 12 cambia lista
+   (RemoveWorkload/AddWorkload), e il cambio di `data` azzera il contesto.
+   A/B s51k 10+10 (prima di saperlo): 3/10 contro 4/10, hold mai scattato.
+2. **"Rendering is stuck on reference value N"** (main in func_0014F528,
+   aspetta il riferimento RSX), preceduto da assert del PM @0x15B0 = la parola
+   a +0x20 del job caricato non e' la firma 0xC0DEC0DE: il PM esegue una voce
+   vecchia/riciclata. Il job perso non rilascia il semaforo della FIFO.
+3. **Contatori della lista del wid 6 (0x106F0780) sfasati**: nei fermi
+   s51L_5 e s51M_8 nessun job tenuto, ma `+0x10` = `000F000D` / `000E000C`
+   (nelle liste sane le due copie sono sempre uguali). Claim del PM
+   (0x2558-0x2600): GETLLAR dell'intestazione, primo u16 = prossimo job, GET
+   della riga di voci a LS 0xD00 (in cache per EA a LS 0x1490!), tipo della
+   voce (halfword): 0 = niente (esce, 0x26B4), 3 -> 0x263C, 1 -> nuovo
+   secondo u16 = max(secondo, primo+1) poi PUTLLC. Da capire cosa vuol dire
+   il secondo u16 e chi lo lascia indietro di 2. Sospetto: la cache della
+   riga di voci a 0x1490 (se il PPU riscrive le voci dopo ResetList e il PM
+   usa la copia vecchia) -- ma con SPURS_PM_FRESH si azzera a ogni corsa.
+Frequenze sotto carico (stress_lotto 8, 160 s): s51rw 3/8, s51c 2/12,
+s51k 7/20, s51L 3/8, s51M 2/8 -- cioe' ~1 su 3-4 corse sotto carico.
+Il job preso e poi perso (forma 1) e' raro: `col job` scattato in 1 corsa su
+~45; `SPURS_PM_HOLD` lo copre solo se il wid non cambia lista (sonde
+"SCARTATO"/"RemoveWorkload ... tiene un job", mai viste in s51M).
+**Prossimo passo**: forma 3 (la piu' frequente senza assert) -- capire il
+secondo u16 e perche' resta indietro; forma 2 -- chi scrive le voci
+(PPU AddJob) e se il PM puo' leggerle a meta' (voce con tipo scritto ma EA
+del descrittore vecchio).
+Anche: **PUTLLC con commit CAS a 128 bit** (`SPU_PUTLLC_CAS`, default acceso)
+quando la SPU cambia un solo blocco da 16 byte: il PPU scrive le righe senza
+lock e uno store fra il confronto e la copia veniva cancellato. Scatta davvero
+(in ogni corsa, ~95 volte su 0x1057BF80, una su 0x106F0780), ma A/B s51c 6+6:
+fermi 1/6 contro 1/6. Tenuto: e' la semantica del ferro.
 
 ## Storico
 

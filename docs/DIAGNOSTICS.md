@@ -1114,6 +1114,10 @@ not changed while a title runs.
 - **`SPU_HOST_NS_MACH`** — `=1`: il decrementer SPU legge l'orologio con `mach_absolute_time` invece di `cntvct_el0` diretto (macOS arm64, s.45). Per l'A/B.
 - **`SPU_ATOMIC_STRIPES`** — `=1`: un solo lock per tutti gli atomici SPU invece di 64 strisce per riga (s.45). Per l'A/B.
 - **`SPU_ATOM_STAT`** — `=1`: ogni 5 s le 8 righe da 128 byte con piu' GETLLAR, con PUTLLC riusciti / falliti senza lock / falliti sotto lock (`[atom-stat]`).
+- **`SPU_ROWWATCH`** — `=<ea hex>` (s.51): storia dei PUTLLC/PUTLLUC della SPU sulla riga da 128 byte (spuNum, wid, pc, lr, byte +0x08..+0x1F prima/dopo); quando la riga resta ferma 3 s stampa gli ultimi 256 record, le voci della lista e l'intestazione di tutte le job list viste dal PM (`[rowwatch]`). Per l'intestazione WWS vedi STATO.md s.51.
+- **`SPU_PUTLLC_CAS`** — `=0` disattiva il commit CAS a 128 bit del PUTLLC (s.51, default acceso).
+- **`SPU_PUTLLC_EARLYFAIL`** — `=0` disattiva il fallimento anticipato del PUTLLC mentre aspetta il lock (s.51).
+- **`SPURS_PM_HOLD`** — `=0` disattiva il contesto tenuto quando il PM esce con un job preso (s.51, default acceso con SPURS_PM_FRESH).
   `runtime/spu/spu_channels.c:851`
 - **`SPU_DMACHK`** — SPU_DMACHK=1: report transfers that break the MFC rules the guest's own dma.h asserts on -- size 0 or > 16 KB, size not a multiple of 16 for transfers of 16+ bytes, or LSA/EA not sharing 16-byte alignment. */
   `runtime/spu/spu_dma.h:611`
