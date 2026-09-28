@@ -444,7 +444,11 @@ static void resv_unlock(void) { for (unsigned i = resv_nstripe(); i-- > 0; ) res
  * di qui: si vedono come "prima" diverso dal "dopo" del record precedente. */
 #if !defined(_MSC_VER)
 #include <pthread.h>
-typedef struct { uint64_t ns; uint16_t spu, wid; uint32_t pc, lr, cmd, lsa; uint8_t b[24], a[24]; } rowwatch_rec;
+typedef struct { uint64_t ns; uint16_t spu, wid; uint32_t pc, lr, cmd, lsa; uint16_t irqd, ndiff; uint32_t ctxl, thr; uint8_t b[24], a[24], l[24]; } rowwatch_rec;
+/* irq presi da questa lane (spu_drain.c) e al GETLLAR osservato: al PUTLLC la
+ * differenza dice se un gestore d'interrupt e' passato in mezzo. */
+_Thread_local unsigned g_spu_irq_taken;
+static _Thread_local unsigned tl_rw_irq_at_get;
 #define ROWWATCH_N 4096
 static rowwatch_rec g_rw[ROWWATCH_N];
 static _Atomic unsigned g_rw_n;
@@ -467,12 +471,14 @@ static void* rowwatch_thread(void* arg)
         fprintf(stderr, "[rowwatch] riga 0x%08X ferma da 3 s dopo %u scritture; ultime:\n", rowwatch_ea(), n);
         for (unsigned i = (n > 256 ? n - 256 : 0); i < n; i++) {
             const rowwatch_rec* r = &g_rw[i % ROWWATCH_N];
-            char b[400]; int p = snprintf(b, sizeof b, "[rowwatch] %u t=%+.3f spu=%u wid=%u cmd=%X lsa=0x%05X pc=0x%05X lr=0x%05X",
-                                         i, ((double)r->ns - (double)t0) / 1e6, r->spu, r->wid, r->cmd, r->lsa, r->pc, r->lr);
+            char b[400]; int p = snprintf(b, sizeof b, "[rowwatch] %u t=%+.3f spu=%u wid=%u cmd=%X lsa=0x%05X irq=%u ndiff=%u ctx=%05X thr=%05X pc=0x%05X lr=0x%05X",
+                                         i, ((double)r->ns - (double)t0) / 1e6, r->spu, r->wid, r->cmd, r->lsa, r->irqd, r->ndiff, r->ctxl, r->thr, r->pc, r->lr);
             p += snprintf(b + p, sizeof b - p, " prima=");
             for (int k = 0; k < 24; k++) p += snprintf(b + p, sizeof b - p, "%02X%s", r->b[k], (k % 4 == 3) ? " " : "");
             p += snprintf(b + p, sizeof b - p, "dopo=");
             for (int k = 0; k < 24; k++) p += snprintf(b + p, sizeof b - p, "%02X%s", r->a[k], (k % 4 == 3) ? " " : "");
+            p += snprintf(b + p, sizeof b - p, "ls=");
+            for (int k = 0; k < 24; k++) p += snprintf(b + p, sizeof b - p, "%02X%s", r->l[k], (k % 4 == 3) ? " " : "");
             fprintf(stderr, "%s\n", b);
         }
         { extern uint8_t* vm_base; const uint8_t* m = vm_base + rowwatch_ea();
@@ -495,12 +501,48 @@ static void rowwatch_note(spu_context* ctx, uint32_t cmd, uint32_t lsa, const ui
     unsigned i = atomic_fetch_add(&g_rw_n, 1);
     rowwatch_rec* r = &g_rw[i % ROWWATCH_N];
     r->ns = spu_host_ns(); r->cmd = cmd; r->lsa = lsa;
+    r->irqd = 0; r->ndiff = 0;
+    if (cmd == MFC_GETLLAR_CMD) tl_rw_irq_at_get = g_spu_irq_taken;
+    else {
+        r->irqd = (uint16_t)(g_spu_irq_taken - tl_rw_irq_at_get);
+        /* byte della riga in LS (all'lsa del PUTLLC) diversi dall'istantanea */
+        for (int k = 0; k < MFC_ATOMIC_LINE; k++)
+            if (spu_ls_get8(ctx->ls, (lsa + k) & SPU_LS_MASK) != ctx->resv_line[k]) r->ndiff++;
+    }
     r->spu = (uint16_t)spu_ls_get32(ctx->ls, 0x1C8); r->wid = (uint16_t)spu_ls_get32(ctx->ls, 0x1DC);
     r->pc = (uint32_t)ctx->pc & SPU_LS_MASK; r->lr = ctx->gpr[0]._u32[0] & SPU_LS_MASK;
     static int s_off = -1;   /* SPU_ROWWATCH_OFF=<hex>: i 24 byte registrati partono da qui (default 8) */
     if (s_off < 0) { const char* e = getenv("SPU_ROWWATCH_OFF"); s_off = e ? (int)(strtoul(e, 0, 16) & 0x78) : 8; if (s_off > 0x68) s_off = 0x68; }
     memcpy(r->b, before + s_off, 24); memcpy(r->a, after + s_off, 24);
+    /* LS della SPU all'lsa, riletta adesso (dopo la copy_in per il GETLLAR) */
+    spu_ls_copy_out(ctx->ls, (lsa + (uint32_t)s_off) & SPU_LS_MASK, r->l, 24);
+    r->ctxl = (uint32_t)((uintptr_t)ctx >> 4) & 0xFFFFF;
+#if defined(__APPLE__)
+    { static _Thread_local uint32_t tid; if (!tid) { uint64_t t; pthread_threadid_np(0, &t); tid = (uint32_t)t & 0xFFFFF; } r->thr = tid; }
+#else
+    r->thr = 0;
+#endif
     atomic_store(&g_rw_last_ns, r->ns);
+    /* s.51: PUTLLC riuscito che ALZA di 1 la halfword a +0x20 (barriera WWS:
+     * il PM toglie sempre 1) -> storia di questo contesto stampata subito */
+    if (cmd == MFC_PUTLLC_CMD) {
+        unsigned hb = (unsigned)before[0x20] << 8 | before[0x21], ha = (unsigned)after[0x20] << 8 | after[0x21];
+        static _Atomic int s_ano;
+        if (ha == hb + 1 && atomic_fetch_add(&s_ano, 1) < 8) {
+            fprintf(stderr, "[rowwatch] ANOMALIA %u: +0x20 %u -> %u, storia del contesto %05X:\n", i, hb, ha, r->ctxl);
+            unsigned j0 = i;   /* le ultime 40 scritture di tutti + fino a 30 piu' vecchie di questo contesto */
+            for (unsigned c = 0; j0 > 0 && i - j0 < 3000 && c < 30; j0--)
+                if (i - j0 >= 40 && g_rw[(j0 - 1) % ROWWATCH_N].ctxl == r->ctxl) c++;
+            for (unsigned j = j0; j <= i; j++) {
+                const rowwatch_rec* q = &g_rw[j % ROWWATCH_N];
+                if (q->ctxl != r->ctxl && j + 40 < i) continue;
+                fprintf(stderr, "[rowwatch] A%u t=%+.3f spu=%u ctx=%05X thr=%05X cmd=%X irq=%u ndiff=%u pc=0x%05X lr=0x%05X +20: prima=%02X%02X%02X%02X dopo=%02X%02X%02X%02X ls=%02X%02X%02X%02X\n",
+                        j, ((double)q->ns - (double)r->ns) / 1e6, q->spu, q->ctxl, q->thr, q->cmd, q->irqd, q->ndiff, q->pc, q->lr,
+                        q->b[8], q->b[9], q->b[10], q->b[11], q->a[8], q->a[9], q->a[10], q->a[11], q->l[8], q->l[9], q->l[10], q->l[11]);
+            }
+            fflush(stderr);
+        }
+    }
     { static _Atomic int started; if (!atomic_exchange(&started, 1)) { pthread_t t; pthread_create(&t, 0, rowwatch_thread, 0); pthread_detach(t); } }
 }
 #endif
@@ -797,11 +839,17 @@ static int spu_mfc_atomic(spu_context* ctx, uint32_t cmd)
              memcmp(mem, ctx->resv_line, MFC_ATOMIC_LINE) != 0)) {
             ctx->atomic_stat = 1; ctx->resv_valid = 0;
             if (spu_atom_stat_on()) spu_atom_stat(ea, ATS_FAST_FAIL, ctx->image_id);
+#if !defined(_MSC_VER)
+            if (rowwatch_ea() && ((uint32_t)ea & ~127u) == rowwatch_ea()) rowwatch_note(ctx, cmd | 0x100, lsa, ctx->resv_line, mem);
+#endif
             return 1;
         }
         if (!resv_lock_unless_lost(ea, mem, ctx->resv_line)) {
             ctx->atomic_stat = 1; ctx->resv_valid = 0;
             if (spu_atom_stat_on()) spu_atom_stat(ea, ATS_FAST_FAIL, ctx->image_id);
+#if !defined(_MSC_VER)
+            if (rowwatch_ea() && ((uint32_t)ea & ~127u) == rowwatch_ea()) rowwatch_note(ctx, cmd | 0x100, lsa, ctx->resv_line, mem);
+#endif
             return 1;
         }
         if (ctx->resv_valid && ctx->resv_ea == ea &&
@@ -879,6 +927,9 @@ static int spu_mfc_atomic(spu_context* ctx, uint32_t cmd)
                           (r[10]<<8)|r[11],(r[12]<<8)|r[13],(r[14]<<8)|r[15]);
               }
           } }
+#if !defined(_MSC_VER)
+        if (ctx->atomic_stat && rowwatch_ea() && ((uint32_t)ea & ~127u) == rowwatch_ea()) rowwatch_note(ctx, cmd | 0x100, lsa, ctx->resv_line, mem);
+#endif
         ctx->resv_valid = 0;                           /* reservation consumed */
         resv_unlock_ea(ea);
         if (spu_atom_stat_on()) spu_atom_stat(ea, ctx->atomic_stat ? ATS_LOCK_FAIL : ATS_OK, ctx->image_id);

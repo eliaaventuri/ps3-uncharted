@@ -24,6 +24,7 @@
 #include "../platform/win32_backtrace.h"   /* RtlCaptureStackBackTrace / GetModuleHandleA on POSIX */
 #include "../platform/win32_compat.h"      /* LONG/SIZE_T, _Interlocked*, YieldProcessor on POSIX */
 extern "C" uint32_t ppu_prof_resolve_host(void* ra);
+extern "C" int ydkj_wwatch_hit_ext(uint32_t ea);   /* YDKJ_WWATCH anche per stwcx/stdcx (s.51) */
 extern "C" void ppu_guest_callstack(const char* tag);
 extern "C" void spu_wring_dump_ext(void);   /* runtime/spu/spu_channels.c */
 
@@ -170,7 +171,11 @@ static int pw_fault(uintptr_t at, void* uctx) {
     /* anche se un altro thread ha gia' disarmato (due fault insieme): la
      * pagina va comunque riaperta, altrimenti il secondo e' un crash vero */
     int was = s_pw_armed; s_pw_armed = 0; mprotect(s_pw_page, s_pw_len, PROT_READ | PROT_WRITE);
-    static int _n = 0; if (!was || _n++ >= 60) return 1;
+    /* YDKJ_PAGEWATCH_ONLY=<lo>:<hi> (s.51): stampa solo gli accessi in [lo,hi) */
+    { static long lo = -1, hi = 0; if (lo < 0) { const char* e = getenv("YDKJ_PAGEWATCH_ONLY"); lo = 0;
+        if (e && *e) { char* c = 0; lo = (long)strtoul(e, &c, 16); hi = (c && *c == ':') ? (long)strtoul(c + 1, 0, 16) : lo + 16; } }
+      uint32_t g = (uint32_t)(at - (uintptr_t)vm_base); if (hi && (g < (uint32_t)lo || g >= (uint32_t)hi)) return 1; }
+    static int _n = 0; if (!was || _n++ >= 400) return 1;
     uintptr_t pc = 0, fp = 0, lr = 0;
 #if defined(__APPLE__) && defined(__aarch64__)
     pc = (uintptr_t)((ucontext_t*)uctx)->uc_mcontext->__ss.__pc;
@@ -477,6 +482,10 @@ extern "C" int ppu_stwcx32(uint64_t ea, uint32_t expected, uint32_t val)
     int ok = __atomic_compare_exchange_n((uint32_t*)(vm_base + ea), &exp_raw, new_raw,
                                          0, __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST) ? 1 : 0;
     if (ok) ppu_resv_break(ea);
+    { static int w = -1; if (w < 0) w = getenv("YDKJ_WWATCH") ? 1 : 0;   /* s.51: anche gli stwcx */
+      if (w && ydkj_wwatch_hit_ext((uint32_t)ea))
+        fprintf(stderr, "[WWATCH] stwcx 0x%08X = 0x%08X (atteso 0x%08X) ok=%d guest-fn=0x%08X tid=%llu\n", (uint32_t)ea, val, expected, ok,
+                ppu_prof_resolve_host(__builtin_return_address(0)), self ? (unsigned long long)self->thread_id : 999ull); }
     resv_unlock(L);
     return ok;
 }
@@ -494,6 +503,10 @@ extern "C" int ppu_stdcx64(uint64_t ea, uint64_t expected, uint64_t val)
     if (self && self->reserve_addr != (uint32_t)ea) { resv_unlock(L); return 0; }
     int ok = __atomic_compare_exchange_n((uint64_t*)(vm_base + ea), &exp_raw, new_raw, 0, __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST) ? 1 : 0;
     if (ok) { ppu_resv_break(ea); ppu_resv_break(ea + 4); }  /* 8-byte store spans two words */
+    { static int w = -1; if (w < 0) w = getenv("YDKJ_WWATCH") ? 1 : 0;   /* s.51 */
+      if (w && (ydkj_wwatch_hit_ext((uint32_t)ea) || ydkj_wwatch_hit_ext((uint32_t)ea + 4)))
+        fprintf(stderr, "[WWATCH] stdcx 0x%08X = 0x%016llX ok=%d guest-fn=0x%08X\n", (uint32_t)ea, (unsigned long long)val, ok,
+                ppu_prof_resolve_host(__builtin_return_address(0))); }
     resv_unlock(L);
     return ok;
 }
@@ -785,6 +798,24 @@ struct vm_spin_tls { uint32_t last, n; };
 extern "C" vm_spin_tls g_vm_spin;
 vm_spin_tls g_vm_spin;
 
+/* --atomic-inc16 (s.51): il titolo alza il contatore di una barriera WWS
+ * (job list, +0x20) con lhz/addi/sth dopo ogni AddJob (func_00491D50), mentre
+ * le SPU lo abbassano con GETLLAR/PUTLLC a ogni job finito (PM 0x26D8). Se il
+ * thread PPU viene sospeso fra lhz e sth, lo sth riscrive il valore vecchio+1
+ * e cancella il decremento della SPU: la barriera resta a 1 per sempre e la
+ * lista si ferma (forma 3 dello stallo). Sul Cell la finestra e' di pochi
+ * cicli; qui un thread sospeso la allarga. L'incremento diventa atomico
+ * rispetto al CAS del PUTLLC. PPU_ATOMIC_INC16=0 torna allo sth (A/B). */
+extern "C" uint16_t ppu_atomic_inc16(uint64_t addr) {
+    static int s_on = -1;
+    if (__builtin_expect(s_on < 0, 0)) { const char* e = getenv("PPU_ATOMIC_INC16"); s_on = !(e && *e == '0'); }
+    uint16_t* p = (uint16_t*)(vm_base + (uint32_t)addr);
+    uint16_t old = __atomic_load_n(p, __ATOMIC_SEQ_CST), nv;
+    if (!s_on) { nv = (uint16_t)(__builtin_bswap16(old) + 1); vm_write16(addr, nv); return nv; }
+    do nv = (uint16_t)(__builtin_bswap16(old) + 1);
+    while (!__atomic_compare_exchange_n(p, &old, __builtin_bswap16(nv), 0, __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST));
+    return nv;
+}
 /* PPU_SPIN_BACKOFF (24/09/2026): chiamata dal codice liftato sul salto
  * all'indietro dei cicli di attesa indicati al lifter (--spin-backoff). Il
  * main thread di Uncharted passa il 61% del tempo a interrogare il ticket di
@@ -1241,6 +1272,7 @@ static int ydkj_wwatch_hit(uint32_t ea)
     for (int i = 0; i < nw; i++) if (ea >= (uint32_t)w[i] && ea < (uint32_t)w[i] + ydkj_wwatch_len()) return 1;
     return 0;
 }
+extern "C" int ydkj_wwatch_hit_ext(uint32_t ea) { return ydkj_wwatch_hit(ea); }
 
 void vm_write8 (uint64_t a, uint8_t  v) { if (__builtin_expect(g_vm_fast > 0, 1)) { const uint32_t ua = (uint32_t)a; if (!vm_oob(ua, 1)) vm_base[ua] = v; return; }
     if (g_vm_fast < 0) g_vm_fast = vm_fast_init();
@@ -1304,7 +1336,9 @@ void vm_write16(uint64_t a, uint16_t v) { if (__builtin_expect(g_vm_fast > 0, 1)
     barrier_watch_hit((uint32_t)a, v, 2, __builtin_return_address(0)); if (vm_oob((uint32_t)a,2)) return;
     { static int64_t w=-2; if (w==-2) { const char* e=getenv("YDKJ_WWATCH"); w = e?(int64_t)strtoul(e,0,0):-1; }
       if (w>=0) { uint32_t ea=(uint32_t)a; if (ydkj_wwatch_hit(ea))
-        fprintf(stderr,"[WWATCH] write16 0x%08X = 0x%04X  ra=%p\n", ea, v, __builtin_return_address(0)); } }
+        fprintf(stderr,"[WWATCH] write16 0x%08X = 0x%04X (era 0x%04X) ra=%p guest-fn=0x%08X tid=%llu\n", ea, v,
+                (unsigned)(vm_base[ea] << 8 | vm_base[ea + 1]), __builtin_return_address(0), ppu_prof_resolve_host(__builtin_return_address(0)),
+                g_active_ctx ? (unsigned long long)g_active_ctx->thread_id : 999ull); } }
     v = __builtin_bswap16(v); memcpy(vm_base + (uint32_t)a, &v, 2); }
 extern "C" uint32_t g_gcm_put_watch_addr;
 extern "C" void cellGcm_on_put_write(void);

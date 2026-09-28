@@ -30,12 +30,14 @@ echo "== ingressi indiretti =="
 echo "== lift PPU (~12 s) =="
 # --spin-backoff 0x742388: il main thread aspetta i ticket dei job SPU in un
 # ciclo (func_0074232C); con la pausa dorme invece di bruciare un core.
+# --atomic-inc16: func_00491D50 e la successiva alzano il contatore di una
+# barriera WWS con lhz/addi/sth mentre le SPU lo abbassano: incremento atomico (s.51).
 rm -rf recomp
 "$PY" "$R/tools/ppu_lifter.py" EBOOT.elf \
     --functions analysis/EBOOT.functions.json \
     --hle-stubs analysis/EBOOT.imports.json \
     --names analysis/names.json --toc 0x7d3190 \
-    --spin-backoff 0x742388 -o recomp
+    --spin-backoff 0x742388 --atomic-inc16 0x492064,0x492388 -o recomp
 
 echo "== tabella NID =="
 (cd "$R" && "$PY" tools/gen_hle_nids.py --all --out "$D/gen/ppu_hle_nids.cpp")

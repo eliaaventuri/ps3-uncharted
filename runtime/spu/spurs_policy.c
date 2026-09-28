@@ -188,6 +188,12 @@ int spu_run_policy_module(spu_lifted_entry_fn entry, int image_id,
     if (wid >= SPURS_PM_MAX_WKL || spu_num >= 6) return -1;
     spu_context* ctx = s_pm_ctx[wid][spu_num];
     int first = 0;
+    /* SONDA s.51: due lane sullo stesso contesto (stessa LS) insieme? */
+    static uint8_t s_pm_busy[SPURS_PM_MAX_WKL][6];
+    if (__atomic_exchange_n(&s_pm_busy[wid][spu_num], 1, __ATOMIC_ACQ_REL)) {
+        static int _n = 0;
+        if (_n++ < 16) fprintf(stderr, "[spurs-pm] CONTESTO CONDIVISO: wid=%u spu=%u gia' in corsa su un'altra lane\n", wid, spu_num);
+    }
     /* SPURS_PM_FRESH=1: treat EVERY dispatch as first contact (zeroed LS, image
      * reloaded). A/B against the persistent default: with persistence, the wwsjob
      * PM's first entry attaches + claims exactly ONE ticket then yields, and every
@@ -656,6 +662,7 @@ int spu_run_policy_module(spu_lifted_entry_fn entry, int image_id,
       s_pm_hold[wid][spu_num] = (uint8_t)hold; }
 
     __atomic_fetch_add(&g_spu_hops_total, ctx->hops - hops0, __ATOMIC_RELAXED);
+    __atomic_store_n(&s_pm_busy[wid][spu_num], 0, __ATOMIC_RELEASE);
     return g_spurs_pm_exited ? 0 : -2;
 }
 

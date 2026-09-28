@@ -1,6 +1,6 @@
 # Stato del progetto
 
-Ultimo aggiornamento: **28 settembre 2026** — sessione 51 (stallo intermittente in corso).
+Ultimo aggiornamento: **28 settembre 2026** — sessione 51 (forma 3 dello stallo risolta: incremento non atomico del PPU; restano fermi da classificare).
 
 ## Dove siamo
 
@@ -1277,17 +1277,49 @@ PUTLLC). Nei fermi resta a **1**. Cattura s51R_3 (SPU_ROWWATCH=0x106CE200
 SPU_ROWWATCH_OFF=18 SPU_ROWWATCH_GET=1, stress 8): **la SPU 0 fa GETLLAR e
 legge 6, poi PUTLLC con istantanea 6 scrive 7** (record 4273/4274, lsa 0x80,
 t=-21 ms); poi il PPU porta a 8 e seguono 7 decrementi -> resta 1. Stessa
-figura in s51Q_5 (letto 5, scritto 6). Il codice a 0x26D8 toglie SEMPRE 1:
-quindi fra il GETLLAR e la `lqx` a 0x26F4 la LS 0x80 di quella SPU conteneva
-un valore VECCHIO (8 -> 7). Ipotesi da verificare: (a) il gestore
-d'interrupt del PM (0x1BDC/0x1C20, irq nel drain o in rdch) che usa la
-stessa LS 0x80 fra wrch MFC_Cmd e la lqx; (b) una copia in LS asincrona o
-sovrapposta (spu_ls_copy_in veloce della s.48, cache mfc) che scrive dopo il
-GETLLAR; (c) la via veloce di spu_wrch (s.49) per MFC_Cmd GETLLAR.
-**Prossimo passo**: nella sonda, a ogni PUTLLC sulla riga osservata,
-registrare anche LS[lsa..lsa+128] della SPU e il contatore di irq del
-contesto fra GETLLAR e PUTLLC; se la LS all'istante del PUTLLC non e'
-l'istantanea meno 1, trovare chi ha scritto LS 0x80 (watch sulla LS).
+figura in s51Q_5 (letto 5, scritto 6). [s.51 sera: questa lettura era
+SBAGLIATA -- la SPU non scrive 7: vedi sotto.]
+
+**Forma 3 RISOLTA (s51S-s51V, 28/09 sera): incremento NON atomico del PPU.**
+Sonda estesa (SPU_ROWWATCH: per ogni record anche `ls=` = la LS all'lsa
+riletta al momento, `irq=` irq presi dalla lane fra GETLLAR e PUTLLC, `ctx=`,
+`thr=`, PUTLLC falliti come cmd=1B4; rilevatore in tempo reale "ANOMALIA"
+quando un PUTLLC riuscito ALZA di 1 la halfword a +0x20, con la storia del
+contesto; spurs_policy.c: "CONTESTO CONDIVISO" se due lane usano lo stesso
+contesto del PM). Cattura s51T_4 (poi fermo @#3377): GETLLAR legge 7, LS=7,
+irq=0; al PUTLLC **ls=6 (la SPU fa giusto 7->6)**, ma subito dopo in memoria
+c'e' **8**. Nessun contesto condiviso, nessun irq: le ipotesi (a)(b)(c)
+cadono tutte.
+Chi scrive 8: YDKJ_WWATCH=0x106CE220 (write16 ora con `era`, guest-fn, tid;
+stwcx/stdcx ora stampati anche loro) -> solo il PPU, tid 1, **func_00491D50**:
+init `sth 0` + `stb 06/01`, poi per ogni job aggiunto (bl 0x48C3D0 /
+0x740D38) `lhz r9,0(r23); addi r9,r9,1; sth r9,0(r23)` a 0x492050-0x492064
+(r23 = barriera+0x20). Anche la funzione successiva ha lo stesso schema a
+0x492370-0x492388 (`sth r9,0x20(r26)`). Nessun DMA SPU (SPU_DMA_EAWIN: solo
+le GET da 16 byte del PM a 0x2668), nessuno stvx, nessuno stwcx.
+Quindi: il PPU legge N, una SPU fa N->N-1 col PUTLLC, il PPU scrive N+1 ->
+**il decremento e' perso**, la barriera resta a 1 e la lista si ferma. E' un
+difetto latente del titolo (sul Cell la finestra lhz->sth e' di pochi cicli);
+qui il thread PPU puo' essere sospeso in mezzo -> per questo lo scatena il
+carico CPU. La sonda YDKJ_WWATCH (fprintf dentro vm_write16, fra lettura e
+scrittura) allarga la finestra: **riproduttore quasi certo senza carico**,
+fermo verso il fotogramma 2630-2670.
+**Correzione**: opzione del lifter `--atomic-inc16 0x492064,0x492388`
+(prepare.sh, iterate.sh): quegli sth diventano `rS = ppu_atomic_inc16(ea)`
+(ppu_loader.cpp, CAS a 16 bit big-endian, atomico rispetto al CAS a 128 bit
+del PUTLLC). `PPU_ATOMIC_INC16=0` = lettura+vm_write16 (A/B).
+Misure (framecatch 100 s, YDKJ_WWATCH=0x106CE220 YDKJ_WWATCH_LEN=4):
+**senza 6/6 fermi** (s51U_1/3/6 prima del rilift, s51V off x3), **con 6/6 OK**.
+Lotti sotto carico (stress_lotto 8) con la correzione: s51X (sonda accesa)
+**6/6 OK, 0 ANOMALIE**; s51W (sonda spenta) interrotto dopo **2 fermi su 2**
+(@#1922, @#2383, nessun assert, forma NON classificata: senza sonda non c'e'
+il dump delle liste). Prima della correzione: s51S 1/8 (assert in un job),
+s51T 2/5 (uno e' la forma 3 catturata). Totale con correzione: 2/8.
+**Prossimo passo**: classificare i fermi s51W -- lotti sotto carico con
+SPU_ROWWATCH=0x106CE200 (il dump al fermo stampa tutte le job list): se sono
+forma 1 (job preso e perso) o forma 2 (assert @0x15B0), o un'altra barriera
+alzata non atomicamente (cercare altri `lhz/addi/sth` su contatori letti dal
+PM: il PM legge la barriera a 0x2668, EA dalla voce di tipo 2).
 Resto delle forme: forma 2 -- chi scrive le voci
 (PPU AddJob) e se il PM puo' leggerle a meta' (voce con tipo scritto ma EA
 del descrittore vecchio). Vecchio testo: forma 3 (la piu' frequente senza assert) -- capire il

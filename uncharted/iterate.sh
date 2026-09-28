@@ -67,7 +67,7 @@ for i in $(seq 1 "$ROUNDS"); do
     "$PY" "$R/tools/ppu_lifter.py" "$D/EBOOT.elf" \
         --functions "$D/analysis/EBOOT.functions.json" \
         --hle-stubs "$D/analysis/EBOOT.imports.json" \
-        --names "$D/analysis/names.json" --toc 0x7d3190 --spin-backoff 0x742388 -o "$D/recomp" 2>&1 | tail -1 | tee -a "$LOG"
+        --names "$D/analysis/names.json" --toc 0x7d3190 --spin-backoff 0x742388 --atomic-inc16 0x492064,0x492388 -o "$D/recomp" 2>&1 | tail -1 | tee -a "$LOG"
 
     "$R/uncharted/build.sh" 2>&1 | tail -1 | tee -a "$LOG"
 done

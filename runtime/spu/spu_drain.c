@@ -284,6 +284,9 @@ void (*spu_take_interrupt(spu_context* ctx,
     ctx->srr0 = ctx->pc;             /* resume point for iret */
     ctx->int_enable = 0;
     spu_irq_regs_save(ctx);          /* hardware contract: handler preserves regs */
+#if !defined(_MSC_VER)
+    { extern _Thread_local unsigned g_spu_irq_taken; g_spu_irq_taken++; }   /* SPU_ROWWATCH (s.51) */
+#endif
     { static int s_it = -1; if (s_it < 0) s_it = getenv("SPU_IRQTRACE") ? 1 : 0;
       if (s_it) { static int _n = 0; if (_n++ < 200)
         fprintf(stderr, "[irq] TAKE srr0=0x%05X depth=%d r13=%08X r15=%08X\n",
