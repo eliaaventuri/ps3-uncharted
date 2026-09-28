@@ -1,15 +1,16 @@
 # Stato del progetto
 
-Ultimo aggiornamento: **28 settembre 2026** — sessione 51 (forma 3 dello stallo risolta: incremento non atomico del PPU; restano fermi da classificare).
+Ultimo aggiornamento: **28 settembre 2026** — sessione 51 (forma 3 dello stallo risolta: incremento non atomico del PPU; 22/22 corse sotto carico senza fermi).
 
 ## Dove siamo
 
 **Uncharted: Drake's Fortune gira su macOS fino al primo livello**
 (`dive-boat`): menu, "New Game", salvataggio, livello con HUD, Drake intero,
 morte e ripartenza dal checkpoint, audio senza click. Circa 28 fps (~7.000
-fotogrammi in 200 s). Non e' ancora giocabile di continuo: resta uno stallo
-intermittente (fotogrammi fermi, ~1 corsa su 10-15, vedi "Fronte aperto" nella
-sessione piu' recente).
+fotogrammi in 200 s). Lo stallo intermittente (fotogrammi fermi, ~1 corsa su
+3-4 sotto carico) era un incremento non atomico del PPU su una barriera WWS:
+corretto in s.51, poi 22/22 corse sotto carico senza fermi (da confermare
+su lotti piu' lunghi).
 
 Le tappe, in una riga ciascuna (dettagli nelle sezioni delle sessioni; quelle
 fino alla 37 stanno in `docs/STATO_STORICO.md`):
@@ -1315,7 +1316,25 @@ Lotti sotto carico (stress_lotto 8) con la correzione: s51X (sonda accesa)
 (@#1922, @#2383, nessun assert, forma NON classificata: senza sonda non c'e'
 il dump delle liste). Prima della correzione: s51S 1/8 (assert in un job),
 s51T 2/5 (uno e' la forma 3 catturata). Totale con correzione: 2/8.
-**Prossimo passo**: classificare i fermi s51W -- lotti sotto carico con
+**s51Y/s51Z (28/09 notte): i fermi s51W non si riproducono.** Binario
+attuale (19:57, con --atomic-inc16), stress_lotto 8 x 160 s:
+s51Y con SPU_ROWWATCH=0x106CE200 (OFF=18, GET=1) **8/8 OK, 0 ANOMALIE**;
+s51Z SENZA sonda (framecatch con FC_DUMP=1: al fermo lldb chiama
+`spurs_pm_dump_lists(0x2F80)` nel processo, niente sonda che sposti i tempi)
+**8/8 OK**. Totale con la correzione: s51X+s51Y+s51Z **22/22 OK**, 0 fermi.
+I due fermi s51W sono sospetti: s51W_1 finisce 57 s dopo s51V_off3 e s51W_2
+55 s dopo s51W_1, troppo poco per corse da ~1.900-2.400 fotogrammi (+20 s di
+attesa del fermo): probabilmente s51W si e' sovrapposto alle ultime corse
+s51V (altra istanza del gioco, forse con PPU_ATOMIC_INC16=0) o girava col
+binario prima del rilift. Entrambi i sample hanno il main in
+func_0074073C (attesa di un job, forma 1 o 3), nessuno in "Rendering is stuck".
+Non classificabili; da considerare NON validi.
+**Prossimo passo**: lo stallo intermittente sembra chiuso (prima: ~1 corsa su
+3-4 sotto carico). Conferma piu' larga: un lotto lungo senza carico
+(lotto.sh 12) e uno sotto carico con FC_DUMP=1; se esce un fermo, il dump
+delle liste e' gia' pronto. Poi tornare alla velocita' o al gioco oltre
+dive-boat.
+[Vecchio testo del prossimo passo:] classificare i fermi s51W -- lotti sotto carico con
 SPU_ROWWATCH=0x106CE200 (il dump al fermo stampa tutte le job list): se sono
 forma 1 (job preso e perso) o forma 2 (assert @0x15B0), o un'altra barriera
 alzata non atomicamente (cercare altri `lhz/addi/sth` su contatori letti dal

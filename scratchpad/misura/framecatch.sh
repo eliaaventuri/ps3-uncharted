@@ -23,6 +23,12 @@ for ((t=0; t<secs; t+=2)); do
             cmds=(); for a in $FC_PEEK; do cmds+=(-o "memory read -s1 -c32 -fx '(char*)vm_base+$a'"); done
             lldb -p "$pid" --batch "${cmds[@]}" > "$out.peek" 2>&1
         fi
+        # FC_DUMP=1: senza sonda SPU_ROWWATCH, fa stampare al processo fermo lo stato
+        # di tutte le job list (spurs_pm_dump_lists, righe [rowwatch] nel log).
+        if [ -n "$FC_DUMP" ]; then
+            lldb -p "$pid" --batch -o "expr (void)spurs_pm_dump_lists(0x2F80)" > "$out.dump" 2>&1
+            sleep 1
+        fi
         res="FERMO@$(echo "$cur" | grep -o '#[0-9]*')"; break
     fi
 done
