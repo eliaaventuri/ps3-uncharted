@@ -157,6 +157,19 @@ void spurs_pm_dump_lists(uint32_t pm_size)
                 fprintf(stderr, " %d=%02X%02X%02X%02X:%02X%02X%02X%02X", e, v[0], v[1], v[2], v[3], v[4], v[5], v[6], v[7]);
         }
         fprintf(stderr, "\n");
+        /* s.52: per ogni SPU che tiene un job, la voce e i primi 0x40 byte del
+         * descrittore (a +0x20 ci vuole la firma 0xC0DEC0DE, assert PM 0x15B0) */
+        for (int n = 0; n < 6; n++) {
+            uint32_t j = (uint32_t)h[0x14 + 2 * n] << 8 | h[0x15 + 2 * n];
+            if (j == 0xFFFF || j >= 0x100 * 8) continue;
+            const uint8_t* v = h + 0x80 + 8 * j;
+            uint32_t d = (uint32_t)v[4] << 24 | v[5] << 16 | v[6] << 8 | v[7];
+            fprintf(stderr, "[rowwatch]   spu=%d job 0x%X voce %02X%02X%02X%02X:%08X", n, j, v[0], v[1], v[2], v[3], d);
+            if (d >= 0x10000u && d < 0xC0000000u)
+                for (int o = 0; o < 0x40; o += 4) fprintf(stderr, "%s%02X%02X%02X%02X", (o % 16) ? " " : " | ",
+                        vm_base[d + o], vm_base[d + o + 1], vm_base[d + o + 2], vm_base[d + o + 3]);
+            fprintf(stderr, "\n");
+        }
     }
     if (vm_base && s_last_spurs) {   /* readyCount/idle/... del SPURS: primi 0x80 byte */
         const uint8_t* sp = vm_base + s_last_spurs;

@@ -1397,6 +1397,54 @@ e sei nel PM. Da capire se i contesti tenuti vengono mai rieseguiti (ora
 wid 8 lista 0x10695C80, SPU 2 sul job 0, nessun "contesto tenuto") segue due
 assert: 0x423C (causa A) e il PM @0x1660.
 
+**s.52, pomeriggio/sera (29/09, progetto ora su /Volumes/SanDisk) -- misure.**
+Lotti sotto carico (stress 8): s52e 2/2 fermi, s52f 1 OK + 1 fermo, s52g
+(con SPU_ROWWATCH=0x10696E80) **7 OK + 1 crash, nessun fermo** (come s51Y: la
+sonda sulla riga maschera il fermo -> dipende dai tempi fra le operazioni
+su quella riga).
+Tre figure:
+1. **s52e_1/s52e_2: lista del wid 13 (0x104C4F00) con job tenuti** (SPU 3 su
+   0x174; SPU 3 su 0x15C e SPU 4 su 0x15F). Assert del PM @0x15B0 (job senza
+   firma 0xC0DEC0DE, r14 = 0x104C4F00) o @0x1648/0x1654 poco prima.
+   `[stall-dump] wid=13`: le SPU che tengono il job hanno ~25-60 k corse contro
+   ~4,8 M delle altre, hold=0, nessun rientro: quella (wid, SPU) quasi non
+   viene piu' eseguita dopo aver preso il job.
+2. **s52f_2 (fermo @#573): assert 0x423C del job 008ff700 (in wid 8) + assert
+   PM @0x1660**, poi la corsa del PM wid=8 spu=2 resta appesa per sempre
+   (SPURS_PM_WATCHDOG=5: pc=0x2E28, ciclo 3FEC0/00A90/00AAC/02E28, ie=0,
+   evmask=0x2 = attesa di un evento). Lista wid 8 0x10695C80: SPU 2 sul job 0
+   ma voce 0 = 0 (gia' azzerata dal PPU mentre il job girava).
+   SPU_ASSERT_LINE=9 all'assert: riga 0x10696E80 = contatori +0x10 `0000 0000`,
+   caselle FFFF, **voci 0-4 PIENE** (2ABB10F0..2ABB16F0), resto zero; LS 0x80
+   identica: il job vuole aggiungere alla voce 0 e la trova piena.
+3. **s52g_5: crash nuovo**: `[spu-int] annidamento oltre 4 livelli: istantanea
+   persa` (spu_drain.c spu_irq_regs_save, SPU_IRQ_NEST=4) poi SIGSEGV in
+   spu_ls_copy_in <- mfc_run_list <- PM func_000024A4 <- ... dentro
+   jobmod_00903d80 func_000072C0 (ricorsivo): lista DMA con EA 0xFE3F8000.
+   Su tutti i lotti s51/s52 il messaggio compare in 3 corse, tutte fermo o
+   crash. Sospetto: livelli salvati che "perdono" quando il gestore non torna
+   a srr0 (es. il PM cambia job) e si accumulano -> ripristino di registri vecchi.
+**Ciclo normale della lista A del wid 12 (0x10696E80)** (YDKJ_WWATCH=
+0x10696E90 LEN=0x18, s52h, senza carico): dopo `AddWorkload(wid=12,
+arg=0x106afe80)` (il wid 12 passa alla lista B) il PPU azzera A: voci
+(write64, ciclo a 0x0073FE34 di func_0073FDF0), poi caselle +0x14..+0x1E =
+FFFF, poi contatori +0x10/+0x12 = 0 (sempre `era 0x0005`). Le voci non nulle
+le scrivono solo le SPU (PUTLLC di AddJob dal job 008ff700). Funzioni di
+reset: func_0073FDF0 (condizionale, con sync), func_00741860, func_00742420.
+Lettura: lo stato dell'assert (contatori 0, voci 0-4 piene) = un job 008ff700
+ha aggiunto 5 lavori ad A DOPO l'azzeramento delle voci e PRIMA di quello dei
+contatori, cioe' mentre il PPU la resettava. Sul ferro il gioco non deve
+permetterlo: il PPU dovrebbe aspettare quei job (wid 8) prima di resettare A.
+func_0074073C (attesa di un job): legge +0x12 (presi), sync, poi il minimo
+delle caselle +0x14..+0x1C (SOLO 5 SPU, i=0..4), finito se indice < minimo.
+**Prossimo passo**: capire perche' il PPU resetta A mentre un job del wid 8
+ci scrive ancora: (a) chi chiama func_0073FDF0 e cosa aspetta prima (quale
+lista/indice), (b) se in quel momento il job 008ff700 e' "finito" per il PPU
+(casella FFFF) pur scrivendo ancora -- es. il PM rilascia la casella a 0x36B0
+prima che il job abbia finito, o il job e' una ri-esecuzione di una voce
+vecchia (forma 2). Sonda utile: YDKJ_WWATCH sulla voce 0 di A + tempo host in
+WWATCH e ROWWATCH per incrociarli (oggi WWATCH non ha tempi).
+
 ## Storico
 
 Sessioni fino alla 37 e la vecchia "Dove siamo", verbatim, in
