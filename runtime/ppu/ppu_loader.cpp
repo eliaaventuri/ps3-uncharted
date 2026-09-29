@@ -1335,10 +1335,18 @@ void vm_write16(uint64_t a, uint16_t v) { if (__builtin_expect(g_vm_fast > 0, 1)
     if (g_vm_fast < 0) g_vm_fast = vm_fast_init();
     barrier_watch_hit((uint32_t)a, v, 2, __builtin_return_address(0)); if (vm_oob((uint32_t)a,2)) return;
     { static int64_t w=-2; if (w==-2) { const char* e=getenv("YDKJ_WWATCH"); w = e?(int64_t)strtoul(e,0,0):-1; }
-      if (w>=0) { uint32_t ea=(uint32_t)a; if (ydkj_wwatch_hit(ea))
-        fprintf(stderr,"[WWATCH] write16 0x%08X = 0x%04X (era 0x%04X) ra=%p guest-fn=0x%08X tid=%llu\n", ea, v,
+      if (w>=0) { uint32_t ea=(uint32_t)a; if (ydkj_wwatch_hit(ea)) {
+      { /* s.52: catena dei chiamanti guest (LR salvati a back-chain+16) */
+        char ch[96] = ""; int cp = 0;
+        if (g_active_ctx) { uint32_t sp = (uint32_t)g_active_ctx->gpr[1];
+            for (int k = 0; k < 5 && sp >= 0x10000u && sp < 0xF0000000u; k++) {
+                uint32_t nsp; memcpy(&nsp, vm_base + sp + 4, 4); nsp = __builtin_bswap32(nsp);
+                if (nsp <= sp || nsp >= 0xF0000000u) break;
+                uint32_t lr; memcpy(&lr, vm_base + nsp + 20, 4); lr = __builtin_bswap32(lr);
+                cp += snprintf(ch + cp, sizeof ch - cp, " %06X", lr); sp = nsp; } }
+        fprintf(stderr,"[WWATCH] write16 0x%08X = 0x%04X (era 0x%04X) ra=%p guest-fn=0x%08X tid=%llu lr=%06X chiamanti:%s\n", ea, v,
                 (unsigned)(vm_base[ea] << 8 | vm_base[ea + 1]), __builtin_return_address(0), ppu_prof_resolve_host(__builtin_return_address(0)),
-                g_active_ctx ? (unsigned long long)g_active_ctx->thread_id : 999ull); } }
+                g_active_ctx ? (unsigned long long)g_active_ctx->thread_id : 999ull, g_active_ctx ? (unsigned)g_active_ctx->lr : 0u, ch); } } } }
     v = __builtin_bswap16(v); memcpy(vm_base + (uint32_t)a, &v, 2); }
 extern "C" uint32_t g_gcm_put_watch_addr;
 extern "C" void cellGcm_on_put_write(void);

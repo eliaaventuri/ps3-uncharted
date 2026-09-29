@@ -17,6 +17,9 @@
 #include "../../runtime/ppu/ppu_memory.h"   /* vm_base (guest mem) */
 #include "../../runtime/ppu/ppu_tls.h"      /* PPU_THREAD_LOCAL (pool delle lane) */
 #include <stdio.h>
+#ifdef __APPLE__
+#include <pthread/qos.h>
+#endif
 #include <stdlib.h>   /* getenv -- an implicit decl returns int, truncating the pointer */
 #include <string.h>
 #include <stdint.h>
@@ -1670,6 +1673,13 @@ static int spurs_lane_sched_on(void)
 static DWORD WINAPI spurs_lane_sched_thread(LPVOID p)
 {
     { ULONG g = 256 * 1024; SetThreadStackGuarantee(&g); }
+#ifdef __APPLE__
+    /* SPURS_LANE_QOS=1 (s.52): le SPU vere non vengono mai sospese; sotto
+     * carico il sistema puo' togliere la CPU a una lane per decine di ms e il
+     * titolo conta su job finiti entro il fotogramma. Prova A/B. */
+    { const char* e = getenv("SPURS_LANE_QOS");
+      if (e && *e && *e != '0') pthread_set_qos_class_self_np(QOS_CLASS_USER_INTERACTIVE, 0); }
+#endif
     const unsigned lane = (unsigned)(uintptr_t)p;
     static long s_idle_us = -1;
     if (s_idle_us < 0) { const char* e = getenv("SPURS_LANE_IDLE_US"); s_idle_us = e ? atol(e) : 100; }

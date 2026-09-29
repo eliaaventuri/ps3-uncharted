@@ -114,6 +114,8 @@ static uint8_t s_pm_hold[SPURS_PM_MAX_WKL_][6];
 /* SONDA s.52: corse del PM per (wid, SPU) e rientri con un job tenuto;
  * stampati da spurs_stall_dump_thread. */
 static volatile unsigned s_pm_runs[SPURS_PM_MAX_WKL_][6], s_pm_hold_reent[SPURS_PM_MAX_WKL_][6];
+/* i contesti e i flag "in corsa" di spu_run_policy_module, per il dump */
+static spu_context* (*s_pm_ctx_pub)[6]; static uint8_t (*s_pm_busy_pub)[6];
 
 /* cellSpursRemoveWorkload: il kernel vero scarica il policy module; il
  * prossimo AddWorkload sullo stesso wid (Uncharted lo fa ~700 volte, edge
@@ -200,6 +202,16 @@ static DWORD WINAPI spurs_stall_dump_thread(LPVOID p)
                 for (int n = 0; n < 6; n++) fprintf(stderr, " %u/%u/%u", s_pm_runs[w][n], s_pm_hold_reent[w][n], s_pm_hold[w][n]);
                 fprintf(stderr, " | lista 0x%llX..\n", (unsigned long long)s_pm_data[w][0]);
             }
+            /* corse del PM ancora in volo: pc dell'ultimo salto, 8 campioni a 2 ms */
+            for (int w = 0; w < SPURS_PM_MAX_WKL_; w++) for (int n = 0; n < 6; n++) {
+                spu_context* c = s_pm_ctx_pub ? s_pm_ctx_pub[w][n] : 0;
+                if (!c || !__atomic_load_n(&s_pm_busy_pub[w][n], __ATOMIC_RELAXED)) continue;
+                fprintf(stderr, "[stall-dump] in volo wid=%d spu=%d pc:", w, n);
+                for (int k = 0; k < 8; k++) { fprintf(stderr, " %05X", c->pc & SPU_LS_MASK); Sleep(2); }
+                fprintf(stderr, " ie=%u evmask=0x%X evstat=0x%X tagmask=0x%X stall=0x%X/0x%X LS12A0=%08X LS12C0=%08X\n",
+                        c->int_enable, c->event_mask, c->event_status, c->mfc_tag_mask, c->list_stall_mask, c->list_stall_stat,
+                        spu_ls_get32(c->ls, 0x12A0), spu_ls_get32(c->ls, 0x12C0));
+            }
             fflush(stderr);
         }
     }
@@ -235,6 +247,7 @@ int spu_run_policy_module(spu_lifted_entry_fn entry, int image_id,
     int first = 0;
     /* SONDA s.51: due lane sullo stesso contesto (stessa LS) insieme? */
     static uint8_t s_pm_busy[SPURS_PM_MAX_WKL][6];
+    s_pm_ctx_pub = s_pm_ctx; s_pm_busy_pub = s_pm_busy;
     if (__atomic_exchange_n(&s_pm_busy[wid][spu_num], 1, __ATOMIC_ACQ_REL)) {
         static int _n = 0;
         if (_n++ < 16) fprintf(stderr, "[spurs-pm] CONTESTO CONDIVISO: wid=%u spu=%u gia' in corsa su un'altra lane\n", wid, spu_num);

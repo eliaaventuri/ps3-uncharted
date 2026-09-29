@@ -1445,6 +1445,44 @@ prima che il job abbia finito, o il job e' una ri-esecuzione di una voce
 vecchia (forma 2). Sonda utile: YDKJ_WWATCH sulla voce 0 di A + tempo host in
 WWATCH e ROWWATCH per incrociarli (oggi WWATCH non ha tempi).
 
+**s.52, sera (29/09) -- chi resetta la lista A e cosa aspetta.**
+Catena dei chiamanti nella sonda WWATCH (nuova: `lr=` e `chiamanti:` = LR
+salvati risalendo la back-chain del guest; ppu_loader.cpp vm_write16): il reset
+dei contatori di A (s52i, 1736 volte su tid 1) viene quasi sempre da
+`func_0048A710 -> func_00742288 -> func_0073FDF0`, chiamante 0x14FEDC (ciclo
+principale). func_0048A710 = scambio del doppio buffer a ogni fotogramma:
+azzera la lista del buffer vecchio SENZA aspettare nulla; func_00742288 =
+"ResetListAfterFinished": `tw` (trap) se func_00742214 (IsListFinished:
+handle dell'ultimo job + func_007428C0/IsJobFinished) dice non finita, poi
+func_0073FDF0 (ResetList: voci, sync, caselle FFFF, sync, contatori 0).
+Una lista a cui nessuno ha ancora aggiunto risulta "finita": la sincronia
+col job che aggiunge (008ff700 del wid 8) deve venire da un'attesa a monte
+(probabilmente l'attesa della RSX in func_0014F528). Da verificare: se quella
+attesa puo' passare prima che il job del wid 8 abbia finito di aggiungere.
+**Job tenuti = sintomo, non causa.** `esce col job ... contesto tenuto` compare
+SOLO nelle corse che poi si fermano (0 in tutte le OK di s52r/s52a).
+s52q_1: tutte e 5 le SPU del wid 12 tengono job 0x30F-0x313 della lista A
+(modulo job 0x1011C900, descrittori validi), hold=1 con 1 rientro, e le 5 lane
+sono DENTRO il PM (spurs_policy_spu_func_00002EF8/2F38/1BDC/2A68/23BC/22B0...)
+a girare in tondo; la sesta lane esegue un job 00931cc0. s52q_2: stessa figura
+sulla lista B (job 0x7AF e 0x7B4, stesso modulo). Indici ~0x310 come s51L_3 e
+s52c_1. Sonda nuova nel dump del fermo: `[stall-dump] in volo wid= spu= pc:`
+(8 campioni del pc delle corse del PM in corso + ie/evmask/tag/stall) -- non
+ancora vista scattare.
+**Il tasso dei fermi varia col momento, non con le sonde.** Stesso binario e
+stesse variabili: s52c/s52e/s52f/s52q (sera del 29 dopo lo spostamento sulla
+SanDisk) 7 fermi su 8; s52r/s52s/s52t/s52u (dopo le 21) **0 su 23**, anche con
+12 cicli di carico (s52t) e con SPURS_LANE_QOS=1 (s52u 6/6 OK; SPURS_LANE_QOS e'
+nuova, cellSpurs.c: lane a QOS_CLASS_USER_INTERACTIVE, di per se' neutra).
+Ipotesi: lavoro di fondo del Mac (indicizzazione Spotlight della SSD appena
+montata?) che toglieva la CPU al PPU a caso. Il "mascheramento" delle sonde
+(s51Y, s52g, s52r) va quindi riletto: potrebbe essere solo il momento.
+Prima di ogni A/B: controllare il carico del Mac (Activity Monitor, mds_stores).
+**Prossimo passo**: riprodurre in modo affidabile -- carico che colpisce il PPU
+e non solo la CPU in generale (es. `taskpolicy`/QoS bassa per il thread PPU
+principale, o cicli occupati su tutti i core di prestazione); poi al fermo
+leggere `[stall-dump] in volo` per sapere dove girano i PM che tengono i job.
+
 ## Storico
 
 Sessioni fino alla 37 e la vecchia "Dove siamo", verbatim, in
