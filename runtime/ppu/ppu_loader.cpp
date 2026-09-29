@@ -18,6 +18,9 @@
  * Compiled as C++ to match the lifted output's `extern "C"` / PPU_THREAD_LOCAL.
  */
 
+#ifdef __APPLE__
+#include <pthread/qos.h>
+#endif
 #include "ppu_tls.h"   /* PPU_THREAD_LOCAL, without a second ppu_context */
 #include "ppu_recomp.h"     /* ppu_context, func decls, ppu_recomp_register */
 #include "../memory/vm.h"   /* vm_commit -- sys_mmapper_search_and_map maps for real */
@@ -3041,6 +3044,13 @@ extern "C" int ppu_run(uint32_t entry_opd, uint32_t stack_top)
      * and concurrently-emitted fences vanished (the boot-loading stall). */
     { extern uint64_t ppu_thread_register_main(void);
       ctx.thread_id = ppu_thread_register_main(); }
+#ifdef __APPLE__
+    /* PS3_MAIN_QOS=utility|background (s.52): abbassa la priorita' del thread
+     * PPU principale, per riprodurre i fermi che nascono quando il sistema
+     * sospende il PPU a meta' di una sequenza (reset delle job list). */
+    { const char* e = getenv("PS3_MAIN_QOS");
+      if (e && *e) pthread_set_qos_class_self_np(e[0] == 'b' ? QOS_CLASS_BACKGROUND : QOS_CLASS_UTILITY, 0); }
+#endif
 
     /* PS3 process-entry ABI: the loader hands _start register state the CRT
      * (_initialize) consumes directly:

@@ -225,6 +225,13 @@ static void spu_irq_regs_save(spu_context* ctx)
         return;
     }
     uint32_t d = ctx->irq_save_valid;
+    /* SONDA s.52: con ie=0 nel gestore non dovrebbe esserci annidamento: d>0
+     * qui = un livello salvato prima non e' mai stato ripristinato. */
+    if (d) { static unsigned _n = 0; unsigned k = __atomic_fetch_add(&_n, 1, __ATOMIC_RELAXED);
+             if (k < 12 || (k & (k - 1)) == 0)
+                 fprintf(stderr, "[spu-int] livello %u gia' occupato (#%u): img=%d ovl=%d srr0 nuovo=0x%05X in attesa=0x%05X pc=0x%05X\n",
+                         d, k + 1, ctx->image_id, ctx->resident_ovl, ctx->srr0 & SPU_LS_MASK,
+                         ctx->irq_resume_pc & SPU_LS_MASK, ctx->pc & SPU_LS_MASK); }
     ctx->irq_resume_stack[d] = ctx->srr0;
     memcpy(ctx->irq_gpr[d], ctx->gpr, sizeof ctx->irq_gpr[d]);
     ctx->irq_resume_pc = ctx->srr0;
@@ -281,6 +288,17 @@ void (*spu_take_interrupt(spu_context* ctx,
                     (uint32_t)ctx->pc & SPU_LS_MASK);
         return tf;
     }
+    /* s.52: l'iret appena eseguito ha messo pc = srr0 e ie = 1, ma il
+     * ripristino dei registri avviene nel dispatch (spu_indirect_branch) che
+     * non e' ancora partito: un interrupt gia' pendente veniva preso PRIMA,
+     * salvando i registri sporchi del gestore sopra il livello vecchio, che
+     * restava appeso e veniva poi "ripristinato" molto piu' tardi al primo
+     * passaggio da quel pc (131 k volte in 100 s, sempre a 0x2430 del PM).
+     * Sul ferro l'iret si completa prima: registri del codice interrotto,
+     * poi il nuovo interrupt. SPU_IRQ_IRETFIX=0 = come prima (A/B). */
+    { static int s_fix = -1;
+      if (s_fix < 0) { const char* e = getenv("SPU_IRQ_IRETFIX"); s_fix = (e && *e == '0') ? 0 : 1; }
+      if (s_fix && ctx->irq_save_valid) spu_irq_regs_maybe_restore(ctx); }
     ctx->srr0 = ctx->pc;             /* resume point for iret */
     ctx->int_enable = 0;
     spu_irq_regs_save(ctx);          /* hardware contract: handler preserves regs */

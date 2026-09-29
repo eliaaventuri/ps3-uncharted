@@ -1483,6 +1483,36 @@ e non solo la CPU in generale (es. `taskpolicy`/QoS bassa per il thread PPU
 principale, o cicli occupati su tutti i core di prestazione); poi al fermo
 leggere `[stall-dump] in volo` per sapere dove girano i PM che tengono i job.
 
+**s.52, notte (29-30/09) -- RIPRODUTTORE e correzione iret.**
+**Riproduttore: `stress_lotto.sh 8 N <pref> PS3_MAIN_QOS=utility
+SPURS_STALL_DUMP=10`** (nuova PS3_MAIN_QOS, ppu_loader.cpp: thread PPU
+principale a QOS_CLASS_UTILITY, `b...` = BACKGROUND): s52v 2 fermi su 3, s52y
+3 su 4 (contro 0/23 di s52r-u senza). Quasi tutti i fermi riprodotti sono sul
+**wid 13, lista 0x104C4F00, job del modulo 0x1012EA40 (jobmod 008eea40 =
+ovl 216)**: una o due SPU tengono un job e il loro PM gira per sempre in
+1BDC/2F38/2EF8/2418/2A68/1F34 con ie=0, **evmask=0x2 (SN = notifica di lista
+DMA con stall)**, stall=0x0/0x0 (`[stall-dump] in volo`): aspetta il
+completamento di uno stadio della pipeline Load/Run/Store che non arriva.
+Spesso preceduto da assert del PM @0x1648 = completamento per uno slot NON in
+volo (func_000022F0: voce LS 0xDF0+(r13<<6)+4*bit senza 0x80000000) o @0x15B0
+(job senza firma). Cioe' notifiche SN perse o doppie. Una volta (s52v_3) il job
+ovl 216 salta a LS 0x28400 dove c'e' un dato (`BRANCH-TO-0 unresolved pc=0x28400`).
+**Correzione iret (spu_drain.c spu_take_interrupt, SPU_IRQ_IRETFIX=0 per A/B):**
+il ripristino dei registri dopo un iret avviene nel dispatch successivo
+(spu_indirect_branch), ma un interrupt gia' pendente veniva preso PRIMA:
+salvataggio dei registri sporchi sopra il livello vecchio, che restava appeso
+e veniva "ripristinato" molto dopo al primo passaggio dal suo pc. Misurato con
+la sonda `[spu-int] livello N gia' occupato`: **131.073 volte in 100 s, sempre
+a 0x2430 del PM -> 0** con la correzione (s52w -> s52x, stessi fotogrammi
+#4212). Da sola NON toglie i fermi (s52y 3/4 col riproduttore), ma e' la
+semantica del ferro: tenuta.
+**Prossimo passo**: col riproduttore, seguire le notifiche SN del wid 13:
+chi le genera (mfc_run_list con elemento a stall-bit), chi le consuma (rdch
+di SPU_RdEventStat / MFC_RdListStallStat, WrListStallAck) e dove una si perde
+o si duplica. Sospetti: SPU_SN_DEFER / g_sn_defer_ctx (globale, non per
+contesto!), list_stall_stat azzerato da un rdch del gestore d'interrupt mentre
+il codice di base aspetta, evento consumato con ie=0.
+
 ## Storico
 
 Sessioni fino alla 37 e la vecchia "Dove siamo", verbatim, in
