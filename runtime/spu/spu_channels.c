@@ -213,6 +213,11 @@ void spu_stop_at(spu_context* ctx, uint32_t addr)
                       spu_ls_get8(ctx->ls, 0x80 + i), spu_ls_get8(ctx->ls, 0x81 + i), spu_ls_get8(ctx->ls, 0x82 + i), spu_ls_get8(ctx->ls, 0x83 + i));
               fprintf(stderr, "\n"); fflush(stderr);
           } }
+        { fprintf(stderr, "         irq (S=salva R=ripristina @pc, passi fa) steps=%llu:", (unsigned long long)ctx->steps);
+          for (unsigned k = 0; k < 16; k++) { unsigned h = (ctx->irq_hist_i + k) & 15; if (!ctx->irq_hist_steps[h]) continue;
+              fprintf(stderr, " %c%05X/%llu", (ctx->irq_hist[h] >> 31) ? 'S' : 'R', ctx->irq_hist[h] & 0x3FFFF,
+                      (unsigned long long)(ctx->steps - ctx->irq_hist_steps[h])); }
+          fprintf(stderr, " | livelli=%u\n", ctx->irq_save_valid); }
         spu_adma_dump(ctx);
     }
     spu_stop(ctx);

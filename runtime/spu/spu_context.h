@@ -379,6 +379,11 @@ typedef struct spu_context {
      * azzera tutto). Chiave: pc | image_id<<32 | resident_ovl<<48. */
 #define SPU_IB_CACHE 2048
     struct { uint64_t key; void (*fn)(struct spu_context*); } ib_cache[SPU_IB_CACHE];
+    /* in fondo: gli oggetti gia' compilati non cambiano offset */
+    uint32_t irq_hist[16];                /* s.52: ultimi salvataggi (S<<31|pc) e ripristini (pc) dei registri d'interrupt */
+    uint32_t irq_hist_i;
+    uint64_t irq_hist_steps[16];
+    uint32_t sn_defer;                    /* s.52: tick di rinvio dell'interrupt SN, per contesto (SPU_SN_DEFER) */
 } spu_context;
 
 /* Reserved LS addresses (inside the kernel area, below the 0xA00 policy-module

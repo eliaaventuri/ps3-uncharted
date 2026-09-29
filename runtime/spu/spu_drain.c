@@ -232,6 +232,7 @@ static void spu_irq_regs_save(spu_context* ctx)
                  fprintf(stderr, "[spu-int] livello %u gia' occupato (#%u): img=%d ovl=%d srr0 nuovo=0x%05X in attesa=0x%05X pc=0x%05X\n",
                          d, k + 1, ctx->image_id, ctx->resident_ovl, ctx->srr0 & SPU_LS_MASK,
                          ctx->irq_resume_pc & SPU_LS_MASK, ctx->pc & SPU_LS_MASK); }
+    { uint32_t h = ctx->irq_hist_i++ & 15; ctx->irq_hist[h] = 0x80000000u | (ctx->srr0 & SPU_LS_MASK); ctx->irq_hist_steps[h] = ctx->steps; }
     ctx->irq_resume_stack[d] = ctx->srr0;
     memcpy(ctx->irq_gpr[d], ctx->gpr, sizeof ctx->irq_gpr[d]);
     ctx->irq_resume_pc = ctx->srr0;
@@ -253,7 +254,17 @@ int spu_irq_regs_maybe_restore(spu_context* ctx)
     if ((ctx->pc & SPU_LS_MASK) == (ctx->irq_resume_pc & SPU_LS_MASK) &&
         ctx->int_enable) {
         uint32_t d = ctx->irq_save_valid - 1;
-        memcpy(ctx->gpr, ctx->irq_gpr[d], sizeof ctx->irq_gpr[d]);
+        { uint32_t h = ctx->irq_hist_i++ & 15; ctx->irq_hist[h] = ctx->pc & SPU_LS_MASK; ctx->irq_hist_steps[h] = ctx->steps; }
+        /* s.52: lo shim vero del job manager WWS (generato a LS 0x3FEC0) e'
+         * `lqa r0..r75` + `bi r79`: ripristina SOLO r0-r75. r76-r127 sono
+         * stato condiviso che il gestore aggiorna per il codice interrotto;
+         * ripristinarli tutti annullava quegli aggiornamenti (PM che esegue
+         * un job con LS 0x1330 = 0 -> assert 0x15B0, job tenuti, fermi).
+         * SPU_IRQ_RESTORE_N=<n> = quanti registri (128 = come prima). */
+        { static int s_n = -1;
+          if (s_n < 0) { const char* e = getenv("SPU_IRQ_RESTORE_N"); s_n = e ? atoi(e) : 76; if (s_n < 1 || s_n > 128) s_n = 128; }
+          int n = ctx->policy_mode ? s_n : 128;
+          memcpy(ctx->gpr, ctx->irq_gpr[d], (size_t)n * sizeof ctx->gpr[0]); }
         ctx->irq_save_valid = d;
         ctx->irq_resume_pc = d ? ctx->irq_resume_stack[d - 1] : 0;
         return 1;
@@ -265,10 +276,7 @@ void (*spu_take_interrupt(spu_context* ctx,
                           void (*tf)(spu_context*)))(spu_context*)
 {
     /* Stall-and-notify still settling: let the SPU run on (see above). */
-    if (g_sn_defer && g_sn_defer_ctx == (void*)ctx) {
-        if (--g_sn_defer == 0) g_sn_defer_ctx = 0;
-        return tf;
-    }
+    if (ctx->sn_defer) { ctx->sn_defer--; return tf; }
     uint32_t w = spu_ls_get32(ctx->ls, 0);   /* vector word at LS 0 */
     uint32_t op9 = w >> 23;          /* top 9 opcode bits */
     uint32_t target;

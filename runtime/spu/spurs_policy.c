@@ -116,6 +116,11 @@ static uint8_t s_pm_hold[SPURS_PM_MAX_WKL_][6];
 static volatile unsigned s_pm_runs[SPURS_PM_MAX_WKL_][6], s_pm_hold_reent[SPURS_PM_MAX_WKL_][6];
 /* i contesti e i flag "in corsa" di spu_run_policy_module, per il dump */
 static spu_context* (*s_pm_ctx_pub)[6]; static uint8_t (*s_pm_busy_pub)[6];
+/* SONDA s.52: le ultime 16 corse del PM per (wid, SPU), stampate al fermo:
+ * f=entrata fresca, h=hold all'entrata, 1330 (indirizzo del codice del job in
+ * LS) all'entrata/uscita, casella della job list all'uscita, LS 0x12A0, uscita. */
+typedef struct { unsigned run; uint8_t fresh, hold, exited; uint16_t slot; uint32_t e1330, x1330, x12a0; } pm_rec;
+static pm_rec s_pm_ring[SPURS_PM_MAX_WKL_][6][16];
 
 /* cellSpursRemoveWorkload: il kernel vero scarica il policy module; il
  * prossimo AddWorkload sullo stesso wid (Uncharted lo fa ~700 volte, edge
@@ -191,6 +196,14 @@ static DWORD WINAPI spurs_stall_dump_thread(LPVOID p)
     for (;;) {
         Sleep(1000);
         unsigned f = rsx_backend_frame_no();
+        { static int shim_done = 0;   /* s.52: lo shim di salvataggio registri del PM, una volta */
+          if (!shim_done && f >= 1000 && s_pm_ctx_pub)
+              for (int w = 0; w < SPURS_PM_MAX_WKL_ && !shim_done; w++) for (int n = 0; n < 6 && !shim_done; n++) {
+                  spu_context* c = s_pm_ctx_pub[w][n];
+                  if (!c || !spu_ls_get32(c->ls, 0x3FEC0)) continue;
+                  shim_done = 1; fprintf(stderr, "[stall-dump] shim 0x3FEC0 (wid=%d spu=%d):", w, n);
+                  for (uint32_t a = 0x3FEC0; a < 0x40000; a += 4) fprintf(stderr, " %08X", spu_ls_get32(c->ls, a));
+                  fprintf(stderr, "\n"); } }
         if (f != last || f < 100) { last = f; same = 0; continue; }
         if (++same == secs) {
             fprintf(stderr, "[stall-dump] fotogramma #%u fermo da %d s\n", f, secs);
@@ -202,6 +215,25 @@ static DWORD WINAPI spurs_stall_dump_thread(LPVOID p)
                 for (int n = 0; n < 6; n++) fprintf(stderr, " %u/%u/%u", s_pm_runs[w][n], s_pm_hold_reent[w][n], s_pm_hold[w][n]);
                 fprintf(stderr, " | lista 0x%llX..\n", (unsigned long long)s_pm_data[w][0]);
             }
+            for (int w = 0; w < SPURS_PM_MAX_WKL_; w++) for (int n = 0; n < 6; n++) {
+                unsigned r = s_pm_runs[w][n]; if (!r) continue;
+                const pm_rec* last = &s_pm_ring[w][n][(r - 1) & 15];
+                int any = 0; for (int k = 0; k < 16; k++) any |= s_pm_ring[w][n][k].slot != 0xFFFF && s_pm_ring[w][n][k].run;
+                if (!any) continue;
+                fprintf(stderr, "[stall-dump] storia wid=%d spu=%d (run f h slot 1330in>out 12A0 esc):", w, n);
+                for (int k = 0; k < 16; k++) { const pm_rec* q = &s_pm_ring[w][n][(r + k) & 15]; if (!q->run) continue;
+                    fprintf(stderr, " | %u %u %u %04X %X>%X %08X %u", q->run, q->fresh, q->hold, q->slot, q->e1330, q->x1330, q->x12a0, q->exited); }
+                fprintf(stderr, "\n"); (void)last;
+            }
+            /* s.52: lo shim di salvataggio registri che il PM genera a LS 0x3FEC0
+             * (una volta sola): quali registri salva davvero? */
+            { static int once = 0;
+              for (int w = 0; w < SPURS_PM_MAX_WKL_ && !once; w++) for (int n = 0; n < 6 && !once; n++) {
+                  spu_context* c = s_pm_ctx_pub ? s_pm_ctx_pub[w][n] : 0;
+                  if (!c || !spu_ls_get32(c->ls, 0x3FEC0)) continue;
+                  once = 1; fprintf(stderr, "[stall-dump] shim 0x3FEC0 (wid=%d spu=%d):", w, n);
+                  for (uint32_t a = 0x3FEC0; a < 0x40000; a += 4) fprintf(stderr, " %08X", spu_ls_get32(c->ls, a));
+                  fprintf(stderr, "\n"); } }
             /* corse del PM ancora in volo: pc dell'ultimo salto, 8 campioni a 2 ms */
             for (int w = 0; w < SPURS_PM_MAX_WKL_; w++) for (int n = 0; n < 6; n++) {
                 spu_context* c = s_pm_ctx_pub ? s_pm_ctx_pub[w][n] : 0;
@@ -322,6 +354,8 @@ int spu_run_policy_module(spu_lifted_entry_fn entry, int image_id,
             ctx->status = SPU_STATUS_STOPPED;
         }
     }
+    const uint8_t rec_fresh = (uint8_t)first, rec_hold = s_pm_hold[wid][spu_num];
+    const uint32_t rec_e1330 = spu_ls_get32(ctx->ls, 0x1330);
     s_pm_data[wid][spu_num] = wkl_data;
     ctx->image_id    = image_id;
     ctx->policy_mode = 1;
@@ -722,7 +756,11 @@ int spu_run_policy_module(spu_lifted_entry_fn entry, int image_id,
               fprintf(stderr, "[spurs-pm] wid=%u spu=%u esce col job 0x%X preso: contesto tenuto\n",
                       wid, spu_num, (vm_base[jl + 0x14 + 2 * spu_num] << 8) | vm_base[jl + 0x15 + 2 * spu_num]);
       }
-      s_pm_hold[wid][spu_num] = (uint8_t)hold; }
+      s_pm_hold[wid][spu_num] = (uint8_t)hold;
+      { unsigned r = s_pm_runs[wid][spu_num]; pm_rec* q = &s_pm_ring[wid][spu_num][r & 15];
+        q->run = r; q->fresh = rec_fresh; q->hold = rec_hold; q->exited = (uint8_t)g_spurs_pm_exited;
+        q->slot = (vm_base && jl) ? (uint16_t)((vm_base[jl + 0x14 + 2 * spu_num] << 8) | vm_base[jl + 0x15 + 2 * spu_num]) : 0xEEEE;
+        q->e1330 = rec_e1330; q->x1330 = spu_ls_get32(ctx->ls, 0x1330); q->x12a0 = spu_ls_get32(ctx->ls, 0x12A0); } }
 
     __atomic_fetch_add(&g_spu_hops_total, ctx->hops - hops0, __ATOMIC_RELAXED);
     __atomic_store_n(&s_pm_busy[wid][spu_num], 0, __ATOMIC_RELEASE);

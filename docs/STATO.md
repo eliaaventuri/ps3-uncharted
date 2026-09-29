@@ -1513,6 +1513,40 @@ o si duplica. Sospetti: SPU_SN_DEFER / g_sn_defer_ctx (globale, non per
 contesto!), list_stall_stat azzerato da un rdch del gestore d'interrupt mentre
 il codice di base aspetta, evento consumato con ie=0.
 
+**s.52-53, notte (30/09) -- il meccanismo del fermo sul wid 13.**
+Sonde nuove: `[stall-dump] storia wid= spu=` (ultime 16 corse del PM per
+(wid, SPU): run, entrata fresca, hold, casella all'uscita, LS 0x1330
+entrata>uscita, LS 0x12A0, uscita al kernel), `irq (S=salva R=ripristina)` e
+`livelli=` nell'assert (spu_stop_at), shim del PM stampato al fotogramma 1000.
+- s53a_1: corsa FRESCA del PM (13,1) prende il job 0xDD, NON esce al kernel
+  (assert 0x15B0/0x15B4/0x1664), LS 0x1330 in uscita = 0x04000200 (indirizzo
+  impossibile). s53c_1: in una corsa fresca di 38 passi, interrupt preso a
+  0x2E28 (attesa di evento), ripristino a 0x2E28, 5 passi dopo RunJob
+  (func_000033A0: `lqd r6, 0x20(LS[0x1330])` == 0xC0DEC0DE?) con LS 0x1330 = 0
+  -> 0x15B0. Il codice di base passa a Run senza che il Load sia registrato.
+- **Lo shim vero del PM** (LS 0x3FEC0, s53e): `lqa r0..r75` (76 istruzioni,
+  0x30FF3800.. = lqa rt=0..0x4B da 0x3F9C0..) + `bi r79`: ripristina SOLO
+  r0-r75. Il nostro ripristino rimetteva tutti i 128 registri, annullando gli
+  aggiornamenti del gestore a r76-r127. Ora (spu_drain.c
+  spu_irq_regs_maybe_restore) solo r0-r75 nei contesti policy_mode
+  (`SPU_IRQ_RESTORE_N=128` = come prima). Il gioco arriva al livello (s53f,
+  0 assert), ma col riproduttore **s53g 2 fermi su 2**: non basta.
+- Forma ricorrente (s53g_2, s52y): PM (13,1) tiene un job, LS 0x12A0 = 2,
+  0x12C0 = 1, ie=0, evmask=0x2 (aspetta SN), **nessuna lista parcheggiata**
+  (stall 0/0): la notifica SN che aspetta e' gia' stata consumata o mai
+  alzata. Il commento in spu_dma.h (stall-and-notify) descrive proprio la
+  corsa: noi eseguiamo la lista in linea e alziamo SN subito; se il gestore
+  d'interrupt la vede con loadJobState ancora kNone la scarta (clear-on-read
+  di ch25) e il Load resta appeso. `SPU_SN_DEFER` (ora per contesto:
+  `sn_defer` in coda a spu_context) con 3-4 NON serve: con 4 il gioco non
+  esce dal caricamento (s53b), con 3 fermi 2/3 (s52z).
+**Prossimo passo**: modellare la notifica SN come asincrona in modo fedele:
+dati copiati subito, ma bit SN (event_status 0x2 + list_stall_stat) resi
+visibili solo dopo N dispatch O appena la SPU legge un canale d'evento
+(SPU_RdEventStat, MFC_RdListStallStat, rchcnt) -- cosi' il codice di base
+finisce di armare lo stato prima che l'interrupt parta, senza cambiare cosa
+vede chi fa polling. Poi riprodurre (riproduttore sopra) e A/B.
+
 ## Storico
 
 Sessioni fino alla 37 e la vecchia "Dove siamo", verbatim, in

@@ -1072,7 +1072,7 @@ static inline int mfc_run_list(spu_context* spu, uint32_t elem_lsa,
               extern volatile unsigned g_sn_defer;
               extern unsigned spu_sn_defer_ticks(void);
               unsigned d = spu_sn_defer_ticks();
-              if (d) { g_sn_defer_ctx = (void*)spu; g_sn_defer = d; } }
+              if (d) spu->sn_defer = d; }   /* s.52: per contesto (il globale si sovrascriveva fra le lane) */
             spu_ch_wake(spu);
             extern volatile unsigned g_sn_defer;
             { static int _n = 0; if (_n++ < 16)
