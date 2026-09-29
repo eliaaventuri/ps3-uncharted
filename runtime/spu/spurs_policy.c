@@ -111,6 +111,9 @@ static uint64_t s_pm_data[SPURS_PM_MAX_WKL_][6];
 /* s.51: il PM e' uscito tenendo un job (casella di questa SPU nella job list
  * != 0xFFFF): la prossima corsa sullo stesso (wid, SPU) NON riparte fresca. */
 static uint8_t s_pm_hold[SPURS_PM_MAX_WKL_][6];
+/* SONDA s.52: corse del PM per (wid, SPU) e rientri con un job tenuto;
+ * stampati da spurs_stall_dump_thread. */
+static volatile unsigned s_pm_runs[SPURS_PM_MAX_WKL_][6], s_pm_hold_reent[SPURS_PM_MAX_WKL_][6];
 
 /* cellSpursRemoveWorkload: il kernel vero scarica il policy module; il
  * prossimo AddWorkload sullo stesso wid (Uncharted lo fa ~700 volte, edge
@@ -163,6 +166,33 @@ void spurs_pm_dump_lists(uint32_t pm_size)
     }
 }
 
+/* SPURS_STALL_DUMP=<s> (s.52): se i fotogrammi non avanzano per s secondi,
+ * stampa una volta le job list (spurs_pm_dump_lists) senza sonde sulle righe,
+ * che spostano i tempi. Si riarma quando i fotogrammi ripartono. */
+static DWORD WINAPI spurs_stall_dump_thread(LPVOID p)
+{
+    extern unsigned rsx_backend_frame_no(void);
+    int secs = (int)(intptr_t)p, same = 0; unsigned last = 0;
+    for (;;) {
+        Sleep(1000);
+        unsigned f = rsx_backend_frame_no();
+        if (f != last || f < 100) { last = f; same = 0; continue; }
+        if (++same == secs) {
+            fprintf(stderr, "[stall-dump] fotogramma #%u fermo da %d s\n", f, secs);
+            spurs_pm_dump_lists(0x2F80);
+            for (int w = 0; w < SPURS_PM_MAX_WKL_; w++) {
+                int any = 0; for (int n = 0; n < 6; n++) any |= s_pm_runs[w][n] != 0;
+                if (!any) continue;
+                fprintf(stderr, "[stall-dump] wid=%d corse/rientri-con-job/hold per spu:", w);
+                for (int n = 0; n < 6; n++) fprintf(stderr, " %u/%u/%u", s_pm_runs[w][n], s_pm_hold_reent[w][n], s_pm_hold[w][n]);
+                fprintf(stderr, " | lista 0x%llX..\n", (unsigned long long)s_pm_data[w][0]);
+            }
+            fflush(stderr);
+        }
+    }
+    return 0;
+}
+
 int spu_run_policy_module(spu_lifted_entry_fn entry, int image_id,
                           const uint8_t* pm_host, uint32_t pm_size,
                           uint64_t wkl_data, uint32_t wid, uint32_t spurs_ea,
@@ -187,6 +217,8 @@ int spu_run_policy_module(spu_lifted_entry_fn entry, int image_id,
     static spu_context* s_pm_ctx[SPURS_PM_MAX_WKL][6];
     if (wid >= SPURS_PM_MAX_WKL || spu_num >= 6) return -1;
     spu_context* ctx = s_pm_ctx[wid][spu_num];
+    s_pm_runs[wid][spu_num]++;
+    if (s_pm_hold[wid][spu_num]) s_pm_hold_reent[wid][spu_num]++;
     int first = 0;
     /* SONDA s.51: due lane sullo stesso contesto (stessa LS) insieme? */
     static uint8_t s_pm_busy[SPURS_PM_MAX_WKL][6];
@@ -363,6 +395,11 @@ int spu_run_policy_module(spu_lifted_entry_fn entry, int image_id,
      * job list sotto e' campionato, e da un campione non si sa quali liste il
      * manager veda davvero: e' la stessa trappola del conteggio per workload. */
     s_last_spurs = spurs_ea;
+    { static int s_sd_started;
+      if (!__atomic_exchange_n(&s_sd_started, 1, __ATOMIC_ACQ_REL)) {
+          const char* e = getenv("SPURS_STALL_DUMP"); int secs = (e && atoi(e) > 0) ? atoi(e) : 0;
+          if (secs) { HANDLE h = CreateThread(NULL, 0, spurs_stall_dump_thread, (LPVOID)(intptr_t)secs, 0, NULL);
+                      if (h) CloseHandle(h); } } }
     { int known = 0;
       for (int k = 0; k < s_seen_n; k++) if (s_seen[k] == wkl_data) { known = 1; break; }
       if (!known && s_seen_n < 32) {

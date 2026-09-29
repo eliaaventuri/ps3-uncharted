@@ -199,6 +199,20 @@ void spu_stop_at(spu_context* ctx, uint32_t addr)
                           ctx->gpr[i]._u32[0]);
         snprintf(b + q, sizeof(b) - q, "\n");
         fputs(b, stderr); fflush(stderr);
+        /* SPU_ASSERT_LINE=<n> (s.52): anche la riga da 128 byte in memoria
+         * all'EA in rn e la copia in LS 0x80 (l'assert 0x423C del job 008ff700
+         * controlla una voce di job list letta con GETLLAR da EA r9 a LS 0x80). */
+        { static int reg = -2; if (reg == -2) { const char* e = getenv("SPU_ASSERT_LINE"); reg = e ? atoi(e) : -1; }
+          extern uint8_t* vm_base; uint32_t ea = reg >= 0 && reg < 128 ? ctx->gpr[reg]._u32[0] & ~127u : 0;
+          if (vm_base && ea >= 0x10000u && ea < 0xC0000000u) {
+              fprintf(stderr, "         riga EA 0x%08X:", ea);
+              for (int i = 0; i < 128; i += 4) fprintf(stderr, "%s%02X%02X%02X%02X", (i % 32) ? " " : "\n          ",
+                      vm_base[ea + i], vm_base[ea + i + 1], vm_base[ea + i + 2], vm_base[ea + i + 3]);
+              fprintf(stderr, "\n         LS 0x80:");
+              for (int i = 0; i < 128; i += 4) fprintf(stderr, "%s%02X%02X%02X%02X", (i % 32) ? " " : "\n          ",
+                      spu_ls_get8(ctx->ls, 0x80 + i), spu_ls_get8(ctx->ls, 0x81 + i), spu_ls_get8(ctx->ls, 0x82 + i), spu_ls_get8(ctx->ls, 0x83 + i));
+              fprintf(stderr, "\n"); fflush(stderr);
+          } }
         spu_adma_dump(ctx);
     }
     spu_stop(ctx);

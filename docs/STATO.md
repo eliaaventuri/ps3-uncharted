@@ -1,6 +1,6 @@
 # Stato del progetto
 
-Ultimo aggiornamento: **28 settembre 2026** — sessione 51 (forma 3 dello stallo risolta: incremento non atomico del PPU; 22/22 corse sotto carico senza fermi).
+Ultimo aggiornamento: **29 settembre 2026** — sessione 52 (stallo sotto carico ancora ~1 su 3: due cause, assert 0x423C del job 008ff700 e job tenuti dal PM; vedi "Sessione 52").
 
 ## Dove siamo
 
@@ -8,9 +8,9 @@ Ultimo aggiornamento: **28 settembre 2026** — sessione 51 (forma 3 dello stall
 (`dive-boat`): menu, "New Game", salvataggio, livello con HUD, Drake intero,
 morte e ripartenza dal checkpoint, audio senza click. Circa 28 fps (~7.000
 fotogrammi in 200 s). Lo stallo intermittente (fotogrammi fermi, ~1 corsa su
-3-4 sotto carico) era un incremento non atomico del PPU su una barriera WWS:
-corretto in s.51, poi 22/22 corse sotto carico senza fermi (da confermare
-su lotti piu' lunghi).
+3-4 sotto carico) aveva come causa principale un incremento non atomico del
+PPU su una barriera WWS (corretto in s.51); senza carico ora 12/12 OK, ma
+sotto carico restano fermi da altre due cause (s.52).
 
 Le tappe, in una riga ciascuna (dettagli nelle sezioni delle sessioni; quelle
 fino alla 37 stanno in `docs/STATO_STORICO.md`):
@@ -1353,6 +1353,49 @@ quando la SPU cambia un solo blocco da 16 byte: il PPU scrive le righe senza
 lock e uno store fra il confronto e la copia veniva cancellato. Scatta davvero
 (in ogni corsa, ~95 volte su 0x1057BF80, una su 0x106F0780), ma A/B s51c 6+6:
 fermi 1/6 contro 1/6. Tenuto: e' la semantica del ferro.
+
+**Sessione 52 (29/09) -- lo stallo NON e' chiuso: restano due cause.**
+Lotti col binario corretto (--atomic-inc16): s52a senza carico **12/12 OK**;
+s52b sotto carico 1 OK, poi s52b_2 = **crash** (non fermo), s52b_3 fermo
+(interrotto); s52c (SPURS_STALL_DUMP=10) **2 fermi su 2**. Il 22/22 della
+s.51 era fortuna: sotto carico il fermo e' ancora ~1 corsa su 3.
+Strumenti nuovi:
+- `SPURS_STALL_DUMP=<s>` (spurs_policy.c): thread che guarda
+  rsx_backend_frame_no(); fermo da s secondi -> spurs_pm_dump_lists + per ogni
+  wid `corse/rientri-con-job/hold` per SPU. Sostituisce FC_DUMP (lldb con
+  `expr spurs_pm_dump_lists` si impianta per sempre: il processo fermo nel
+  debugger tiene il lock di stderr; s52b_3 perso cosi').
+- `SPU_ASSERT_LINE=<reg>` (spu_channels.c, spu_stop_at): all'assert stampa
+  la riga da 128 byte all'EA in r<reg> e la LS 0x80.
+- I crash lasciano il rapporto di macOS in ~/Library/Logs/DiagnosticReports
+  (uncharted-*.ips): pila host completa del thread che crasha.
+**Causa A -- job 008ff700 (ovl 217), assert stopd @0x423C.** In
+func_00004038 il job fa GETLLAR della riga EA r9 & ~127 (LS 0x80) e pretende
+che la doubleword a r33 (LS 0x80 + (r33 & 0x78)) sia ZERO (due parole = 0,
+`gb`/`cgti 11`), altrimenti stopd. Nei log r9 = **0x10696E80** (intestazione
+della job list del wid 12) e r4 = 0xA0 -> voce 0 a +0x20: il job aggiunge un
+job alla lista del wid 12 e trova la casella gia' piena. Statistica su tutti
+i lotti s51/s52: l'assert 0x423C compare in 10 corse, **9 finiscono in
+fermo o crash**; e' ~1/5 dei fermi registrati. Il crash (3 volte: s44st8_7,
+s51X_3, s52b_2) e' SEMPRE dopo questo assert, nello stesso job e funzione:
+jobmod_008ff700 func_00004038 +0x2a44 -> spu_wrch_slow, GETLLAR (cmd 0xD0) a
+LS r107 da EA r17 = r50 & ~127 = **0xFFFCA080** (lifted: loc_00006540,
+riga ~2850 di spu_jobs/lifted/jobmod_008ff700_141ce50dac0a/spu_recomp.c).
+Il PPU azzera quelle voci con std (write64 = 0, YDKJ_WWATCH=0x10696EA0 LEN=8:
+solo scritture di zero dal PPU; le voci non nulle le scrive la SPU col
+PUTLLC). Ipotesi da verificare: azzeramento del PPU (ResetList) che si
+incrocia col PUTLLC di AddJob della SPU (commit per byte quando cambiano
+piu' blocchi da 16 byte: nessun CAS). In corso: lotto s52e con
+SPU_ASSERT_LINE=9 + YDKJ_WWATCH=0x10696EA0.
+**Causa B -- forma 1 (job preso e mai rilasciato), s52c_1.** Lista wid 12
+0x106AFE80: `042C042C 0314FFFF FFFF0315` = SPU 0 sul job 0x314, SPU 3 sul
+0x315 (stessi indici di s51L_3!). Il log dice `esce col job 0x314/0x315
+preso: contesto tenuto` (SPURS_PM_HOLD scatta) e la lista del wid 12 e' ancora
+quella (wid-joblist arg=0x106AFE80), ma nessuna lane e' dentro un job: tutte
+e sei nel PM. Da capire se i contesti tenuti vengono mai rieseguiti (ora
+`[stall-dump] wid=12 corse/rientri-con-job/hold`). s52c_2 (fermo @#593,
+wid 8 lista 0x10695C80, SPU 2 sul job 0, nessun "contesto tenuto") segue due
+assert: 0x423C (causa A) e il PM @0x1660.
 
 ## Storico
 
