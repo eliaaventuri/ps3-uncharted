@@ -49,7 +49,10 @@ Invio = START); `PAD_SCRIPT` per le corse senza nessuno.
 
 ## Il materiale
 
-- ISO: `~/Documents/Uncharted - Drake's Fortune (Europe, Australia) ....iso`
+- ISO: `/Volumes/SanDisk/Giochi/ISO/Uncharted - Drake's Fortune (Europe, Australia) ....iso`
+  (dal 29/09/2026 progetto, dati e ISO stanno sulla SSD SanDisk; `~/Documents/Coding/ps3-uncharted`
+  e `~/Documents/Coding/uncharted-data` sono symlink, quindi gli script con i vecchi percorsi funzionano.
+  Verificato dopo lo spostamento: build, scaffold, `--draw` Metal, `build.sh` e corsa da 160 s OK, #6684)
   (21 GB, **BCES00065**). Montato in sola lettura:
   `hdiutil attach -readonly -nobrowse -noverify -mountpoint /tmp/uc_iso "<iso>"`.
 - Dati di lavoro **fuori dal repo**, in `~/Documents/Coding/uncharted-data/`:
