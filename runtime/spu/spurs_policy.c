@@ -240,8 +240,9 @@ static DWORD WINAPI spurs_stall_dump_thread(LPVOID p)
                 if (!c || !__atomic_load_n(&s_pm_busy_pub[w][n], __ATOMIC_RELAXED)) continue;
                 fprintf(stderr, "[stall-dump] in volo wid=%d spu=%d pc:", w, n);
                 for (int k = 0; k < 8; k++) { fprintf(stderr, " %05X", c->pc & SPU_LS_MASK); Sleep(2); }
-                fprintf(stderr, " ie=%u evmask=0x%X evstat=0x%X tagmask=0x%X stall=0x%X/0x%X LS12A0=%08X LS12C0=%08X\n",
+                fprintf(stderr, " ie=%u evmask=0x%X evstat=0x%X tagmask=0x%X stall=0x%X/0x%X snpend=0x%X/%u LS12A0=%08X LS12C0=%08X\n",
                         c->int_enable, c->event_mask, c->event_status, c->mfc_tag_mask, c->list_stall_mask, c->list_stall_stat,
+                        c->sn_pend, c->sn_pend_ticks,
                         spu_ls_get32(c->ls, 0x12A0), spu_ls_get32(c->ls, 0x12C0));
             }
             fflush(stderr);

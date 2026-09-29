@@ -193,6 +193,27 @@ void spu_img_restore(spu_context* ctx, int32_t saved_img)
 void* volatile   g_sn_defer_ctx = 0;
 volatile unsigned g_sn_defer     = 0;
 
+/* s.53: SPU_SN_ASYNC=<n> dispatch prima che SN diventi visibile (0 = subito,
+ * come prima). Vedi spu_sn_publish in spu_context.h. Spenta: misurata col
+ * riproduttore 4/8 fermi contro 2/8 con SN immediata (s53j/s53k). */
+unsigned spu_sn_async_ticks(void)
+{
+    static int s_n = -1;
+    if (s_n < 0) { const char* e = getenv("SPU_SN_ASYNC"); s_n = e ? atoi(e) : 0; }
+    return (unsigned)(s_n < 0 ? 0 : s_n);
+}
+
+/* Sonda s.53: 0 = pubblicata a fine conteggio, 1 = da una lettura di canale d'evento. */
+void spu_sn_probe(spu_context* ctx, int why)
+{
+    static unsigned n = 0; unsigned k = __atomic_fetch_add(&n, 1, __ATOMIC_RELAXED);
+    if (k < 24 || (k & (k - 1)) == 0)
+        fprintf(stderr, "[sn-async] #%u pubblica %s img=%d pc=0x%05X pend=0x%X ticks=%u ie=%u evmask=0x%X LS12A0=%08X\n",
+                k + 1, why ? "LETTURA" : "CONTEGGIO", ctx->image_id, ctx->pc & SPU_LS_MASK,
+                ctx->sn_pend, ctx->sn_pend_ticks, ctx->int_enable, ctx->event_mask,
+                spu_ls_get32(ctx->ls, 0x12A0));
+}
+
 unsigned spu_sn_defer_ticks(void)
 {
     static int s_n = -1;
@@ -465,6 +486,7 @@ void spu_drain_fast(spu_context* ctx)
     void (*tf)(spu_context*);
     while ((tf = g_spu_trampoline_fn) != 0) {
         ctx->hops++;
+        spu_sn_tick(ctx);
         int irq = (ctx->int_enable && (ctx->event_status & ctx->event_mask)) ? 1 : 0;
         if (!irq && retlink && ctx->host_depth > 0 && ctx->ret_link &&
             ((uint32_t)ctx->pc & SPU_LS_MASK) == ctx->ret_link) {

@@ -1547,6 +1547,43 @@ visibili solo dopo N dispatch O appena la SPU legge un canale d'evento
 finisce di armare lo stato prima che l'interrupt parta, senza cambiare cosa
 vede chi fa polling. Poi riprodurre (riproduttore sopra) e A/B.
 
+**s.53, notte (29/09) -- notifica SN asincrona: fatta, misurata, NON aiuta.**
+Implementazione (`SPU_SN_ASYNC=<n>`, default 0 = spenta): in mfc_run_list il
+bit di stall va in `ctx->sn_pend` (campi `sn_pend`/`sn_pend_ticks` in coda a
+spu_context) invece che in list_stall_stat/event_status; `spu_sn_publish`
+(spu_context.h) lo rende visibile dopo n passi (`spu_sn_tick` nel ciclo del
+drain veloce e completo, e a ogni rdch/rchcnt/wrch) oppure subito a una
+lettura di SPU_RdEventStat / MFC_RdListStallStat (rdch, rchcnt, mfc_channel_read).
+Sonda `[sn-async]` (spu_drain.c spu_sn_probe) a ogni pubblicazione, snpend nel
+`[stall-dump] in volo`.
+- Primo tentativo (s53h, s53i_1): il gioco si ferma nel CARICAMENTO (#82-#98),
+  0 pubblicazioni: il PM aspetta in un giro di trasferimenti in linea
+  (SPU_XIND / spu_xfer_ok) che non passa mai dal drain ne' da un canale, e
+  sn_pend resta appeso per sempre. Probabilmente la stessa causa di
+  SPU_SN_DEFER=4 (s53b). Correzione: `!ctx->sn_pend` in spu_xfer_ok, che fa
+  passare dal drain finche' SN e' in arrivo. Poi s53i_2: #4241 in 90 s, tutte
+  le pubblicazioni sono per CONTEGGIO, con ie=0 evmask=0x2, pc 0x2D58/0x2448
+  del PM (nessuna per lettura).
+- **Riproduttore, 8+8 corse, stesse condizioni** (stress_lotto 8 8,
+  PS3_MAIN_QOS=utility, SPURS_STALL_DUMP=10): **B = SPU_SN_ASYNC=64 (s53j):
+  4 fermi su 8** (#2231, #2366, #2906, #4017); **A = SPU_SN_ASYNC=0 (s53k):
+  2 fermi su 8** (#4559, #3171). Stessa forma in tutti: wid 13, una SPU tiene
+  un job del modulo 0x1012EA40 (ovl 216), job 0x13F/0x192/0x179/0x65 in B, 0x183 in A.
+- Cambia la forma del fermo: in A il PM che tiene il job e' quello noto
+  (02F38/1D20/2F04, ie=0, evmask=0x2, LS12A0=2, LS12C0=1: aspetta SN). In B
+  nessun PM aspetta piu' SN con LS12A0=2 (snpend=0 ovunque). s53j_2: chi tiene
+  il job gira a LS 0x14/0x3000/0x3008/0x2A68 con **ie=1**, evmask=0x2,
+  tagmask=0x80000000, LS12C0=0xFFFFFFF1. In s53j_4/8 chi tiene il job non e'
+  nemmeno "in volo". Il fermo si sposta ma resta.
+- Variabilita': i lotti A precedenti davano 3/4 (s52y) e 2/2 (s53g); 2/8 di
+  s53k dice che 8 corse per lato sono il minimo per un confronto.
+- Da notare: s53j_5 ha fatto #18209 fotogrammi in 160 s (gli altri ~5.000):
+  da capire se e' un altro stato del gioco (menu?) prima di usarla come misura.
+**Prossimo passo**: l'ipotesi "SN persa per tempismo" non spiega i fermi (B
+non li riduce e cambia solo chi aspetta). Seguire il job di ovl 216 che resta
+tenuto: dove si trova il SUO pc quando si ferma (sonda sul contesto che tiene
+il job, non sul PM), e perche' LS12C0 vale 0xFFFFFFF1 in s53j_2.
+
 ## Storico
 
 Sessioni fino alla 37 e la vecchia "Dove siamo", verbatim, in

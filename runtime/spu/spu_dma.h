@@ -1060,8 +1060,13 @@ static inline int mfc_run_list(spu_context* spu, uint32_t elem_lsa,
             spu->list_stall_ea_base[t]   = ea_base;
             spu->list_stall_cmd[t]       = base_cmd;
             spu->list_stall_mask |= (1u << t);  /* this tag now has a parked list */
+            { extern unsigned spu_sn_async_ticks(void);   /* s.53: SN asincrona */
+              unsigned a = spu_sn_async_ticks();
+              if (a) { spu->sn_pend |= (1u << t); if (!spu->sn_pend_ticks) spu->sn_pend_ticks = a; }
+              else {
             spu->list_stall_stat |= (1u << t);  /* accumulate into the notify mask */
             spu->event_status    |= 0x2u;       /* SPU_EVENT_SN stall-and-notify */
+              } }
             /* Real MFC runs a queued list asynchronously, so the notify lands
              * AFTER the arming code finishes. We run it inline here, so hold the
              * resulting interrupt off for a few drain ticks -- otherwise the WWS
@@ -1764,6 +1769,7 @@ static inline uint32_t mfc_channel_read(mfc_engine* mfc, spu_context* spu,
         /* Accumulated tag-group mask of newly-stalled lists. Reading returns
          * the mask and clears it (RPCS3 ch_stall_stat semantics); the interrupt
          * handler's IhcLoop then drains every set bit, acking each via ch26. */
+        spu_sn_publish(spu);                 /* s.53: una lettura rende visibile SN in arrivo */
         uint32_t m = spu->list_stall_stat;
         spu->list_stall_stat = 0;
         return m;

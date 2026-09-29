@@ -1010,6 +1010,7 @@ static __attribute__((noinline)) void spu_wrch_slow(spu_context* ctx, uint32_t c
  * ~680 campioni su 37.000 (xctrace, s.49) di solo prologo/epilogo. */
 void spu_wrch(spu_context* ctx, uint32_t channel, u128 value)
 {
+    spu_sn_tick(ctx);   /* s.53 */
     if (__builtin_expect(s_wrch_hist == 0, 1)) {
         uint32_t v = value._u32[0];
         switch (channel) {
@@ -1167,6 +1168,8 @@ static void spu_ch_wait(spu_context* ctx, uint32_t channel, const char* op)
  * ===========================================================================*/
 u128 spu_rdch(spu_context* ctx, uint32_t channel)
 {
+    if (channel == SPU_RdEventStat || channel == MFC_RdListStallStat) spu_sn_publish(ctx);   /* s.53 */
+    else spu_sn_tick(ctx);
     { static int s_c = -1; if (s_c < 0) s_c = getenv("SPU_CHHIST") ? 1 : 0;
       if (s_c) { static unsigned long long r[128]; static unsigned long long n;
           r[channel & 127]++;
@@ -1276,6 +1279,8 @@ u128 spu_rdch(spu_context* ctx, uint32_t channel)
  * ===========================================================================*/
 uint32_t spu_rchcnt(spu_context* ctx, uint32_t channel)
 {
+    if (channel == SPU_RdEventStat || channel == MFC_RdListStallStat) spu_sn_publish(ctx);   /* s.53 */
+    else spu_sn_tick(ctx);
     { static int s_t = -1; if (s_t < 0) s_t = getenv("YDKJ_POLLTRACE") ? 1 : 0;
       if (s_t) { static uint64_t s_cnt[8] = {0}; static uint64_t s_total = 0;
         int b = (channel==SPU_RdInMbox)?0:(channel==SPU_RdEventStat)?1:(channel==SPU_RdSigNotify1)?2:

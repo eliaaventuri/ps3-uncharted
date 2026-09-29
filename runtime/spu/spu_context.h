@@ -384,6 +384,8 @@ typedef struct spu_context {
     uint32_t irq_hist_i;
     uint64_t irq_hist_steps[16];
     uint32_t sn_defer;                    /* s.52: tick di rinvio dell'interrupt SN, per contesto (SPU_SN_DEFER) */
+    uint32_t sn_pend;                     /* s.53: bit di list_stall_stat gia' arrivati ma non ancora visibili (SPU_SN_ASYNC) */
+    uint32_t sn_pend_ticks;               /* s.53: dispatch/accessi a canale che mancano alla pubblicazione */
 } spu_context;
 
 /* Reserved LS addresses (inside the kernel area, below the 0xA00 policy-module
@@ -935,6 +937,28 @@ void spu_task_launch_check(spu_context* ctx, void* fn); /* SPURS task-launch    
 void spu_img_restore(spu_context* ctx, int32_t saved_img);
 /* Wake a host thread blocked in a channel wait (channel-stall milestone). */
 void spu_ch_wake(spu_context* ctx);
+/* s.53: notifica SN asincrona. mfc_run_list esegue la lista in linea, ma sul
+ * ferro la lista gira in coda all'MFC e SN arriva DOPO che il codice di base
+ * ha finito di armare lo stato del Load. Il bit resta in sn_pend e diventa
+ * visibile (list_stall_stat + event_status 0x2) dopo SPU_SN_ASYNC dispatch o
+ * accessi a canale, oppure subito alla prima lettura di un canale d'evento:
+ * chi fa polling vede quello di prima, l'interrupt parte piu' tardi. */
+void spu_sn_probe(spu_context* ctx, int why);
+static inline void spu_sn_publish(spu_context* ctx)
+{
+    if (!ctx->sn_pend) return;
+    spu_sn_probe(ctx, ctx->sn_pend_ticks == 0 ? 0 : 1);
+    ctx->list_stall_stat |= ctx->sn_pend;
+    ctx->event_status    |= 0x2u;
+    ctx->sn_pend = 0;
+    ctx->sn_pend_ticks = 0;
+    spu_ch_wake(ctx);
+}
+static inline void spu_sn_tick(spu_context* ctx)
+{
+    if (__builtin_expect(ctx->sn_pend != 0, 0) && --ctx->sn_pend_ticks == 0)
+        spu_sn_publish(ctx);
+}
 /* Runaway lifted-call recursion guard. A lifted brsl/bisl nests a real host
  * call frame, so an SPU loop the lifter lowered as a CALL rather than a
  * transfer recurses until the host stack dies -- surfacing as a bare
@@ -1050,6 +1074,7 @@ static inline int spu_xfer_ok(spu_context* ctx)
 {
     return g_spu_xfer_inline &&
            !(ctx->int_enable && (ctx->event_status & ctx->event_mask)) &&
+           !ctx->sn_pend &&   /* s.53: SN in arrivo, il conteggio avanza nel drain */
            !(ctx->host_depth > 0 && ctx->ret_link &&
              ((uint32_t)ctx->pc & SPU_LS_MASK) == ctx->ret_link) &&
            g_pm_flow_ctx != (void*)ctx;
@@ -1090,6 +1115,7 @@ static inline void (*spu_ib_inline(spu_context* ctx))(spu_context*)
         spu_depth_guard(ctx);                                  \
         while (g_spu_trampoline_fn) {                           \
             (ctx)->hops++;                                                    \
+            spu_sn_tick(ctx);                                                 \
             /* L'interrupt si prende PRIMA delle scorciatoie di ritorno.      \
              * Sull'hardware un interrupt abilitato e pendente entra fra due  \
              * istruzioni qualunque, ritorno compreso; qui invece le due      \
