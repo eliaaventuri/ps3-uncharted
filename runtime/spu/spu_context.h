@@ -386,6 +386,17 @@ typedef struct spu_context {
     uint32_t sn_defer;                    /* s.52: tick di rinvio dell'interrupt SN, per contesto (SPU_SN_DEFER) */
     uint32_t sn_pend;                     /* s.53: bit di list_stall_stat gia' arrivati ma non ancora visibili (SPU_SN_ASYNC) */
     uint32_t sn_pend_ticks;               /* s.53: dispatch/accessi a canale che mancano alla pubblicazione */
+    /* s.53 SPU_LSWATCH: cambi di LS 0x12A0 (loadJobState) e 0x1330 (job da
+     * eseguire) del PM visti al dispatch, con pc, ie e livelli d'interrupt */
+    uint32_t lsw_i, lsw_prev_a, lsw_prev_b;
+    uint32_t lsw_pc[32], lsw_a[32], lsw_b[32], lsw_f[32], lsw_c[32], lsw_prev_c;
+    uint64_t lsw_steps[32];
+    uint64_t cmd_ea, cmd_steps;           /* s.53: ultimo GET che ha coperto LS 0xC00 (comandi del job) */
+    uint32_t cmd_lsa, cmd_size;
+    uint8_t  cmd_snap[48];                /* s.53: i byte in memoria al momento del GET verso 0xC00 */
+    uint32_t dmah_i;                      /* s.53: ultimi 16 DMA del PM (lsa, ea, size|cmd<<16, passo) */
+    uint32_t dmah_lsa[16], dmah_ea[16], dmah_sc[16];
+    uint64_t dmah_steps[16];
 } spu_context;
 
 /* Reserved LS addresses (inside the kernel area, below the 0xA00 policy-module
@@ -937,6 +948,8 @@ void spu_task_launch_check(spu_context* ctx, void* fn); /* SPURS task-launch    
 void spu_img_restore(spu_context* ctx, int32_t saved_img);
 /* Wake a host thread blocked in a channel wait (channel-stall milestone). */
 void spu_ch_wake(spu_context* ctx);
+extern int g_spu_lswatch;
+void spu_lswatch(spu_context* ctx, uint32_t tag);
 /* s.53: notifica SN asincrona. mfc_run_list esegue la lista in linea, ma sul
  * ferro la lista gira in coda all'MFC e SN arriva DOPO che il codice di base
  * ha finito di armare lo stato del Load. Il bit resta in sn_pend e diventa

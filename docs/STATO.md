@@ -1584,6 +1584,92 @@ non li riduce e cambia solo chi aspetta). Seguire il job di ovl 216 che resta
 tenuto: dove si trova il SUO pc quando si ferma (sonda sul contesto che tiene
 il job, non sul PM), e perche' LS12C0 vale 0xFFFFFFF1 in s53j_2.
 
+**s.53, mattina (30/09) -- dentro il PM: il gestore esegue comandi sbagliati.**
+Disassemblato del PM: `~/Documents/Coding/uncharted-data/pm.bin` (LS 0xA00..,
+estratto da spu_all/spurs_policy.elf) e `pm.s` (tools/spu_disasm.py --base 0xA00).
+Mappa utile:
+- Gestore d'interrupt 0xA34: salva r76-r79 a 0x3FE80, genera lo shim di
+  salvataggio a 0x3FEC0 (brasl r79), chiama 0x2468, genera lo shim di
+  ripristino (`lqa r0..r75` + `bi r79`), rilegge r76-r79, `binz r78,r78`, irete.
+  Il gestore NON legge ne' modifica l'area di salvataggio in LS: l'ipotesi
+  "il gestore cambia i registri salvati e noi li perdiamo" e' SCARTATA.
+- 0x2468 (corpo): rdch EventStat/ack, rchcnt+rdch ListStallStat con ack per
+  bit; se stall tag 0 e 12A0==1 -> 12A0=2 (0x24CC); se 12A0==2 -> chiama
+  0x2EF8 (0x2524).
+- 0x2EF8: salva r0 in LS 0x1540 (globale, non stack!), aspetta tag 3, chiama
+  0x1BB0 (interprete dei comandi del job in LS 0xC00, 8 byte l'uno, tabella
+  di salto a 0x1590: tipo = (cmd>>7)&28 -> 0x2418 fine/nop, 0x1C20, 0x1D20,
+  0x22B0 (0x600: controlla le caselle 0xDF0+set*64 bit 0x8000 -> assert
+  0x1644/0x1648), 0x2368, 0x23BC (0xA00: "esegui", scrive LS 0x1330 =
+  indirizzo del job), 0x1604); se torna r3!=0 -> 12A0=3.
+- Codice di base, ciclo 0x2D58: 12F0, 12A0==2 -> 0x2EF8, 12A0==3 -> attende
+  tag 1 -> RunJob 0x33A0 (legge 0x1330: se 0 -> assert 0x15B0); altrimenti
+  finestra d'interrupt 0x2E20 (`bie` a 0x2E28, `bid r0`). Altra finestra:
+  0x2428 (`bie` 0x2430, `bid` 0x2438 attesa tag).
+Sonda `SPU_LSWATCH=1` (spu_drain.c spu_lswatch/spu_lswatch_print, stampata
+nell'assert): cambi di LS 0x12A0/0x1330 (+ impronta di 0xC00) al dispatch,
+all'interrupt (I) e al ripristino (R), con ie e livello; poi l'ultimo GET che
+ha coperto LS 0xC00 (cmd_ea in spu_context, preso in mfc_do_transfer), LS
+0xC00 contro EA attuale, caselle 0xDF0..0xFF0 e stato 0x1200..0x1380.
+- Corsa normale di un job ovl 216 (wid 13): passo 17 12A0=0x00300001 (Load
+  armato), 18 interrupt a 0x2E28, ~28 nel gestore 12A0=2, ~80 12A0=3 e
+  1330=0x4000, 83 ripristino a 0x2E28, ~138 12A0=0 (job finito).
+- s53l_1/s53m_1 (assert 0x1648 poi 0x1654, poi fermo): nel gestore, comando
+  0x600/3 a 0xC00 trova le caselle non riservate. I comandi in LS 0xC00
+  coincidono con la memoria (GET da 0x30 del descrittore del job, EA
+  0x1044ED90): dati giusti, stato delle caselle sbagliato.
+- s53n_1 (assert 0x15B0 poi fermo #3792): nel gestore 12A0 passa 2->3 in 2
+  passi con **1330=0**: il ciclo dei comandi non ha visto il comando 0xA00.
+  **LS 0xC00 contiene altro** (`18001190 00911230 00020000 00000000 00000000
+  190112A0 00021F00 21012C00`: stessa forma dei comandi di un job di un
+  altro tipo, es. EA 0x10447D40), mentre l'ultimo GET che copriva 0xC00 e'
+  quello giusto (descrittore ovl 216 a EA 0x1044B660, passo 10). Quindi i
+  comandi sono stati sovrascritti DOPO il GET e NON da un DMA di questo
+  contesto (nessun GET registrato): una store SPU (del PM o di un job) o una
+  scrittura dall'esterno. Nessun "CONTESTO CONDIVISO" / "SCARTATO" / "fresh
+  PM context" nei log dei fermi. Tabella caselle 0xDF0..0xFF0 tutta a zero.
+- ATTENZIONE: /tmp/uc_iso e' sparita due volte in questa sessione (corse
+  s53l "ERRORE:" buttate); s53j_5 (#18209, 56 draw) NON e' una corsa valida:
+  B = 4 fermi su 7 corse valide.
+
+**s.53, mattina (seguito) -- il PM legge un descrittore che non c'e' piu'.**
+Sonda estesa (tutto dietro SPU_LSWATCH=1, spento = percorso normale intatto):
+impronta di LS 0xC00 nel registro, ultimi 16 DMA del PM (`dma del PM`, anche
+GETLLAR/PUTLLC), i 48 byte in memoria AL MOMENTO del GET verso 0xC00
+(`al GET:`). Il Load arma a 0x31E8..0x3320: 12A0 = voce della lista
+(`00300001`), poi GET semplice (cmd 0x40, tag 0) di 0x30 byte dall'EA della
+voce a LS 0xC00, poi 0x29A4 (lista con stall-and-notify). L'MFC da noi e'
+sincrono (mfc_submit esegue subito), quindi la LS riceve la memoria di quel
+momento.
+- Job normale: al passo 17 l'impronta di 0xC00 e' 0x4318A000 (descrittore
+  ovl 216: `200 10440100 220 5C200100 | 4318A400 1012EA40 ... | 600 3 A00 0`).
+- s53n_1 (fermo #2608): impronta 0x600 gia' al passo 17: in 0xC00 c'e' un
+  descrittore spazzatura, il gestore esegue comandi sbagliati -> assert
+  0x1648/0x1654 -> fermo.
+- s53n_2 (assert 0x15B0, poi si riprende): in LS i comandi di un job di un
+  ALTRO tipo (`0C021180 00F50000 18001620 ...`), in memoria adesso il
+  descrittore ovl 216 giusto: la memoria del descrittore e' stata riscritta
+  DOPO il GET.
+- s53n_4 (assert 0x15B0): LS == memoria adesso, ma quella memoria non e' un
+  descrittore (`0 0 0 0 | 100 10447A30 C0 104D1B00 | 80 27142F40 ...`).
+- Quindi: il PM prende una voce (tipo 1, taglia 0x30, EA) che punta a
+  memoria riciclata o non ancora scritta. Non e' stato vecchio in LS: con
+  SPURS_PM_FRESH=1 (run.sh) il PM riparte fresco a ogni corsa, salvo i
+  contesti tenuti. Nota RPCS3 (spursKernelDispatchWorkload, copia in
+  uncharted-data/cellSpursSpu.cpp): sul ferro l'immagine del PM si ricopia
+  solo se cambia wklInfo->addr, e tutti i wid WwsJob hanno lo stesso PM
+  (0x1008eb00): una LS per SPU fisica condivisa fra i wid. Noi: una LS per
+  (wid, spu) + FRESH. Da tenere presente, non e' la causa di questo fermo.
+**Prossimo passo**: chi scrive voce e descrittore della lista del wid 13
+(0x104C4F00, voci a +0x80) e in che ordine rispetto al contatore che il PM
+legge. Sospetti in ordine: (1) il nostro PUTLLC che su piu' blocchi da 16
+byte fa commit per byte senza CAS (voce e contatore visti a meta' da un
+GETLLAR di un'altra SPU); (2) GETLLAR/letture senza acquire su ARM (il
+contatore nuovo visto prima della voce); (3) voce di un fotogramma vecchio
+dopo lo scambio del doppio buffer (ResetList). Sonda: al GET verso 0xC00,
+stampare la voce presa (LS 0x1420/0x12A0), la riga della lista in memoria
+in quel momento e il contatore.
+
 ## Storico
 
 Sessioni fino alla 37 e la vecchia "Dove siamo", verbatim, in

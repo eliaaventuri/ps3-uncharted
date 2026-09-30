@@ -313,6 +313,15 @@ static inline void spu_wring_dump(void)
 static inline int mfc_do_transfer(spu_context* spu, uint32_t lsa, uint64_t ea,
                                    uint32_t size, uint32_t cmd)
 {
+    if (__builtin_expect(g_spu_lswatch > 0, 0) && spu->policy_mode) { uint32_t h = spu->dmah_i++ & 15;   /* s.53 SPU_LSWATCH */
+        spu->dmah_lsa[h] = lsa & SPU_LS_MASK; spu->dmah_ea[h] = (uint32_t)ea;
+        spu->dmah_sc[h] = (size & 0xFFFF) | (cmd << 16); spu->dmah_steps[h] = spu->steps; }
+    if (__builtin_expect(g_spu_lswatch > 0, 0) && spu->policy_mode && !mfc_is_put(cmd) && (lsa & SPU_LS_MASK) <= 0xC00u &&
+        (lsa & SPU_LS_MASK) + size > 0xC00u) {   /* s.53 SPU_LSWATCH: da dove vengono i comandi */
+        spu->cmd_ea = ea; spu->cmd_lsa = lsa & SPU_LS_MASK; spu->cmd_size = size; spu->cmd_steps = spu->steps;
+        { extern uint8_t* vm_base; uint32_t e = (uint32_t)ea + (0xC00u - (lsa & SPU_LS_MASK));
+          if (vm_base && e >= 0x10000u && e < 0xC0000000u) memcpy(spu->cmd_snap, vm_base + e, sizeof spu->cmd_snap); }
+    }
 #ifndef SPU_DMA_LOG
     /* Via veloce (s.46): senza variabili diagnostiche il trasferimento fa solo
      * cio' che ha effetto sul gioco. Il percorso completo qui sotto passa ~35

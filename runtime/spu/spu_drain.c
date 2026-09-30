@@ -203,6 +203,54 @@ unsigned spu_sn_async_ticks(void)
     return (unsigned)(s_n < 0 ? 0 : s_n);
 }
 
+/* s.53 SPU_LSWATCH=1: registra i cambi di LS 0x12A0/0x1330 del PM. tag: 0 =
+ * dispatch, 1 = interrupt preso (pc = srr0), 2 = registri ripristinati all'iret. */
+int g_spu_lswatch = 0;
+void spu_lswatch(spu_context* ctx, uint32_t tag)
+{
+    uint32_t a = spu_ls_get32(ctx->ls, 0x12A0), b = spu_ls_get32(ctx->ls, 0x1330);
+    uint32_t c = spu_ls_get32(ctx->ls, 0xC00) ^ spu_ls_get32(ctx->ls, 0xC10) ^ spu_ls_get32(ctx->ls, 0xC20);
+    if (a == ctx->lsw_prev_a && b == ctx->lsw_prev_b && c == ctx->lsw_prev_c && tag == 0) return;
+    ctx->lsw_prev_a = a; ctx->lsw_prev_b = b; ctx->lsw_prev_c = c;
+    uint32_t h = ctx->lsw_i++ & 31;
+    ctx->lsw_pc[h] = ctx->pc & SPU_LS_MASK; ctx->lsw_a[h] = a; ctx->lsw_b[h] = b; ctx->lsw_c[h] = c;
+    ctx->lsw_f[h] = tag | (ctx->int_enable << 4) | (ctx->irq_save_valid << 8);
+    ctx->lsw_steps[h] = ctx->steps;
+}
+void spu_lswatch_print(spu_context* ctx)
+{
+    if (g_spu_lswatch <= 0) return;
+    fprintf(stderr, "         lswatch (pc tipo:D/I/R ie liv 12A0 1330 xorC00 passo) steps=%llu:", (unsigned long long)ctx->steps);
+    for (unsigned k = 0; k < 32; k++) { unsigned h = (ctx->lsw_i + k) & 31; if (!ctx->lsw_steps[h] && !ctx->lsw_pc[h]) continue;
+        fprintf(stderr, "%s%05X %c%u%u %08X %08X %08X %llu", (k % 4) ? " | " : "\n          ", ctx->lsw_pc[h],
+                "DIR?"[ctx->lsw_f[h] & 3], (ctx->lsw_f[h] >> 4) & 1, ctx->lsw_f[h] >> 8,
+                ctx->lsw_a[h], ctx->lsw_b[h], ctx->lsw_c[h], (unsigned long long)ctx->lsw_steps[h]); }
+    fprintf(stderr, "\n");
+    { extern uint8_t* vm_base; uint32_t ea = (uint32_t)ctx->cmd_ea + (0xC00u - ctx->cmd_lsa);
+      fprintf(stderr, "         comandi: GET lsa=0x%05X ea=0x%08X size=0x%X al passo %llu; LS 0xC00 / EA 0x%08X ora:",
+              ctx->cmd_lsa, (uint32_t)ctx->cmd_ea, ctx->cmd_size, (unsigned long long)ctx->cmd_steps, ea);
+      fprintf(stderr, "\n          al GET:");
+      for (int i = 0; i < 48; i += 4) fprintf(stderr, " %02X%02X%02X%02X", ctx->cmd_snap[i], ctx->cmd_snap[i + 1], ctx->cmd_snap[i + 2], ctx->cmd_snap[i + 3]);
+      fprintf(stderr, "\n          LS:");
+      for (int i = 0; i < 64; i += 4) fprintf(stderr, " %08X", spu_ls_get32(ctx->ls, 0xC00 + i));
+      if (vm_base && ctx->cmd_size && ea >= 0x10000u && ea < 0xC0000000u) {
+          fprintf(stderr, "\n          EA:");
+          for (int i = 0; i < 64; i += 4) fprintf(stderr, " %02X%02X%02X%02X", vm_base[ea + i], vm_base[ea + i + 1], vm_base[ea + i + 2], vm_base[ea + i + 3]);
+      }
+      fprintf(stderr, "\n"); }
+    fprintf(stderr, "         dma del PM (lsa<-ea size cmd passo):");
+    for (unsigned k = 0; k < 16; k++) { unsigned h = (ctx->dmah_i + k) & 15; if (!ctx->dmah_sc[h]) continue;
+        fprintf(stderr, "%s%05X %08X %X c%02X %llu", (k % 4) ? " | " : "\n          ", ctx->dmah_lsa[h], ctx->dmah_ea[h],
+                ctx->dmah_sc[h] & 0xFFFF, ctx->dmah_sc[h] >> 16, (unsigned long long)ctx->dmah_steps[h]); }
+    fprintf(stderr, "\n");
+    /* tabella delle caselle dei buffer (func_000022F0: 0xDF0 + set*64, bit 0x8000 = riservata) */
+    fprintf(stderr, "         caselle LS 0xDF0..0xFF0:");
+    for (int i = 0; i < 0x200; i += 4) fprintf(stderr, "%s%08X", (i % 64) ? " " : "\n          ", spu_ls_get32(ctx->ls, 0xDF0 + i));
+    fprintf(stderr, "\n         stato LS 0x1200..0x1380:");
+    for (int i = 0; i < 0x180; i += 4) fprintf(stderr, "%s%08X", (i % 64) ? " " : "\n          ", spu_ls_get32(ctx->ls, 0x1200 + i));
+    fprintf(stderr, "\n");
+}
+
 /* Sonda s.53: 0 = pubblicata a fine conteggio, 1 = da una lettura di canale d'evento. */
 void spu_sn_probe(spu_context* ctx, int why)
 {
@@ -288,6 +336,7 @@ int spu_irq_regs_maybe_restore(spu_context* ctx)
           memcpy(ctx->gpr, ctx->irq_gpr[d], (size_t)n * sizeof ctx->gpr[0]); }
         ctx->irq_save_valid = d;
         ctx->irq_resume_pc = d ? ctx->irq_resume_stack[d - 1] : 0;
+        if (g_spu_lswatch > 0 && ctx->policy_mode) spu_lswatch(ctx, 2);
         return 1;
     }
     return 0;
@@ -329,6 +378,7 @@ void (*spu_take_interrupt(spu_context* ctx,
       if (s_fix < 0) { const char* e = getenv("SPU_IRQ_IRETFIX"); s_fix = (e && *e == '0') ? 0 : 1; }
       if (s_fix && ctx->irq_save_valid) spu_irq_regs_maybe_restore(ctx); }
     ctx->srr0 = ctx->pc;             /* resume point for iret */
+    if (g_spu_lswatch > 0 && ctx->policy_mode) spu_lswatch(ctx, 1);
     ctx->int_enable = 0;
     spu_irq_regs_save(ctx);          /* hardware contract: handler preserves regs */
 #if !defined(_MSC_VER)
@@ -434,6 +484,7 @@ void spu_drain_slow(spu_context* ctx)
         static int _n = 0;
         if (_n++ == 0) fprintf(stderr, "[spu-drain] ciclo %s\n", m == 1 ? "veloce" : "completo (diagnostica)");
         g_spu_drain_mode = m;
+        { const char* e = getenv("SPU_LSWATCH"); g_spu_lswatch = (e && *e && *e != '0') ? 1 : 0; }
         /* s.48: trasferimenti in linea solo col drain veloce */
         { const char* e = getenv("SPU_XFER_INLINE");
           g_spu_xfer_inline = (m == 1 && !(e && *e == '0')) ? 1 : 0;
@@ -487,6 +538,7 @@ void spu_drain_fast(spu_context* ctx)
     while ((tf = g_spu_trampoline_fn) != 0) {
         ctx->hops++;
         spu_sn_tick(ctx);
+        if (__builtin_expect(g_spu_lswatch, 0) && ctx->policy_mode) spu_lswatch(ctx, 0);
         int irq = (ctx->int_enable && (ctx->event_status & ctx->event_mask)) ? 1 : 0;
         if (!irq && retlink && ctx->host_depth > 0 && ctx->ret_link &&
             ((uint32_t)ctx->pc & SPU_LS_MASK) == ctx->ret_link) {

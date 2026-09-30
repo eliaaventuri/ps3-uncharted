@@ -218,6 +218,7 @@ void spu_stop_at(spu_context* ctx, uint32_t addr)
               fprintf(stderr, " %c%05X/%llu", (ctx->irq_hist[h] >> 31) ? 'S' : 'R', ctx->irq_hist[h] & 0x3FFFF,
                       (unsigned long long)(ctx->steps - ctx->irq_hist_steps[h])); }
           fprintf(stderr, " | livelli=%u\n", ctx->irq_save_valid); }
+        { extern void spu_lswatch_print(spu_context*); spu_lswatch_print(ctx); }
         spu_adma_dump(ctx);
     }
     spu_stop(ctx);
@@ -694,6 +695,11 @@ static int spu_mfc_atomic(spu_context* ctx, uint32_t cmd)
 
     uint32_t ea  = ctx->mfc_eal & ~(uint32_t)(MFC_ATOMIC_LINE - 1);
     uint32_t lsa = ctx->mfc_lsa & SPU_LS_MASK;
+    if (g_spu_lswatch > 0 && ctx->policy_mode) { uint32_t h = ctx->dmah_i++ & 15;   /* s.53 SPU_LSWATCH */
+        ctx->dmah_lsa[h] = lsa; ctx->dmah_ea[h] = ea; ctx->dmah_sc[h] = MFC_ATOMIC_LINE | (cmd << 16); ctx->dmah_steps[h] = ctx->steps; }
+    if (g_spu_lswatch > 0 && cmd == MFC_GETLLAR_CMD && ctx->policy_mode && lsa <= 0xC00u && lsa + MFC_ATOMIC_LINE > 0xC00u) {
+        ctx->cmd_ea = ea; ctx->cmd_lsa = lsa; ctx->cmd_size = 0x10000u | MFC_ATOMIC_LINE; ctx->cmd_steps = ctx->steps;   /* s.53 SPU_LSWATCH */
+    }
     /* s.47: la riga in ordine di memoria (big-endian) in un buffer locale; la
      * LS la riceve/fornisce con spu_ls_copy_in/out (ordine SPU_LS_XOR) */
     uint8_t ls[MFC_ATOMIC_LINE];
