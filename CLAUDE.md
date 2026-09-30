@@ -65,56 +65,18 @@ Il ruolo di Opus è di **Senior Architect / Orchestratore**: i tuoi token devono
    - Analisi di grandi log di errore, crash dump, disassemblati e trace.
    - Mappatura preliminare di funzioni e dipendenze.
 
-2. **Qwen 32B Locale (`./run_worker.sh --local tasks/TASK.md`)** [Offline Costo Zero]:
-   - Cicli continui di compilazione `cmake --build build`.
-   - Modifiche chirurgiche a stub, header o funzioni circoscritte.
-   - Esecuzione continua di `.venv/bin/python tools/check_ppu_scaffold.py` fino al verde.
-   - Ogni operazione ripetitiva che altrimenti consumerebbe token o chiamate API.
+2. **Sotto-agenti Claude** (definiti in `~/.claude/agents/`):
+   - **`haiku-esploratore`** (sola lettura): trovare/leggere/riassumere file, mappare cartelle, estrarre dati.
+   - **`sonnet-esecutore`**: cicli di compilazione `cmake --build build`, modifiche chirurgiche già decise a stub, header o funzioni circoscritte, esecuzione di `.venv/bin/python tools/check_ppu_scaffold.py` fino al verde.
 
-### Come è messo il worker (riparato il 09/09/2026)
+Se Gemini ha finito la quota (`run_worker.sh` esce con codice 75, `GEMINI_NON_DISPONIBILE`), il task lo fa Opus o `sonnet-esecutore`. Il worker locale Qwen è stato rimosso il 28/09/2026: `--local` non esiste più.
 
-Tre cose erano rotte e ora funzionano; se un giorno smette, si guarda qui.
-
-1. `~/local-ai-worker/opencode.json` dichiarava il provider locale con
-   `"npm": "@opencode-ai/plugin"`, che non è un pacchetto di provider: opencode
-   rispondeva `Failed to initialize provider: local-mlx`. Ora è
-   `@ai-sdk/openai-compatible`.
-2. Quel file sta nella cartella del worker, ma opencode legge la configurazione
-   dalla **cartella di lavoro** e da `~/.config/opencode/`. Il provider è stato
-   copiato anche nella configurazione globale, così `--local` funziona lanciato
-   da dentro il repo.
-3. `run_worker.sh` è un symlink: `BASH_SOURCE` restava il percorso del link e
-   `git_checkpoint.sh` non si trovava. Ora il link viene risolto.
-4. **`scripts/tool_shim.py`** (porta 8081) è nuovo. Qwen2.5-Coder scrive le
-   chiamate agli strumenti come JSON nudo, mentre `mlx_lm` ne riconosce una solo
-   se è avvolta nei tag `<tool_call>`: senza adattatore il modello *stampava* le
-   chiamate invece di eseguirle. Lo shim le converte (e gestisce lo streaming).
-   Parte e si ferma insieme al server, e la configurazione punta a 8081.
-
-Nota di realtà: il modello locale processa ~90 token al secondo di prompt, e il
-prompt di sistema di opencode è ~9.000 token — quindi **un paio di minuti per
-turno**. Va bene per mappature e lavori ripetitivi, non per iterazioni rapide.
-
-5. **Limiti alla cache dei prompt** (in `scripts/start_server.sh`). Senza,
-   `mlx_lm` tiene una cache KV per ogni ramo di conversazione e non la butta
-   mai: misurato `Prompt Cache: 4 sequences, 10.02 GB` sopra ai ~18 GB dei pesi,
-   con la memoria della macchina all'80%. Ora `--prompt-cache-size 1` e
-   `--prompt-cache-bytes 3221225472` (3 GB): una sola conversazione in cache,
-   che basta a riusare il prompt di sistema. Dopo la modifica: 93% di memoria
-   libera. Si possono cambiare con le variabili `PROMPT_CACHE_SIZE` e
-   `PROMPT_CACHE_BYTES`.
-
-**Regola operativa: non lanciare mai il gioco mentre il worker locale gira.**
-Il modello da 32B e il backend Metal del port si contendono la stessa GPU
-unificata, e il server MLX muore con
-`[METAL] Command buffer execution failed: Insufficient Memory`. Misurato il
-09/09/2026: server crashato a metà task. O si delega la lettura di codice al
-worker, o si misura il gioco — mai insieme.
+Nota sul runner: `run_worker.sh` è un symlink e risolve il proprio percorso per trovare `git_checkpoint.sh`; se smette di trovarlo, si guarda lì.
 
 ### Flusso Operativo Obbligatorio
 
 1. **Definisci l'obiettivo**: Scrivi un task circoscritto in `tasks/TASK.md` (ispirandoti a `tasks/TASK_TEMPLATE.md`).
-2. **Delega l'esecuzione**: Lancia `./run_worker.sh --gemini` o `./run_worker.sh --local`.
+2. **Delega l'esecuzione**: Lancia `./run_worker.sh --gemini` (o affida il lavoro a `sonnet-esecutore`).
    *(Il worker crea in automatico un checkpoint Git di sicurezza e opera in modo reversibile).*
 3. **Leggi solo il responso sintetico**: Leggi **esclusivamente** `tasks/RESULT.md`.
    - Se `SUCCESS`: accetta il lavoro e passa all'obiettivo successivo.
